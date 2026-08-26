@@ -483,17 +483,32 @@
 
   function localizeRuntimeMessage(value) {
     let text = asText(value);
+    if (text.includes("Douyin returned an uploader profile instead of the requested video")) {
+      return "抖音把目标视频错误返回成了博主主页，程序已拦截这些非目标作品。请在 Chrome 打开原视频完成验证后重试。";
+    }
+    if (text.includes("Douyin could not create a verified signed request")) {
+      return "抖音暂时无法创建经过验证的请求。请在 Chrome 打开原视频，完成验证码或登录后再重试。";
+    }
+    if (text.includes("The site requires login, fresh browser cookies, or a CAPTCHA")) {
+      return "该网站需要登录、最新的 Chrome Cookie 或验证码。请在 Chrome 完成验证后重试。";
+    }
+    if (text.includes("Douyin did not return a verified media identity")) {
+      return "抖音没有返回可验证的目标视频身份。请在 Chrome 打开原视频完成验证后重试。";
+    }
+    if (text.includes("Douyin could not verify the author's highest-quality renditions") || text.includes("Douyin could not find the requested video in its verified author feed")) {
+      return "抖音暂时无法从该作者的已验证作品数据中确认最高画质。请在 Chrome 打开原视频完成验证码或登录后重试。";
+    }
     if (text.includes("FFprobe was found but could not be started")) {
       return "已找到 FFprobe，但程序无法启动它。请重新安装包含 FFprobe 的 FFmpeg，然后完全停止并重启程序。";
     }
     if (text.includes("FFprobe was not found")) {
       return "未找到 FFprobe，无法验证抖音最高画质。请安装包含 FFprobe 的 FFmpeg，将其 bin 目录加入 PATH，然后完全停止并重启程序；macOS Homebrew 可运行 brew install ffmpeg。";
     }
-    if (!text.includes("Douyin profile media was discovered")) return text;
+    if (!text.includes("Douyin media was discovered") && !text.includes("Douyin profile media was discovered")) return text;
 
     text = text
       .replace(
-        /Douyin profile media was discovered, but its highest quality could not be verified\.[\s\S]*?Probe details:\s*/,
+        /Douyin (?:profile )?media was discovered, but its highest quality could not be verified\.[\s\S]*?Probe details:\s*/,
         "已发现该抖音作品，但无法验证其最高画质；为避免下错低清版本，本次没有下载。探测详情："
       )
       .replaceAll("media request or FFprobe timed out", "媒体请求或 FFprobe 探测超时")
@@ -509,6 +524,9 @@
       .replaceAll("no verified media identity was available", "没有可验证的媒体身份")
       .replaceAll("no playable candidate was returned", "未返回可播放的候选媒体")
       .replaceAll("media metadata could not be parsed", "无法解析媒体元数据")
+      .replaceAll("best verified candidate was", "已验证的最高候选为")
+      .replaceAll("below the discovered minimum", "低于解析阶段确认的最低画质")
+      .replaceAll("highest candidate uses unsupported video codec", "最高画质使用当前不支持的视频编码")
       .replaceAll("default", "原始档");
     return text;
   }
@@ -786,8 +804,9 @@
     elements.totalCount.textContent = counts.total === null ? "—" : String(counts.total);
 
     elements.authAlert.hidden = !needsAuth;
+    elements.authRetryButton.hidden = job?.retryable === false;
     if (needsAuth) {
-      elements.authMessage.textContent = asText(firstDefined(
+      elements.authMessage.textContent = localizeRuntimeMessage(firstDefined(
         job?.auth_message,
         job?.action_message,
         job?.error_message,
@@ -814,7 +833,10 @@
     }
     const hasUnprocessedItems = counts.total !== null && counts.success + counts.failed < counts.total;
     const resumable = ["cancelled", "interrupted"].includes(rawStatus(job)) || discoveryIncomplete || (rawStatus(job) === "partial" && hasUnprocessedItems);
-    elements.retryAllButton.hidden = isRunning(job) || (counts.failed === 0 && !needsAuth && canonicalStatus(job) !== "failed" && !resumable);
+    const items = getItems(job);
+    const hasRetryableItems = items.some(isRetryableItem);
+    const canRetryDiscovery = items.length === 0 && (needsAuth || canonicalStatus(job) === "failed" || resumable);
+    elements.retryAllButton.hidden = job?.retryable === false || isRunning(job) || (!hasRetryableItems && !resumable && !canRetryDiscovery);
     elements.retryAllLabel.textContent = discoveryIncomplete
       ? "继续发现"
       : resumable

@@ -88,6 +88,59 @@ def test_extract_url_accepts_share_text_and_removes_fragment() -> None:
     )
 
 
+def test_extract_url_accepts_markdown_link_without_joining_label_and_target() -> None:
+    value = (
+        "[https://www.douyin.com/video/7664225419386607205]"
+        "(https://www.douyin.com/video/7664225419386607205)"
+    )
+
+    assert extract_url(value) == ("https://www.douyin.com/video/7664225419386607205")
+
+
+def test_extract_url_uses_earliest_plain_url_before_later_markdown_link() -> None:
+    value = (
+        "https://www.douyin.com/video/7664225419386607205 "
+        "[other](https://www.douyin.com/user/wrong-profile)"
+    )
+
+    assert extract_url(value) == ("https://www.douyin.com/video/7664225419386607205")
+
+
+def test_douyin_modal_video_url_is_canonicalized_as_single_item() -> None:
+    info = identify_url(
+        "https://www.douyin.com/user/MS4wLjABAAAATEST"
+        "?modal_id=7664225419386607205&from_tab_name=main"
+    )
+
+    assert info.platform == Platform.DOUYIN
+    assert info.kind == SourceKind.ITEM
+    assert info.url == "https://www.douyin.com/video/7664225419386607205"
+
+
+def test_douyin_video_url_drops_tracking_and_ignores_conflicting_modal_id() -> None:
+    info = identify_url(
+        "https://www.douyin.com/video/7664225419386607205"
+        "?modal_id=9999999999999999999&previous_page=app_code_link"
+    )
+
+    assert info.kind == SourceKind.ITEM
+    assert info.url == "https://www.douyin.com/video/7664225419386607205"
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "modal_id=",
+        "modal_id=invalid",
+        "modal_id=7664225419386607205&modal_id=invalid",
+        "modal_id=7664225419386607205&modal_id=7677923079457231738",
+    ],
+)
+def test_douyin_rejects_invalid_or_ambiguous_profile_modal_id(query: str) -> None:
+    with pytest.raises(UnsupportedUrlError, match="modal"):
+        identify_url(f"https://www.douyin.com/user/profile-a?{query}")
+
+
 @pytest.mark.parametrize(
     "value",
     [
@@ -99,6 +152,12 @@ def test_extract_url_accepts_share_text_and_removes_fragment() -> None:
         "https://www.xiaohongshu.com/search_result",
         "https://www.douyin.com/search/example",
         "https://www.douyin.com/note/7628957913016552758",
+        "https://www.douyin.com/video/7664225419386607205oops",
+        "https://www.douyin.com/video/7664225419386607205/other",
+        (
+            "https://www.douyin.com/video/7664225419386607205]"
+            "(https://www.douyin.com/user/WRONG"
+        ),
     ],
 )
 def test_rejects_invalid_or_unsupported_urls(value: str) -> None:

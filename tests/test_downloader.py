@@ -17,6 +17,7 @@ from app.downloader import (
     _SafeFilenamePostProcessor,
     _item_key,
     safe_component,
+    safe_external_error_message,
 )
 from app.douyin import DouyinProfile
 from app.errors import AuthenticationRequiredError, MediaDownloadError
@@ -326,7 +327,7 @@ def test_douyin_item_discovery_rejects_crosswired_extractor_id(
     source_url = "https://www.douyin.com/video/1111111111111111111"
 
     class CrosswiredDiscoveryYoutubeDL(FakeYoutubeDL):
-        def extract_info(self, url: str, download: bool):
+        def extract_info(self, url: str, download: bool, process: bool = True):
             return {
                 "id": "2222222222222222222",
                 "title": "Wrong video",
@@ -340,6 +341,341 @@ def test_douyin_item_discovery_rejects_crosswired_extractor_id(
         engine.discover(source_url, Platform.DOUYIN, SourceKind.ITEM)
 
     assert error.value.verification_url == source_url
+
+
+def test_douyin_item_discovery_creates_exactly_one_verified_item(
+    monkeypatch,
+) -> None:
+    media_id = "7664225419386607205"
+    source_url = f"https://www.douyin.com/video/{media_id}"
+    video_uri = "v0200fg10000fixturevideoid"
+
+    class DirectItemYoutubeDL(FakeYoutubeDL):
+        def extract_info(self, url: str, download: bool, process: bool = True):
+            assert url == source_url
+            assert download is False
+            assert process is False
+            return {
+                "id": media_id,
+                "title": "Verified title",
+                "channel": "Verified author",
+                "channel_id": "verified-owner",
+                "duration": 23.4,
+                "timestamp": 1_756_656_000,
+                "extractor_key": "Douyin",
+                "formats": [
+                    {
+                        "url": (
+                            "https://api-play.amemv.com/aweme/v1/play/"
+                            f"?video_id={video_uri}&ratio=720p"
+                        ),
+                        "width": 1440,
+                        "height": 2560,
+                    }
+                ],
+            }
+
+    DirectItemYoutubeDL.created_options.clear()
+    monkeypatch.setattr("app.downloader.YoutubeDL", DirectItemYoutubeDL)
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+
+    result = engine.discover(source_url, Platform.DOUYIN, SourceKind.ITEM)
+
+    assert result.author == "Verified author"
+    assert len(result.items) == 1
+    item = result.items[0]
+    assert item.media_id == media_id
+    assert item.source_url == source_url
+    assert item.title == "Verified title"
+    assert item.metadata["verification_url"] == source_url
+    assert item.metadata["item_identity_verified"] is True
+    assert item.metadata["douyin_item_media"] == {
+        "media_id": media_id,
+        "video_uri": video_uri,
+        "title": "Verified title",
+        "author": "Verified author",
+        "minimum_width": 1080,
+        "minimum_height": 1920,
+        "owner_id": "verified-owner",
+        "duration_ms": 23_400,
+        "create_time": 1_756_656_000,
+    }
+    assert DirectItemYoutubeDL.created_options[0]["noplaylist"] is True
+
+
+def test_douyin_item_discovery_enriches_quality_from_bound_author_profile(
+    monkeypatch,
+) -> None:
+    media_id = "7638230489560727931"
+    owner_id = "MS4wLjABAAAAexpected-owner"
+    source_url = f"https://www.douyin.com/video/{media_id}"
+    video_uri = "v0200fg10000fixturevideoid"
+    direct_url = "https://v26-web.douyinvod.com/verified-1440.mp4"
+
+    class DirectItemYoutubeDL(FakeYoutubeDL):
+        def extract_info(self, url: str, download: bool, process: bool = True):
+            return {
+                "id": media_id,
+                "title": "Verified title",
+                "channel": "Verified author",
+                "channel_id": owner_id,
+                "duration": 27.5,
+                "formats": [
+                    {
+                        "url": (
+                            "https://api-play.amemv.com/aweme/v1/play/"
+                            f"?video_id={video_uri}&ratio=720p"
+                        ),
+                        "width": 720,
+                        "height": 1280,
+                    }
+                ],
+            }
+
+    calls = []
+
+    def enrich(profile_id, target_id, **kwargs):
+        calls.append((profile_id, target_id))
+        return {
+            "minimum_width": 1440,
+            "minimum_height": 2560,
+            "direct_candidates": [
+                {
+                    "width": 1440,
+                    "height": 2560,
+                    "codec_hint": "hevc",
+                    "urls": [direct_url],
+                }
+            ],
+        }
+
+    monkeypatch.setattr("app.downloader.YoutubeDL", DirectItemYoutubeDL)
+    monkeypatch.setattr(
+        "app.downloader.discover_item_metadata_from_profile",
+        enrich,
+    )
+    engine = MediaDownloader(DownloaderConfig(cookie_browser="chrome"))
+
+    result = engine.discover(source_url, Platform.DOUYIN, SourceKind.ITEM)
+
+    assert calls == [(owner_id, media_id)]
+    cached = result.items[0].metadata["douyin_item_media"]
+    assert cached["minimum_width"] == 1440
+    assert cached["minimum_height"] == 2560
+    assert cached["direct_candidates"][0]["urls"] == [direct_url]
+
+
+def test_douyin_item_discovery_fails_closed_when_author_feed_is_unverified(
+    monkeypatch,
+) -> None:
+    media_id = "7638230489560727931"
+    source_url = f"https://www.douyin.com/video/{media_id}"
+    video_uri = "v0200fg10000fixturevideoid"
+
+    class DirectItemYoutubeDL(FakeYoutubeDL):
+        def extract_info(self, url: str, download: bool, process: bool = True):
+            return {
+                "id": media_id,
+                "title": "Verified title",
+                "channel": "Verified author",
+                "channel_id": "MS4wLjABAAAAexpected-owner",
+                "formats": [
+                    {
+                        "url": (
+                            "https://api-play.amemv.com/aweme/v1/play/"
+                            f"?video_id={video_uri}&ratio=720p"
+                        )
+                    }
+                ],
+            }
+
+    monkeypatch.setattr("app.downloader.YoutubeDL", DirectItemYoutubeDL)
+    monkeypatch.setattr(
+        "app.downloader.discover_item_metadata_from_profile",
+        lambda *args, **kwargs: None,
+    )
+    engine = MediaDownloader(DownloaderConfig(cookie_browser="chrome"))
+
+    with pytest.raises(AuthenticationRequiredError, match="highest quality") as error:
+        engine.discover(source_url, Platform.DOUYIN, SourceKind.ITEM)
+
+    assert error.value.verification_url == source_url
+
+
+def test_douyin_item_enrichment_never_lowers_native_quality_floor(
+    monkeypatch,
+) -> None:
+    media_id = "7638230489560727931"
+    source_url = f"https://www.douyin.com/video/{media_id}"
+    video_uri = "v0200fg10000fixturevideoid"
+
+    class DirectItemYoutubeDL(FakeYoutubeDL):
+        def extract_info(self, url: str, download: bool, process: bool = True):
+            return {
+                "id": media_id,
+                "title": "Verified title",
+                "channel": "Verified author",
+                "channel_id": "MS4wLjABAAAAexpected-owner",
+                "formats": [
+                    {
+                        "url": (
+                            "https://api-play.amemv.com/aweme/v1/play/"
+                            f"?video_id={video_uri}&ratio=1080p"
+                        ),
+                        "width": 1080,
+                        "height": 1920,
+                    }
+                ],
+            }
+
+    monkeypatch.setattr("app.downloader.YoutubeDL", DirectItemYoutubeDL)
+    monkeypatch.setattr(
+        "app.downloader.discover_item_metadata_from_profile",
+        lambda *args, **kwargs: {
+            "minimum_width": 720,
+            "minimum_height": 1280,
+            "direct_candidates": [
+                {
+                    "width": 720,
+                    "height": 1280,
+                    "urls": ["https://v26-web.douyinvod.com/verified-720.mp4"],
+                }
+            ],
+        },
+    )
+    engine = MediaDownloader(DownloaderConfig(cookie_browser="chrome"))
+
+    result = engine.discover(source_url, Platform.DOUYIN, SourceKind.ITEM)
+
+    cached = result.items[0].metadata["douyin_item_media"]
+    assert cached["minimum_width"] == 1080
+    assert cached["minimum_height"] == 1920
+
+
+def test_douyin_item_discovery_rejects_playlist_shaped_result(
+    monkeypatch,
+) -> None:
+    media_id = "7664225419386607205"
+    source_url = f"https://www.douyin.com/video/{media_id}"
+
+    class UnexpectedPlaylistYoutubeDL(FakeYoutubeDL):
+        def extract_info(self, url: str, download: bool, process: bool = True):
+            return {
+                "_type": "playlist",
+                "id": media_id,
+                "channel": "Wrong profile",
+                "entries": [
+                    {"id": "7677923079457231738"},
+                    {"id": "7677554129950241521"},
+                ],
+            }
+
+    monkeypatch.setattr("app.downloader.YoutubeDL", UnexpectedPlaylistYoutubeDL)
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+
+    with pytest.raises(AuthenticationRequiredError, match="uploader profile") as error:
+        engine.discover(source_url, Platform.DOUYIN, SourceKind.ITEM)
+
+    assert error.value.verification_url == source_url
+
+
+def test_douyin_item_playlist_shape_uses_bound_signed_detail_fallback(
+    monkeypatch,
+) -> None:
+    media_id = "7664225419386607205"
+    source_url = f"https://www.douyin.com/video/{media_id}"
+    calls = []
+
+    class UnexpectedPlaylistYoutubeDL:
+        def extract_info(self, url: str, download: bool, process: bool):
+            return {
+                "_type": "playlist",
+                "id": media_id,
+                "entries": [{"id": "7677923079457231738"}],
+            }
+
+    class FakeDouyinIE:
+        def __init__(self, ydl) -> None:
+            self.ydl = ydl
+
+        def _parse_aweme_video_app(self, detail):
+            return {"id": media_id, "title": "Signed item", "formats": []}
+
+    def fetch(aweme_id, **kwargs):
+        calls.append((aweme_id, kwargs))
+        return {"aweme_id": media_id}
+
+    monkeypatch.setattr("app.downloader.DouyinIE", FakeDouyinIE)
+    monkeypatch.setattr("app.downloader.fetch_signed_aweme_detail", fetch)
+    engine = MediaDownloader(DownloaderConfig(cookie_browser="chrome"))
+
+    result = engine._extract_douyin_raw_info(
+        UnexpectedPlaylistYoutubeDL(),
+        source_url,
+        expected_id=media_id,
+        expected_profile_id=None,
+        verification_url=source_url,
+        profile_metadata=None,
+        fallback_title=media_id,
+        should_cancel=lambda: False,
+    )
+
+    assert result["id"] == media_id
+    assert len(calls) == 1
+    assert calls[0][0] == media_id
+    assert calls[0][1]["verification_url"] == source_url
+    assert calls[0][1]["expected_sec_uid"] is None
+    assert calls[0][1]["cookie_profile"] is None
+
+
+def test_douyin_item_crosswired_id_uses_bound_signed_detail_fallback(
+    monkeypatch,
+) -> None:
+    media_id = "7664225419386607205"
+    source_url = f"https://www.douyin.com/video/{media_id}"
+    calls = []
+
+    class CrosswiredYoutubeDL:
+        def extract_info(self, url: str, download: bool, process: bool):
+            return {
+                "id": "7677923079457231738",
+                "title": "Wrong item",
+                "formats": [],
+            }
+
+    class FakeDouyinIE:
+        def __init__(self, ydl) -> None:
+            self.ydl = ydl
+
+        def _parse_aweme_video_app(self, detail):
+            return {"id": media_id, "title": "Signed item", "formats": []}
+
+    def fetch(aweme_id, **kwargs):
+        calls.append((aweme_id, kwargs))
+        return {"aweme_id": media_id}
+
+    monkeypatch.setattr("app.downloader.DouyinIE", FakeDouyinIE)
+    monkeypatch.setattr("app.downloader.fetch_signed_aweme_detail", fetch)
+    engine = MediaDownloader(DownloaderConfig(cookie_browser="chrome"))
+
+    result = engine._extract_douyin_raw_info(
+        CrosswiredYoutubeDL(),
+        source_url,
+        expected_id=media_id,
+        expected_profile_id=None,
+        verification_url=source_url,
+        profile_metadata=None,
+        fallback_title=media_id,
+        should_cancel=lambda: False,
+    )
+
+    assert result["id"] == media_id
+    assert len(calls) == 1
+    assert calls[0][0] == media_id
+    assert calls[0][1]["verification_url"] == source_url
+    assert calls[0][1]["expected_sec_uid"] is None
+    assert calls[0][1]["cookie_profile"] is None
+    assert callable(calls[0][1]["should_cancel"])
 
 
 def test_douyin_crosswired_source_is_rejected_before_ytdlp(
@@ -397,6 +733,40 @@ def test_douyin_extracted_id_mismatch_is_rejected_before_media_transfer(
         engine.download_item(item, Platform.DOUYIN, tmp_path)
 
     assert error.value.verification_url == profile_url
+
+
+def test_douyin_download_never_processes_playlist_shaped_item(
+    monkeypatch, tmp_path
+) -> None:
+    media_id = "7664225419386607205"
+    source_url = f"https://www.douyin.com/video/{media_id}"
+
+    class PlaylistYoutubeDL(FakeYoutubeDL):
+        def extract_info(self, url: str, download: bool, process: bool = True):
+            return {
+                "_type": "playlist",
+                "id": media_id,
+                "entries": [{"id": "7677923079457231738"}],
+            }
+
+        def process_ie_result(self, info, download: bool):
+            raise AssertionError("playlist-shaped item must never be processed")
+
+    monkeypatch.setattr("app.downloader.YoutubeDL", PlaylistYoutubeDL)
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    item = DownloadItem(
+        id="direct-item",
+        media_id=media_id,
+        source_url=source_url,
+        title="Direct item",
+        media_type=MediaType.VIDEO,
+        metadata={"verification_url": source_url},
+    )
+
+    with pytest.raises(AuthenticationRequiredError, match="uploader profile") as error:
+        engine.download_item(item, Platform.DOUYIN, tmp_path)
+
+    assert error.value.verification_url == source_url
 
 
 @pytest.mark.parametrize("channel_id", ["profile-b", None])
@@ -558,6 +928,53 @@ def test_douyin_verified_profile_metadata_skips_per_item_detail() -> None:
     ]
 
 
+def test_douyin_verified_item_metadata_skips_second_signed_detail() -> None:
+    media_id = "7664225419386607205"
+    source_url = f"https://www.douyin.com/video/{media_id}"
+    video_uri = "v0200fg10000fixturevideoid"
+
+    class UnexpectedYoutubeDL:
+        def extract_info(self, *args, **kwargs):
+            raise AssertionError("verified item metadata must skip item detail")
+
+    engine = MediaDownloader(DownloaderConfig(cookie_browser="chrome"))
+    result = engine._extract_douyin_raw_info(
+        UnexpectedYoutubeDL(),
+        source_url,
+        expected_id=media_id,
+        expected_profile_id=None,
+        verification_url=source_url,
+        profile_metadata={
+            "verification_url": source_url,
+            "item_identity_verified": True,
+            "douyin_item_media": {
+                "media_id": media_id,
+                "owner_id": "verified-owner",
+                "video_uri": video_uri,
+                "minimum_width": 1080,
+                "minimum_height": 1920,
+                "duration_ms": 23_400,
+                "create_time": 1_756_656_000,
+                "title": "Cached item video",
+                "author": "Verified author",
+            },
+        },
+        fallback_title="Fallback title",
+        should_cancel=lambda: False,
+    )
+
+    assert result["id"] == media_id
+    assert result["channel_id"] == "verified-owner"
+    assert result["duration"] == 23.4
+    assert result["timestamp"] == 1_756_656_000
+    assert result["_douyin_verified_cache_only"] is True
+    assert result["_douyin_minimum_width"] == 1080
+    assert result["_douyin_minimum_height"] == 1920
+    assert parse_qs(urlsplit(result["formats"][0]["url"]).query)["video_id"] == [
+        video_uri
+    ]
+
+
 def test_douyin_profile_metadata_rejects_wrong_cached_owner() -> None:
     engine = MediaDownloader(DownloaderConfig(cookie_browser="chrome"))
 
@@ -603,16 +1020,22 @@ def test_douyin_cached_profile_item_can_recover_default_2k_master(
 
     def probe(ydl, url, *, expected_duration, should_cancel):
         ratio = parse_qs(urlsplit(url).query)["ratio"][0]
-        if ratio != "default":
-            return None
+        dimensions = {
+            "default": (1440, 2560, 20_132_350, 59_093_472, "h265"),
+            "4k": (1080, 1920, 4_000_000, 10_000_000, "h264"),
+            "2k": (1080, 1920, 4_000_000, 10_000_000, "h264"),
+            "1080p": (1080, 1920, 4_000_000, 10_000_000, "h264"),
+            "720p": (720, 1280, 2_000_000, 5_000_000, "h264"),
+        }
+        width, height, bit_rate, filesize, codec = dimensions[ratio]
         return {
             "url": url,
-            "width": 1440,
-            "height": 2560,
-            "bit_rate": 20_132_350,
-            "filesize": 59_093_472,
+            "width": width,
+            "height": height,
+            "bit_rate": bit_rate,
+            "filesize": filesize,
             "duration": expected_duration,
-            "vcodec": "h265",
+            "vcodec": codec,
             "acodec": "aac",
         }
 
@@ -634,6 +1057,154 @@ def test_douyin_cached_profile_item_can_recover_default_2k_master(
 
     assert selected["format_id"].startswith("douyin-api-1440x2560")
     assert (selected["width"], selected["height"]) == (1440, 2560)
+
+
+def test_douyin_profile_direct_rendition_beats_throttled_ratio_endpoints(
+    monkeypatch,
+) -> None:
+    media_id = "2222222222222222222"
+    profile_id = "profile-a"
+    direct_url = "https://v26-web.douyinvod.com/verified-1440.mp4"
+    engine = MediaDownloader(DownloaderConfig(cookie_browser="chrome"))
+    info = engine._douyin_raw_info_from_profile_metadata(
+        {
+            "profile_owner_verified": True,
+            "douyin_profile_media": {
+                "media_id": media_id,
+                "owner_id": profile_id,
+                "video_uri": "v0200fg10000fixturevideoid",
+                "minimum_width": 1440,
+                "minimum_height": 2560,
+                "direct_candidates": [
+                    {
+                        "width": 1440,
+                        "height": 2560,
+                        "bit_rate": 1_320_511,
+                        "codec_hint": "hevc",
+                        "urls": [direct_url],
+                    }
+                ],
+            },
+        },
+        expected_id=media_id,
+        expected_profile_id=profile_id,
+        verification_url=f"https://www.douyin.com/user/{profile_id}",
+        fallback_title="Video",
+    )
+    assert info is not None
+    assert info["_douyin_minimum_width"] == 1440
+    assert info["_douyin_minimum_height"] == 2560
+
+    def probe(ydl, url, *, expected_duration, should_cancel):
+        if url == direct_url:
+            width, height, bit_rate, codec = 1440, 2560, 1_320_511, "hevc"
+        else:
+            ratio = parse_qs(urlsplit(url).query)["ratio"][0]
+            if ratio == "720p":
+                width, height, bit_rate, codec = 720, 1280, 700_000, "h264"
+            else:
+                width, height, bit_rate, codec = 1080, 1920, 1_000_000, "h264"
+        return {
+            "url": url,
+            "width": width,
+            "height": height,
+            "bit_rate": bit_rate,
+            "filesize": bit_rate * 3,
+            "duration": expected_duration,
+            "vcodec": codec,
+            "acodec": "aac",
+        }
+
+    monkeypatch.setattr(engine, "_probe_douyin_candidate", probe)
+    assert engine._add_douyin_probe_formats(
+        object(),
+        info,
+        expected_id=media_id,
+        expected_profile_id=profile_id,
+        verification_url=f"https://www.douyin.com/user/{profile_id}",
+        should_cancel=lambda: False,
+    )
+    assert any(
+        value["format_id"].startswith("douyin-api-1440x2560")
+        for value in info["formats"]
+    )
+
+
+def test_douyin_expired_direct_mirror_is_optional_when_floor_is_met(
+    monkeypatch,
+) -> None:
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    info = _douyin_raw_info()
+    info["_douyin_minimum_width"] = 1080
+    info["_douyin_minimum_height"] = 1920
+    info["_douyin_direct_candidates"] = [
+        {
+            "width": 1080,
+            "height": 1920,
+            "urls": ["https://v26-web.douyinvod.com/expired.mp4"],
+        }
+    ]
+
+    def probe(ydl, url, *, expected_duration, should_cancel):
+        if "expired.mp4" in url:
+            raise TimeoutError("expired direct URL")
+        return {
+            "url": url,
+            "width": 1080,
+            "height": 1920,
+            "bit_rate": 1_000_000,
+            "filesize": 3_000_000,
+            "duration": expected_duration,
+            "vcodec": "h264",
+            "acodec": "aac",
+        }
+
+    monkeypatch.setattr(engine, "_probe_douyin_candidate", probe)
+    assert engine._add_douyin_probe_formats(
+        object(),
+        info,
+        expected_id="1111111111111111111",
+        verification_url="https://www.douyin.com/video/1111111111111111111",
+        should_cancel=lambda: False,
+    )
+
+
+def test_douyin_direct_floor_never_hides_ratio_probe_failure(monkeypatch) -> None:
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    direct_url = "https://v26-web.douyinvod.com/verified-1080.mp4"
+    info = _douyin_raw_info()
+    info["_douyin_minimum_width"] = 1080
+    info["_douyin_minimum_height"] = 1920
+    info["_douyin_direct_candidates"] = [
+        {"width": 1080, "height": 1920, "urls": [direct_url]}
+    ]
+
+    def probe(ydl, url, *, expected_duration, should_cancel):
+        if url != direct_url and parse_qs(urlsplit(url).query)["ratio"][0] == "default":
+            raise TimeoutError("default endpoint timed out")
+        return {
+            "url": url,
+            "width": 1080,
+            "height": 1920,
+            "bit_rate": 1_000_000,
+            "filesize": 3_000_000,
+            "duration": expected_duration,
+            "vcodec": "h264",
+            "acodec": "aac",
+        }
+
+    monkeypatch.setattr(engine, "_probe_douyin_candidate", probe)
+    assert (
+        engine._add_douyin_probe_formats(
+            object(),
+            info,
+            expected_id="1111111111111111111",
+            verification_url="https://www.douyin.com/video/1111111111111111111",
+            should_cancel=lambda: False,
+        )
+        is False
+    )
+    assert "default" in info["_douyin_probe_failure"]
 
 
 def test_douyin_cached_profile_item_never_falls_back_to_unverified_720(
@@ -974,7 +1545,83 @@ def test_douyin_720_probe_does_not_override_native_1080(monkeypatch) -> None:
     assert (selected["width"], selected["height"]) == (1080, 1920)
 
 
-def test_douyin_unplayable_4k_probe_does_not_override_playable_2k(
+def test_douyin_cached_floor_blocks_silently_throttled_720_probes(
+    monkeypatch,
+) -> None:
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    info = _douyin_raw_info()
+    info["formats"][0]["format_id"] = "item-cached-play"
+    info["_douyin_verified_cache_only"] = True
+    info["_douyin_minimum_width"] = 1080
+    info["_douyin_minimum_height"] = 1920
+
+    def probe(ydl, url, *, expected_duration, should_cancel):
+        return {
+            "url": url,
+            "width": 720,
+            "height": 1280,
+            "bit_rate": 700_000,
+            "filesize": 7_000_000,
+            "duration": expected_duration,
+            "vcodec": "h264",
+            "acodec": "aac",
+        }
+
+    monkeypatch.setattr(engine, "_probe_douyin_candidate", probe)
+
+    assert (
+        engine._add_douyin_probe_formats(
+            object(),
+            info,
+            expected_id="1111111111111111111",
+            verification_url="https://www.douyin.com/video/1111111111111111111",
+            should_cancel=lambda: False,
+        )
+        is False
+    )
+    assert not any(
+        value["format_id"].startswith("douyin-api-") for value in info["formats"]
+    )
+    assert "720x1280" in info["_douyin_probe_failure"]
+    assert "minimum 1080x1920" in info["_douyin_probe_failure"]
+
+
+def test_douyin_native_720_floor_accepts_verified_720_probes(monkeypatch) -> None:
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    info = _douyin_raw_info()
+    info["formats"][0]["format_id"] = "item-cached-play"
+    info["_douyin_verified_cache_only"] = True
+    info["_douyin_minimum_width"] = 720
+    info["_douyin_minimum_height"] = 1280
+
+    def probe(ydl, url, *, expected_duration, should_cancel):
+        return {
+            "url": url,
+            "width": 720,
+            "height": 1280,
+            "bit_rate": 700_000,
+            "filesize": 7_000_000,
+            "duration": expected_duration,
+            "vcodec": "h264",
+            "acodec": "aac",
+        }
+
+    monkeypatch.setattr(engine, "_probe_douyin_candidate", probe)
+
+    assert engine._add_douyin_probe_formats(
+        object(),
+        info,
+        expected_id="1111111111111111111",
+        verification_url="https://www.douyin.com/video/1111111111111111111",
+        should_cancel=lambda: False,
+    )
+    assert any(
+        value["format_id"].startswith("douyin-api-720x1280")
+        for value in info["formats"]
+    )
+
+
+def test_douyin_unsupported_top_codec_blocks_lower_quality(
     monkeypatch,
 ) -> None:
     engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
@@ -982,46 +1629,77 @@ def test_douyin_unplayable_4k_probe_does_not_override_playable_2k(
 
     def probe(ydl, url, *, expected_duration, should_cancel):
         ratio = parse_qs(urlsplit(url).query)["ratio"][0]
-        if ratio == "4k":
-            return {
-                "url": url,
-                "width": 2160,
-                "height": 3840,
-                "bit_rate": 4_000_000,
-                "filesize": 40_000_000,
-                "duration": expected_duration,
-                "vcodec": "vvc",
-                "acodec": "aac",
-            }
-        if ratio == "2k":
-            return {
-                "url": url,
-                "width": 1440,
-                "height": 2560,
-                "bit_rate": 2_000_000,
-                "filesize": 20_000_000,
-                "duration": expected_duration,
-                "vcodec": "h265",
-                "acodec": "aac",
-            }
-        return None
+        dimensions = {
+            "default": (1440, 2560, 2_000_000, 20_000_000, "h265"),
+            "4k": (2160, 3840, 4_000_000, 40_000_000, "vvc"),
+            "2k": (1440, 2560, 2_000_000, 20_000_000, "h265"),
+            "1080p": (1080, 1920, 1_000_000, 10_000_000, "h264"),
+            "720p": (720, 1280, 700_000, 7_000_000, "h264"),
+        }
+        width, height, bit_rate, filesize, codec = dimensions[ratio]
+        return {
+            "url": url,
+            "width": width,
+            "height": height,
+            "bit_rate": bit_rate,
+            "filesize": filesize,
+            "duration": expected_duration,
+            "vcodec": codec,
+            "acodec": "aac",
+        }
 
     monkeypatch.setattr(engine, "_probe_douyin_candidate", probe)
-    engine._add_douyin_probe_formats(
+    assert (
+        engine._add_douyin_probe_formats(
+            object(),
+            info,
+            expected_id="1111111111111111111",
+            verification_url="https://www.douyin.com/user/expected-profile",
+            should_cancel=lambda: False,
+        )
+        is False
+    )
+    assert not any(
+        value["format_id"].startswith("douyin-api-") for value in info["formats"]
+    )
+    assert "unsupported video codec vvc" in info["_douyin_probe_failure"]
+
+
+def test_douyin_lower_resolution_unsupported_codec_does_not_block_best(
+    monkeypatch,
+) -> None:
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    info = _douyin_raw_info()
+
+    def probe(ydl, url, *, expected_duration, should_cancel):
+        ratio = parse_qs(urlsplit(url).query)["ratio"][0]
+        if ratio == "720p":
+            width, height, codec = 720, 1280, "vvc"
+        else:
+            width, height, codec = 1440, 2560, "hevc"
+        return {
+            "url": url,
+            "width": width,
+            "height": height,
+            "bit_rate": 2_000_000,
+            "filesize": 20_000_000,
+            "duration": expected_duration,
+            "vcodec": codec,
+            "acodec": "aac",
+        }
+
+    monkeypatch.setattr(engine, "_probe_douyin_candidate", probe)
+    assert engine._add_douyin_probe_formats(
         object(),
         info,
         expected_id="1111111111111111111",
-        verification_url="https://www.douyin.com/user/expected-profile",
+        verification_url="https://www.douyin.com/video/1111111111111111111",
         should_cancel=lambda: False,
     )
-
-    with YoutubeDL(
-        {"quiet": True, **engine._download_format_options(Platform.DOUYIN)}
-    ) as ydl:
-        selected = ydl.process_ie_result(info, download=False)
-
-    assert selected["format_id"].startswith("douyin-api-1440x2560")
-    assert selected["vcodec"] == "h265"
+    assert any(
+        value["format_id"].startswith("douyin-api-1440x2560")
+        for value in info["formats"]
+    )
 
 
 def test_douyin_uri_extraction_rejects_crosswired_or_ambiguous_media() -> None:
@@ -1210,6 +1888,121 @@ def test_douyin_probe_failures_are_safe_and_actionable(monkeypatch) -> None:
         "default,4k,2k,1080p,720p: media endpoint network request failed"
     )
     assert "must-not-leak" not in info["_douyin_probe_failure"]
+
+
+def test_douyin_partial_probe_success_never_allows_720p_fallback(monkeypatch) -> None:
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    info = _douyin_raw_info()
+    info["_douyin_verified_cache_only"] = True
+
+    def probe(ydl, url, *, expected_duration, should_cancel):
+        ratio = parse_qs(urlsplit(url).query)["ratio"][0]
+        if ratio != "720p":
+            raise TimeoutError(f"{ratio} timed out")
+        return {
+            "url": url,
+            "width": 720,
+            "height": 1280,
+            "bit_rate": 700_000,
+            "filesize": 7_000_000,
+            "duration": expected_duration,
+            "vcodec": "h264",
+            "acodec": "aac",
+        }
+
+    monkeypatch.setattr(engine, "_probe_douyin_candidate", probe)
+
+    assert (
+        engine._add_douyin_probe_formats(
+            object(),
+            info,
+            expected_id="1111111111111111111",
+            verification_url="https://www.douyin.com/video/1111111111111111111",
+            should_cancel=lambda: False,
+        )
+        is False
+    )
+    assert not any(
+        value["format_id"].startswith("douyin-api-") for value in info["formats"]
+    )
+    assert info["_douyin_probe_failure"].startswith(
+        "default,4k,2k,1080p: media request or FFprobe timed out"
+    )
+
+
+def test_download_error_redacts_external_urls_headers_and_tokens() -> None:
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    error = DownloadError(
+        "transfer failed for https://cdn.example/video?token=must-not-leak "
+        "Authorization: Bearer top-secret sessionid=also-secret "
+        "X-Bogus: bogus-secret signature: signature-secret "
+        "headers={'Cookie': 'dict-cookie-secret', "
+        "'Authorization': 'Bearer dict-bearer-secret'} "
+        "Bearer standalone-secret"
+    )
+
+    with pytest.raises(MediaDownloadError) as raised:
+        engine._raise_download_error(
+            error,
+            "https://www.douyin.com/video/1111111111111111111",
+        )
+
+    message = str(raised.value)
+    assert "[redacted URL]" in message
+    assert "must-not-leak" not in message
+    assert "top-secret" not in message
+    assert "also-secret" not in message
+    assert "bogus-secret" not in message
+    assert "signature-secret" not in message
+    assert "dict-cookie-secret" not in message
+    assert "dict-bearer-secret" not in message
+    assert "standalone-secret" not in message
+
+
+@pytest.mark.parametrize(
+    ("raw_message", "secret"),
+    [
+        ("X-Bogus: bogus-secret", "bogus-secret"),
+        ("signature: signature-secret", "signature-secret"),
+        ("Bearer standalone-secret", "standalone-secret"),
+        ("headers={'Cookie': 'dict-cookie-secret'}", "dict-cookie-secret"),
+        (
+            "headers={'Authorization': 'Bearer dict-bearer-secret'}",
+            "dict-bearer-secret",
+        ),
+        ("params={'msToken': 'MS_SECRET'}", "MS_SECRET"),
+        ("params={'a_bogus': 'AB_SECRET'}", "AB_SECRET"),
+        ("params={'verifyFp': 'FP_SECRET'}", "FP_SECRET"),
+        ("params={'passport_csrf_token': 'CSRF_SECRET'}", "CSRF_SECRET"),
+        ("cookies={'odin_tt': 'ODIN_SECRET'}", "ODIN_SECRET"),
+        ("sid_tt=SID_SECRET; sessionid_ss=SESSION_SECRET", "SID_SECRET"),
+        ("sid_tt=SID_SECRET; sessionid_ss=SESSION_SECRET", "SESSION_SECRET"),
+        ("headers=[('Cookie', 'sid=COOKIESECRET')]", "COOKIESECRET"),
+        ("headers=[('X-Bogus', 'BOGUSSECRET')]", "BOGUSSECRET"),
+        (
+            "headers=(('Authorization', 'Basic BASICSECRET'),)",
+            "BASICSECRET",
+        ),
+        ("cookies={'sid': 'COOKIESECRET'}", "COOKIESECRET"),
+        ("session_id=SESSIONSECRET", "SESSIONSECRET"),
+        (
+            "Cookie: foo=bar; arbitrary_name=LEAKME; sid_tt=SENSITIVE",
+            "LEAKME",
+        ),
+        (
+            "cookies={'sid':'SECRET1','arbitrary':'SECRET2'}",
+            "SECRET2",
+        ),
+        ("Set-Cookie=sid=SECRET1; foo=SECRET2", "SECRET2"),
+    ],
+)
+def test_external_error_redaction_covers_header_representations(
+    raw_message: str,
+    secret: str,
+) -> None:
+    sanitized = safe_external_error_message(raw_message)
+    assert secret not in sanitized
+    assert safe_external_error_message(sanitized) == sanitized
 
 
 def test_douyin_ffprobe_missing_is_explicit(monkeypatch) -> None:
@@ -1648,7 +2441,7 @@ def test_douyin_download_disables_partial_resume_between_quality_retries(
     monkeypatch.setattr(
         engine,
         "_add_douyin_probe_formats",
-        lambda *args, **kwargs: False,
+        lambda *args, **kwargs: True,
     )
     item = DownloadItem(
         id="douyin-item",

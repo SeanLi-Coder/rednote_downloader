@@ -132,6 +132,7 @@ class DownloadJob(BaseModel):
     cookie_fallback_used: bool = False
     discovery_complete: bool = True
     cancel_requested: bool = False
+    retryable: bool = True
     revision: int = 0
     created_at: datetime = Field(default_factory=utc_now)
     started_at: datetime | None = None

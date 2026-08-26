@@ -17,7 +17,8 @@ from pydantic import BaseModel, Field, field_validator
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .downloader import DownloaderConfig
-from .platforms import UnsupportedUrlError
+from .models import DownloadJob
+from .platforms import UnsupportedUrlError, identify_url
 from .storage import JobNotFoundError
 from .task_manager import (
     DownloadManager,
@@ -118,6 +119,17 @@ def _http_error(exc: Exception) -> HTTPException:
     return HTTPException(status_code=400, detail=str(exc))
 
 
+def _public_job(job: DownloadJob) -> DownloadJob:
+    public = job.model_copy(deep=True)
+    for item in public.items:
+        for key in ("douyin_item_media", "douyin_profile_media"):
+            cached = item.metadata.get(key)
+            if isinstance(cached, dict):
+                cached.pop("video_uri", None)
+                cached.pop("direct_candidates", None)
+    return public
+
+
 @app.get("/api/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -152,11 +164,13 @@ def update_config(request: AppConfig) -> AppConfig:
 @app.post("/api/jobs", status_code=201)
 def create_job(request: CreateJobRequest):
     try:
-        return manager.create_job(
-            request.url,
-            output_root=config.download_dir,
-            cookie_browser="chrome" if config.use_chrome_cookies else None,
-            cookie_profile=config.chrome_profile,
+        return _public_job(
+            manager.create_job(
+                request.url,
+                output_root=config.download_dir,
+                cookie_browser="chrome" if config.use_chrome_cookies else None,
+                cookie_profile=config.chrome_profile,
+            )
         )
     except Exception as exc:
         raise _http_error(exc) from exc
@@ -164,13 +178,13 @@ def create_job(request: CreateJobRequest):
 
 @app.get("/api/jobs")
 def list_jobs():
-    return manager.list_jobs()
+    return [_public_job(job) for job in manager.list_jobs()]
 
 
 @app.get("/api/jobs/{job_id}")
 def get_job(job_id: str):
     try:
-        return manager.get_job(job_id)
+        return _public_job(manager.get_job(job_id))
     except Exception as exc:
         raise _http_error(exc) from exc
 
@@ -179,8 +193,8 @@ def get_job(job_id: str):
 def retry_job(job_id: str, request: Annotated[RetryRequest, Body()]):
     try:
         if request.item_id:
-            return manager.retry_item(job_id, request.item_id)
-        return manager.retry_failed(job_id)
+            return _public_job(manager.retry_item(job_id, request.item_id))
+        return _public_job(manager.retry_failed(job_id))
     except Exception as exc:
         raise _http_error(exc) from exc
 
@@ -188,7 +202,7 @@ def retry_job(job_id: str, request: Annotated[RetryRequest, Body()]):
 @app.post("/api/jobs/{job_id}/cancel")
 def cancel_job(job_id: str):
     try:
-        return manager.cancel_job(job_id)
+        return _public_job(manager.cancel_job(job_id))
     except Exception as exc:
         raise _http_error(exc) from exc
 
@@ -249,7 +263,10 @@ def _open_chrome(url: str) -> None:
 def open_verification(job_id: str) -> dict[str, str]:
     try:
         job = manager.get_job(job_id)
-        url = job.verification_url or job.source_url
+        source = identify_url(job.source_url)
+        if source.platform != job.platform or source.kind != job.source_kind:
+            raise UnsupportedUrlError("The original task URL is no longer verifiable")
+        url = source.url
         _open_chrome(url)
         return {"status": "opened", "url": url}
     except Exception as exc:
@@ -261,7 +278,10 @@ def events() -> StreamingResponse:
     messages: queue.Queue[str] = queue.Queue(maxsize=1)
 
     def listener(_, job) -> None:
-        payload = json.dumps(job.model_dump(mode="json"), ensure_ascii=False)
+        payload = json.dumps(
+            _public_job(job).model_dump(mode="json"),
+            ensure_ascii=False,
+        )
         try:
             messages.put_nowait(payload)
         except queue.Full:

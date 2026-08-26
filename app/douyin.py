@@ -5,7 +5,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from http.cookiejar import CookieJar
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from yt_dlp.cookies import extract_cookies_from_browser
@@ -26,6 +26,9 @@ AUTH_TEXT_PATTERNS = (
     "网络环境存在风险",
     "登录后查看",
 )
+
+DOUYIN_QUALITY_FLOOR_SHORT_EDGE = 1080
+DOUYIN_QUALITY_FLOOR_LONG_EDGE = 1920
 
 
 @dataclass(slots=True)
@@ -110,6 +113,90 @@ def _parse_profile_awemes(
     return entries, authors, bool(has_more) if has_more is not None else None
 
 
+def quality_floor_dimensions(
+    candidates: Iterable[Any],
+    *,
+    cap_full_hd: bool = True,
+) -> tuple[int, int] | None:
+    """Return the largest valid dimensions, optionally capped at Full HD."""
+    dimensions: list[tuple[int, int]] = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        try:
+            width = int(candidate.get("width") or candidate.get("minimum_width") or 0)
+            height = int(
+                candidate.get("height") or candidate.get("minimum_height") or 0
+            )
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if not (0 < width <= 16_384 and 0 < height <= 16_384):
+            continue
+        dimensions.append((width, height))
+    if not dimensions:
+        return None
+
+    width, height = max(dimensions, key=lambda value: value[0] * value[1])
+    if not cap_full_hd:
+        return width, height
+    if width <= height:
+        return (
+            min(width, DOUYIN_QUALITY_FLOOR_SHORT_EDGE),
+            min(height, DOUYIN_QUALITY_FLOOR_LONG_EDGE),
+        )
+    return (
+        min(width, DOUYIN_QUALITY_FLOOR_LONG_EDGE),
+        min(height, DOUYIN_QUALITY_FLOOR_SHORT_EDGE),
+    )
+
+
+def _safe_direct_media_urls(address: dict[str, Any]) -> list[str]:
+    result: list[str] = []
+    for value in address.get("url_list") or []:
+        if not isinstance(value, str) or len(value) > 8_192:
+            continue
+        parsed = urlsplit(value)
+        hostname = (parsed.hostname or "").lower().rstrip(".")
+        if parsed.scheme != "https" or not any(
+            hostname == domain or hostname.endswith(f".{domain}")
+            for domain in ("douyin.com", "douyinvod.com", "amemv.com")
+        ):
+            continue
+        if value not in result:
+            result.append(value)
+        if len(result) >= 5:
+            break
+    return result
+
+
+def _direct_quality_candidate(
+    address: Any,
+    *,
+    bit_rate: Any = None,
+    codec_hint: str | None = None,
+) -> dict[str, Any] | None:
+    if not isinstance(address, dict):
+        return None
+    dimensions = quality_floor_dimensions([address], cap_full_hd=False)
+    urls = _safe_direct_media_urls(address)
+    if not dimensions or not urls:
+        return None
+    candidate: dict[str, Any] = {
+        "width": dimensions[0],
+        "height": dimensions[1],
+        "urls": urls,
+    }
+    try:
+        normalized_bit_rate = int(bit_rate or address.get("bit_rate") or 0)
+    except (TypeError, ValueError, OverflowError):
+        normalized_bit_rate = 0
+    if normalized_bit_rate > 0:
+        candidate["bit_rate"] = normalized_bit_rate
+    if codec_hint:
+        candidate["codec_hint"] = codec_hint
+    return candidate
+
+
 def _minimal_aweme_metadata(
     aweme: dict[str, Any], profile_id: str
 ) -> tuple[str, dict[str, Any]] | None:
@@ -124,15 +211,13 @@ def _minimal_aweme_metadata(
     if not isinstance(video, dict):
         return None
     video_uri = ""
-    addresses = [
-        video.get(address_key)
-        for address_key in (
-            "play_addr",
-            "play_addr_h264",
-            "play_addr_265",
-            "play_addr_bytevc1",
-        )
+    address_values = [
+        ("play_addr", video.get("play_addr"), None),
+        ("play_addr_h264", video.get("play_addr_h264"), "h264"),
+        ("play_addr_265", video.get("play_addr_265"), "hevc"),
+        ("play_addr_bytevc1", video.get("play_addr_bytevc1"), "hevc"),
     ]
+    addresses = [value for _, value, _ in address_values]
     bit_rates = video.get("bit_rate")
     if isinstance(bit_rates, list):
         addresses.extend(
@@ -153,6 +238,68 @@ def _minimal_aweme_metadata(
         "owner_id": owner_id,
         "video_uri": video_uri,
     }
+    direct_candidates = [
+        candidate
+        for _, address, codec_hint in address_values
+        if (
+            candidate := _direct_quality_candidate(
+                address,
+                codec_hint=codec_hint,
+            )
+        )
+    ]
+    if isinstance(bit_rates, list):
+        for value in bit_rates:
+            if not isinstance(value, dict):
+                continue
+            codec_hint = (
+                "hevc"
+                if value.get("is_h265") in {1, True}
+                or value.get("is_bytevc1") in {1, True}
+                else "h264"
+            )
+            candidate = _direct_quality_candidate(
+                value.get("play_addr"),
+                bit_rate=value.get("bit_rate"),
+                codec_hint=codec_hint,
+            )
+            if candidate:
+                direct_candidates.append(candidate)
+    if direct_candidates:
+        direct_candidates.sort(
+            key=lambda value: (
+                value["width"] * value["height"],
+                int(value.get("bit_rate") or 0),
+            ),
+            reverse=True,
+        )
+        highest_pixels = max(
+            value["width"] * value["height"] for value in direct_candidates
+        )
+        unique_candidates: list[dict[str, Any]] = []
+        seen_candidates: set[tuple[int, int, tuple[str, ...]]] = set()
+        for candidate in direct_candidates:
+            if candidate["width"] * candidate["height"] != highest_pixels:
+                continue
+            signature = (
+                candidate["width"],
+                candidate["height"],
+                tuple(candidate["urls"]),
+            )
+            if signature in seen_candidates:
+                continue
+            seen_candidates.add(signature)
+            unique_candidates.append(candidate)
+        metadata["direct_candidates"] = unique_candidates[:4]
+    quality_candidates: list[Any] = [video, *addresses]
+    if isinstance(bit_rates, list):
+        quality_candidates.extend(bit_rates)
+    quality_floor = quality_floor_dimensions(
+        metadata.get("direct_candidates") or quality_candidates,
+        cap_full_hd=not bool(metadata.get("direct_candidates")),
+    )
+    if quality_floor:
+        metadata["minimum_width"], metadata["minimum_height"] = quality_floor
     duration_ms = video.get("duration")
     if isinstance(duration_ms, int) and duration_ms > 0:
         metadata["duration_ms"] = duration_ms
@@ -166,6 +313,32 @@ def _minimal_aweme_metadata(
     if isinstance(nickname, str) and nickname.strip():
         metadata["author"] = nickname.strip()
     return aweme_id, metadata
+
+
+def discover_item_metadata_from_profile(
+    profile_id: str,
+    media_id: str,
+    *,
+    cookie_profile: str | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+) -> dict[str, Any] | None:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{10,200}", profile_id):
+        return None
+    if not media_id.isdigit():
+        return None
+    profile_url = f"https://www.douyin.com/user/{profile_id}"
+    awemes = fetch_signed_profile_awemes(
+        profile_url,
+        profile_id,
+        cookie_profile=cookie_profile,
+        should_cancel=should_cancel,
+    )
+    for aweme in awemes:
+        if str(aweme.get("aweme_id") or "").strip() != media_id:
+            continue
+        parsed = _minimal_aweme_metadata(aweme, profile_id)
+        return parsed[1] if parsed else None
+    return None
 
 
 def _cookie_jar_to_playwright(cookie_jar: CookieJar) -> list[dict[str, Any]]:

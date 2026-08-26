@@ -11,6 +11,7 @@ class UnsupportedUrlError(ValueError):
 
 
 _URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+_MARKDOWN_URL_RE = re.compile(r"\[[^\]]*\]\((https?://[^\s)]+)\)", re.IGNORECASE)
 _TRAILING_SHARE_PUNCTUATION = ").,;!?]}\u3002\uff0c\uff1b\uff01\uff1f\u3011\uff09"
 
 
@@ -20,9 +21,17 @@ def _is_domain(host: str, domain: str) -> bool:
 
 def extract_url(value: str) -> str:
     value = value.strip()
-    match = _URL_RE.search(value)
+    markdown_match = _MARKDOWN_URL_RE.search(value)
+    plain_match = _URL_RE.search(value)
+    use_markdown = bool(
+        markdown_match
+        and (plain_match is None or markdown_match.start() <= plain_match.start())
+    )
+    match = markdown_match if use_markdown else plain_match
     if match:
-        value = match.group(0).rstrip(_TRAILING_SHARE_PUNCTUATION)
+        value = match.group(1 if use_markdown else 0).rstrip(
+            _TRAILING_SHARE_PUNCTUATION
+        )
     parsed = urlsplit(value)
     if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
         raise UnsupportedUrlError("Please enter a complete http:// or https:// URL")
@@ -43,6 +52,7 @@ def identify_url(value: str) -> UrlInfo:
     host = (parsed.hostname or "").lower().rstrip(".")
     path = parsed.path.rstrip("/") or "/"
     query = parse_qs(parsed.query)
+    query_with_blanks = parse_qs(parsed.query, keep_blank_values=True)
 
     if _is_domain(host, "xhslink.com"):
         return UrlInfo(
@@ -60,10 +70,26 @@ def identify_url(value: str) -> UrlInfo:
     if host == "v.douyin.com":
         return UrlInfo(url=url, platform=Platform.DOUYIN, kind=SourceKind.SHORT_LINK)
     if _is_domain(host, "douyin.com"):
-        if re.search(r"/user/[^/]+", path):
-            kind = SourceKind.PROFILE
-        elif re.search(r"/video/\d+", path):
+        user_match = re.fullmatch(r"/user/[^/]+", path)
+        modal_values = query_with_blanks.get("modal_id", [])
+        modal_ids = set(modal_values)
+        video_match = re.fullmatch(r"/video/(\d+)", path)
+        if video_match:
+            media_id = video_match.group(1)
+            url = f"https://www.douyin.com/video/{media_id}"
             kind = SourceKind.ITEM
+        elif (
+            user_match
+            and len(modal_ids) == 1
+            and all(re.fullmatch(r"\d+", value) for value in modal_values)
+        ):
+            media_id = next(iter(modal_ids))
+            url = f"https://www.douyin.com/video/{media_id}"
+            kind = SourceKind.ITEM
+        elif user_match and "modal_id" in query_with_blanks:
+            raise UnsupportedUrlError("Invalid or ambiguous Douyin modal video URL")
+        elif user_match:
+            kind = SourceKind.PROFILE
         elif re.search(r"/note/\d+", path):
             raise UnsupportedUrlError("Douyin image posts are not supported yet")
         else:

@@ -7,6 +7,7 @@ from app.douyin import (
     _minimal_aweme_metadata,
     _parse_profile_awemes,
     discover_profile,
+    quality_floor_dimensions,
 )
 from app.errors import AuthenticationRequiredError
 
@@ -31,6 +32,8 @@ def test_douyin_signed_profile_discovery_returns_verified_complete_metadata(
                 },
                 "video": {
                     "duration": 72_800,
+                    "width": 1440,
+                    "height": 2560,
                     "play_addr": {"uri": video_uri},
                 },
             }
@@ -46,6 +49,8 @@ def test_douyin_signed_profile_discovery_returns_verified_complete_metadata(
         "media_id": aweme_id,
         "owner_id": profile_id,
         "video_uri": video_uri,
+        "minimum_width": 1080,
+        "minimum_height": 1920,
         "duration_ms": 72_800,
         "create_time": 1_756_656_000,
         "title": "Signed profile video",
@@ -81,6 +86,131 @@ def test_douyin_minimal_metadata_accepts_265_and_bitrate_uris() -> None:
     assert from_bitrate and from_bitrate[1]["video_uri"] == (
         "v0200fg10000bitratefixtureid"
     )
+
+
+def test_douyin_minimal_metadata_caches_conservative_quality_floor() -> None:
+    profile_id = "MS4wLjABAAAAexpected"
+    result = _minimal_aweme_metadata(
+        {
+            "aweme_id": "1111111111111111111",
+            "author": {"sec_uid": profile_id},
+            "video": {
+                "play_addr": {"uri": "v0200fg10000fixturevideoid"},
+                "bit_rate": [
+                    {
+                        "width": 2560,
+                        "height": 1440,
+                        "play_addr": {"uri": "v0200fg10000highqualityid"},
+                    }
+                ],
+            },
+        },
+        profile_id,
+    )
+
+    assert result is not None
+    assert result[1]["minimum_width"] == 1920
+    assert result[1]["minimum_height"] == 1080
+
+
+def test_douyin_quality_floor_does_not_inflate_native_720() -> None:
+    assert quality_floor_dimensions([{"width": 720, "height": 1280}]) == (
+        720,
+        1280,
+    )
+
+
+def test_douyin_metadata_keeps_highest_verified_direct_rendition() -> None:
+    profile_id = "MS4wLjABAAAAexpected"
+    shared_uri = "v0200fg10000fixturevideoid"
+    result = _minimal_aweme_metadata(
+        {
+            "aweme_id": "1111111111111111111",
+            "author": {"sec_uid": profile_id},
+            "video": {
+                "width": 1440,
+                "height": 2560,
+                "play_addr": {
+                    "uri": shared_uri,
+                    "width": 1080,
+                    "height": 1920,
+                    "url_list": ["https://v26-web.douyinvod.com/verified-1080.mp4"],
+                },
+                "bit_rate": [
+                    {
+                        "bit_rate": 1_320_511,
+                        "is_bytevc1": 1,
+                        "play_addr": {
+                            "uri": shared_uri,
+                            "width": 1440,
+                            "height": 2560,
+                            "url_list": [
+                                "https://v11-weba.douyinvod.com/verified-1440.mp4",
+                                "https://evil.example/untrusted.mp4",
+                            ],
+                        },
+                    }
+                ],
+            },
+        },
+        profile_id,
+    )
+
+    assert result is not None
+    metadata = result[1]
+    assert metadata["minimum_width"] == 1440
+    assert metadata["minimum_height"] == 2560
+    assert metadata["direct_candidates"] == [
+        {
+            "width": 1440,
+            "height": 2560,
+            "urls": ["https://v11-weba.douyinvod.com/verified-1440.mp4"],
+            "bit_rate": 1_320_511,
+            "codec_hint": "hevc",
+        }
+    ]
+
+
+def test_douyin_explicit_bitrate_candidate_precedes_root_fallbacks() -> None:
+    profile_id = "MS4wLjABAAAAexpected"
+    video = {
+        "play_addr": {"uri": "v0200fg10000fixturevideoid"},
+        "bit_rate": [
+            {
+                "bit_rate": 2_000_000,
+                "is_h265": 1,
+                "play_addr": {
+                    "uri": "v0200fg10000fixturevideoid",
+                    "width": 1440,
+                    "height": 2560,
+                    "url_list": ["https://v26-web.douyinvod.com/explicit-high.mp4"],
+                },
+            }
+        ],
+    }
+    for index, key in enumerate(
+        ("play_addr", "play_addr_h264", "play_addr_265", "play_addr_bytevc1")
+    ):
+        video[key] = {
+            "uri": "v0200fg10000fixturevideoid",
+            "width": 1440,
+            "height": 2560,
+            "url_list": [f"https://v26-web.douyinvod.com/root-{index}.mp4"],
+        }
+    result = _minimal_aweme_metadata(
+        {
+            "aweme_id": "1111111111111111111",
+            "author": {"sec_uid": profile_id},
+            "video": video,
+        },
+        profile_id,
+    )
+
+    assert result is not None
+    candidates = result[1]["direct_candidates"]
+    assert len(candidates) == 4
+    assert candidates[0]["bit_rate"] == 2_000_000
+    assert candidates[0]["urls"] == ["https://v26-web.douyinvod.com/explicit-high.mp4"]
 
 
 def test_douyin_post_response_must_match_requested_profile() -> None:

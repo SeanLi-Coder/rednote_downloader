@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import threading
 import time
 import uuid
@@ -8,7 +9,15 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 
-from .downloader import DownloaderConfig, EngineEvent, MediaDownloader, safe_component
+from .downloader import (
+    DOUYIN_ITEM_EXPANSION_MESSAGE,
+    DiscoveryResult,
+    DownloaderConfig,
+    EngineEvent,
+    MediaDownloader,
+    safe_component,
+    safe_external_error_message,
+)
 from .errors import AuthenticationRequiredError, DownloadCancelledError
 from .models import (
     ACTIVE_JOB_STATUSES,
@@ -42,6 +51,19 @@ Listener = Callable[[ManagerEvent, DownloadJob], None]
 LEGACY_DOUYIN_RESULT_ERROR = (
     "This legacy Douyin profile result must be manually reviewed; "
     "create a new task before downloading again."
+)
+DOUYIN_ITEM_SOURCE_ERROR = (
+    "This legacy Douyin item task no longer has a verifiable original video URL. "
+    "Its queued entries will not be retried; create a new task from the original "
+    "video link."
+)
+DOUYIN_ITEM_MIGRATION_MESSAGE = (
+    "This legacy Douyin item task must be rediscovered from its original video "
+    "link before downloading. Existing files were preserved."
+)
+_LEGACY_DOUYIN_MARKDOWN_ITEM_RE = re.compile(
+    r"(https://www\.douyin\.com/video/(\d+))\]\("
+    r"(https://www\.douyin\.com/video/(\d+))"
 )
 
 
@@ -78,6 +100,141 @@ class DownloadManager:
         for job in jobs:
             changed = False
             legacy_douyin_result = False
+            migrated_douyin_item_source = False
+            recovered_legacy_source = self._legacy_douyin_markdown_item_source(
+                job.source_url
+            )
+            try:
+                normalized_source = identify_url(
+                    recovered_legacy_source or job.source_url
+                )
+            except (TypeError, ValueError):
+                normalized_source = None
+            if (
+                job.platform == Platform.DOUYIN
+                and normalized_source
+                and normalized_source.platform == Platform.DOUYIN
+                and normalized_source.kind == SourceKind.ITEM
+            ):
+                normalized_media_id = MediaDownloader._douyin_video_id(
+                    normalized_source.url
+                )
+                requires_item_migration = (
+                    recovered_legacy_source is not None
+                    or job.source_kind != SourceKind.ITEM
+                    or MediaDownloader._douyin_video_id(job.source_url)
+                    != normalized_media_id
+                )
+                source_changed = (
+                    job.source_url != normalized_source.url
+                    or job.source_kind != SourceKind.ITEM
+                )
+                if source_changed:
+                    job.source_url = normalized_source.url
+                    job.source_kind = SourceKind.ITEM
+                    migrated_douyin_item_source = requires_item_migration
+                    changed = True
+                if (
+                    job.verification_url is not None
+                    and job.verification_url != normalized_source.url
+                ):
+                    job.verification_url = normalized_source.url
+                    changed = True
+            if migrated_douyin_item_source:
+                now = utc_now()
+                job.status = JobStatus.INTERRUPTED
+                job.error = DOUYIN_ITEM_MIGRATION_MESSAGE
+                job.auth_message = None
+                job.verification_url = normalized_source.url
+                job.active_item_id = None
+                job.cancel_requested = False
+                job.retryable = True
+                job.discovery_complete = False
+                job.finished_at = now
+                for item in job.items:
+                    bound, metadata_changed = self._bind_douyin_item_metadata(job, item)
+                    changed |= metadata_changed
+                    if not bound:
+                        continue
+                    item.status = ItemStatus.FAILED
+                    item.error = DOUYIN_ITEM_MIGRATION_MESSAGE
+                    item.auth_message = None
+                    item.retryable = True
+                    item.updated_at = now
+                changed = True
+            if (
+                job.platform == Platform.DOUYIN
+                and job.source_kind == SourceKind.ITEM
+                and (
+                    normalized_source is None
+                    or normalized_source.platform != Platform.DOUYIN
+                    or normalized_source.kind != SourceKind.ITEM
+                )
+            ):
+                now = utc_now()
+                job.status = JobStatus.FAILED
+                job.error = DOUYIN_ITEM_SOURCE_ERROR
+                job.auth_message = None
+                job.verification_url = None
+                job.active_item_id = None
+                job.cancel_requested = False
+                job.retryable = False
+                job.finished_at = now
+                for item in job.items:
+                    item.status = ItemStatus.FAILED
+                    item.error = DOUYIN_ITEM_SOURCE_ERROR
+                    item.retryable = False
+                    item.updated_at = now
+                changed = True
+            target = self._douyin_item_target(job)
+            if target:
+                requires_direct_rediscovery = False
+                now = utc_now()
+                for item in job.items:
+                    had_profile_metadata = any(
+                        key in item.metadata
+                        for key in (
+                            "profile_url",
+                            "profile_owner_verified",
+                            "douyin_profile_media",
+                        )
+                    )
+                    cache_was_invalid = (
+                        item.media_id == target[1]
+                        and self._is_bound_douyin_item_url(
+                            item.source_url,
+                            target[0],
+                            target[1],
+                        )
+                        and self._discard_invalid_douyin_item_cache(
+                            item,
+                            target[0],
+                            target[1],
+                        )
+                    )
+                    bound, metadata_changed = self._bind_douyin_item_metadata(job, item)
+                    changed |= metadata_changed or cache_was_invalid
+                    if bound and had_profile_metadata:
+                        requires_direct_rediscovery = True
+                    if bound and cache_was_invalid:
+                        requires_direct_rediscovery = True
+                    if bound and requires_direct_rediscovery:
+                        item.status = ItemStatus.FAILED
+                        item.error = DOUYIN_ITEM_MIGRATION_MESSAGE
+                        item.auth_message = None
+                        item.retryable = True
+                        item.updated_at = now
+                if requires_direct_rediscovery:
+                    job.status = JobStatus.INTERRUPTED
+                    job.error = DOUYIN_ITEM_MIGRATION_MESSAGE
+                    job.auth_message = None
+                    job.verification_url = target[0]
+                    job.active_item_id = None
+                    job.cancel_requested = False
+                    job.retryable = True
+                    job.discovery_complete = False
+                    job.finished_at = now
+                    changed = True
             if job.status in ACTIVE_JOB_STATUSES:
                 job.status = JobStatus.INTERRUPTED
                 job.error = "The application stopped before this task finished. Retry to continue."
@@ -104,12 +261,33 @@ class DownloadManager:
                     item.retryable = True
                     item.updated_at = utc_now()
                     changed = True
+            if self._douyin_item_has_invalid_expansion(job):
+                target = self._douyin_item_target(job)
+                now = utc_now()
+                for item in job.items:
+                    item.status = ItemStatus.FAILED
+                    item.error = DOUYIN_ITEM_EXPANSION_MESSAGE
+                    item.auth_message = None
+                    item.retryable = True
+                    item.updated_at = now
+                job.status = JobStatus.INTERRUPTED
+                job.error = DOUYIN_ITEM_EXPANSION_MESSAGE
+                job.auth_message = None
+                job.verification_url = target[0] if target else job.source_url
+                job.active_item_id = None
+                job.cancel_requested = False
+                job.retryable = True
+                job.discovery_complete = False
+                job.finished_at = now
+                changed = True
+            changed |= self._sanitize_persisted_errors(job)
             if changed:
                 job.refresh_counts()
                 if legacy_douyin_result:
                     job.status = (
                         JobStatus.PARTIAL if job.completed_items else JobStatus.FAILED
                     )
+                    job.retryable = False
                     job.error = LEGACY_DOUYIN_RESULT_ERROR
                     job.finished_at = utc_now()
                 elif job.total_items and job.completed_items == job.total_items:
@@ -157,7 +335,10 @@ class DownloadManager:
         with self._lock:
             job = self._require_job(job_id)
             self._ensure_not_running(job_id)
-            if job.items:
+            if self._prepare_douyin_item_rediscovery_locked(job):
+                targets = None
+                rediscover = True
+            elif job.items:
                 targets = [
                     item.id
                     for item in job.items
@@ -216,6 +397,9 @@ class DownloadManager:
         with self._lock:
             job = self._require_job(job_id)
             self._ensure_not_running(job_id)
+            if self._prepare_douyin_item_rediscovery_locked(job):
+                self._submit_locked(job, None, rediscover=True)
+                return self.get_job(job_id)
             item = self._find_item(job, item_id)
             if item.status not in RETRYABLE_ITEM_STATUSES or not item.retryable:
                 raise ItemNotRetryableError(
@@ -234,6 +418,9 @@ class DownloadManager:
         with self._lock:
             job = self._require_job(job_id)
             self._ensure_not_running(job_id)
+            if self._prepare_douyin_item_rediscovery_locked(job):
+                self._submit_locked(job, None, rediscover=True)
+                return self.get_job(job_id)
             resume_queued = job.status in {
                 JobStatus.NEEDS_AUTH,
                 JobStatus.INTERRUPTED,
@@ -248,9 +435,13 @@ class DownloadManager:
                     or (resume_queued and item.status == ItemStatus.QUEUED)
                 )
             ]
-            if job.items and not targets:
+            rediscover = self._should_rediscover_on_retry(job)
+            completed_profile_can_continue = rediscover and all(
+                item.status == ItemStatus.COMPLETED for item in job.items
+            )
+            if job.items and not targets and not completed_profile_can_continue:
                 raise ItemNotRetryableError("This task has no failed items to retry")
-            if self._should_rediscover_on_retry(job):
+            if rediscover:
                 self._submit_locked(job, None, rediscover=True)
                 return self.get_job(job_id)
             if not job.items and job.status in {
@@ -365,6 +556,7 @@ class DownloadManager:
                     job_snapshot.source_kind,
                     should_cancel=cancel_event.is_set,
                 )
+                self._validate_discovery_result(job_snapshot, result)
                 if cancel_event.is_set():
                     raise DownloadCancelledError("Task cancelled")
                 with self._lock:
@@ -375,7 +567,32 @@ class DownloadManager:
                     )
                     job.output_dir = str(Path(job.output_root) / author_folder)
                     Path(job.output_dir).mkdir(parents=True, exist_ok=True)
-                    job.items = self._merge_discovered_items(job.items, result.items)
+                    previous_items = job.items
+                    if (
+                        job.platform == Platform.DOUYIN
+                        and job.source_kind == SourceKind.ITEM
+                    ):
+                        expected_id = MediaDownloader._douyin_video_id(job.source_url)
+                        previous_items = [
+                            item
+                            for item in previous_items
+                            if item.media_id == expected_id
+                            and self._is_bound_douyin_item_url(
+                                item.source_url,
+                                job.source_url,
+                                expected_id,
+                            )
+                        ][:1]
+                    job.items = self._merge_discovered_items(
+                        previous_items,
+                        result.items,
+                    )
+                    if (
+                        job.platform == Platform.DOUYIN
+                        and job.source_kind == SourceKind.ITEM
+                    ):
+                        for item in job.items:
+                            self._bind_douyin_item_metadata(job, item)
                     job.cookie_fallback_used = result.cookie_fallback_used
                     job.discovery_complete = result.discovery_complete
                     job.warning = result.warning
@@ -452,6 +669,19 @@ class DownloadManager:
                         and job.source_kind == SourceKind.PROFILE
                     ):
                         item_snapshot.metadata["profile_url"] = job.source_url
+                    elif (
+                        platform == Platform.DOUYIN
+                        and job.source_kind == SourceKind.ITEM
+                    ):
+                        bound, _ = self._bind_douyin_item_metadata(
+                            job,
+                            item_snapshot,
+                        )
+                        if not bound:
+                            raise AuthenticationRequiredError(
+                                DOUYIN_ITEM_EXPANSION_MESSAGE,
+                                verification_url=job.source_url,
+                            )
                 self._notify(self.get_job(job_id), "item_started", item_id)
 
                 try:
@@ -497,17 +727,19 @@ class DownloadManager:
                         if cancelled:
                             self._mark_cancelled_locked(job)
                         else:
+                            safe_message = safe_external_error_message(exc)
                             item.status = ItemStatus.NEEDS_AUTH
-                            item.error = str(exc)
-                            item.auth_message = str(exc)
+                            item.error = safe_message
+                            item.auth_message = safe_message
                             item.updated_at = utc_now()
                             job.active_item_id = None
                             job.status = JobStatus.NEEDS_AUTH
-                            job.auth_message = str(exc)
-                            job.verification_url = (
-                                exc.verification_url or item.source_url
+                            job.auth_message = safe_message
+                            job.verification_url = self._verification_url(
+                                job,
+                                exc.verification_url or item.source_url,
                             )
-                            job.error = str(exc)
+                            job.error = safe_message
                             job.finished_at = utc_now()
                             job.refresh_counts()
                         self._commit_locked(job)
@@ -529,11 +761,12 @@ class DownloadManager:
                         self._commit_locked(job)
                     raise
                 except Exception as exc:
+                    safe_message = safe_external_error_message(exc)
                     with self._lock:
                         job = self._require_job(job_id)
                         item = self._find_item(job, item_id)
                         item.status = ItemStatus.FAILED
-                        item.error = str(exc)
+                        item.error = safe_message
                         item.retryable = True
                         item.updated_at = utc_now()
                         job.active_item_id = None
@@ -549,10 +782,14 @@ class DownloadManager:
                 if cancelled:
                     self._mark_cancelled_locked(job)
                 else:
+                    safe_message = safe_external_error_message(exc)
                     job.status = JobStatus.NEEDS_AUTH
-                    job.error = str(exc)
-                    job.auth_message = str(exc)
-                    job.verification_url = exc.verification_url or job.source_url
+                    job.error = safe_message
+                    job.auth_message = safe_message
+                    job.verification_url = self._verification_url(
+                        job,
+                        exc.verification_url or job.source_url,
+                    )
                     job.active_item_id = None
                     job.finished_at = utc_now()
                 self._commit_locked(job)
@@ -566,10 +803,11 @@ class DownloadManager:
                 self._commit_locked(job)
             self._notify(self.get_job(job_id), "cancelled")
         except Exception as exc:
+            safe_message = safe_external_error_message(exc)
             with self._lock:
                 job = self._require_job(job_id)
                 job.status = JobStatus.FAILED
-                job.error = str(exc)
+                job.error = safe_message
                 job.active_item_id = None
                 job.finished_at = utc_now()
                 job.refresh_counts()
@@ -613,9 +851,9 @@ class DownloadManager:
             elif event.event == "downloading":
                 item.status = ItemStatus.DOWNLOADING
             if event.event == "probing" and event.message:
-                item.progress.filename = event.message
+                item.progress.filename = safe_external_error_message(event.message)
             elif event.message:
-                job.warning = event.message
+                job.warning = safe_external_error_message(event.message)
             elif event.cookie_fallback_used and not job.warning:
                 job.warning = (
                     "Chrome cookies could not be read. Anonymous access was used, "
@@ -706,6 +944,262 @@ class DownloadManager:
         )
         return MediaDownloader(config)
 
+    @staticmethod
+    def _legacy_douyin_markdown_item_source(value: str) -> str | None:
+        match = _LEGACY_DOUYIN_MARKDOWN_ITEM_RE.fullmatch(value)
+        if not match or match.group(2) != match.group(4):
+            return None
+        try:
+            label_source = identify_url(match.group(1))
+            target_source = identify_url(match.group(3))
+        except (TypeError, ValueError):
+            return None
+        if (
+            label_source.platform != Platform.DOUYIN
+            or target_source.platform != Platform.DOUYIN
+            or label_source.kind != SourceKind.ITEM
+            or target_source.kind != SourceKind.ITEM
+            or label_source.url != target_source.url
+        ):
+            return None
+        return target_source.url
+
+    @staticmethod
+    def _douyin_item_target(job: DownloadJob) -> tuple[str, str] | None:
+        if job.platform != Platform.DOUYIN:
+            return None
+        try:
+            source = identify_url(job.source_url)
+        except (TypeError, ValueError):
+            return None
+        if source.platform != Platform.DOUYIN or source.kind != SourceKind.ITEM:
+            return None
+        media_id = MediaDownloader._douyin_video_id(source.url)
+        return (source.url, media_id) if media_id else None
+
+    def _prepare_douyin_item_rediscovery_locked(self, job: DownloadJob) -> bool:
+        target = self._douyin_item_target(job)
+        if not target:
+            if job.platform == Platform.DOUYIN and job.source_kind == SourceKind.ITEM:
+                raise ItemNotRetryableError(DOUYIN_ITEM_SOURCE_ERROR)
+            return False
+        canonical_url, expected_id = target
+        source_changed = (
+            job.source_url != canonical_url or job.source_kind != SourceKind.ITEM
+        )
+        job.source_url = canonical_url
+        job.source_kind = SourceKind.ITEM
+        valid_items = [
+            item
+            for item in job.items
+            if item.media_id == expected_id
+            and self._is_bound_douyin_item_url(
+                item.source_url,
+                canonical_url,
+                expected_id,
+            )
+        ]
+        requires_identity_refresh = False
+        for item in valid_items:
+            had_profile_metadata = any(
+                key in item.metadata
+                for key in (
+                    "profile_url",
+                    "profile_owner_verified",
+                    "douyin_profile_media",
+                )
+            )
+            invalid_cache = self._discard_invalid_douyin_item_cache(
+                item,
+                canonical_url,
+                expected_id,
+            )
+            self._bind_douyin_item_metadata(job, item)
+            requires_identity_refresh |= had_profile_metadata or invalid_cache
+        if requires_identity_refresh:
+            job.discovery_complete = False
+        invalid_expansion = self._douyin_item_has_invalid_expansion(job)
+        if (
+            not source_changed
+            and not invalid_expansion
+            and not requires_identity_refresh
+            and job.discovery_complete
+        ):
+            return False
+        job.items = valid_items[:1]
+        for item in job.items:
+            self._bind_douyin_item_metadata(job, item)
+            if source_changed or invalid_expansion or requires_identity_refresh:
+                item.status = ItemStatus.FAILED
+                item.error = (
+                    DOUYIN_ITEM_EXPANSION_MESSAGE
+                    if invalid_expansion
+                    else DOUYIN_ITEM_MIGRATION_MESSAGE
+                )
+                item.auth_message = None
+                item.retryable = True
+                item.updated_at = utc_now()
+        job.active_item_id = None
+        job.refresh_counts()
+        return True
+
+    @classmethod
+    def _douyin_item_has_invalid_expansion(cls, job: DownloadJob) -> bool:
+        target = cls._douyin_item_target(job)
+        if not target or not job.items:
+            return False
+        canonical_url, expected_id = target
+        valid_items = [
+            item
+            for item in job.items
+            if item.media_id == expected_id
+            and cls._is_bound_douyin_item_url(
+                item.source_url,
+                canonical_url,
+                expected_id,
+            )
+        ]
+        return len(job.items) != 1 or len(valid_items) != 1
+
+    @classmethod
+    def _validate_discovery_result(
+        cls,
+        job: DownloadJob,
+        result: DiscoveryResult,
+    ) -> None:
+        target = cls._douyin_item_target(job)
+        if not target:
+            return
+        canonical_url, expected_id = target
+        if len(result.items) != 1:
+            raise AuthenticationRequiredError(
+                DOUYIN_ITEM_EXPANSION_MESSAGE,
+                verification_url=canonical_url,
+            )
+        item = result.items[0]
+        if item.media_id != expected_id or not cls._is_bound_douyin_item_url(
+            item.source_url,
+            canonical_url,
+            expected_id,
+        ):
+            raise AuthenticationRequiredError(
+                DOUYIN_ITEM_EXPANSION_MESSAGE,
+                verification_url=canonical_url,
+            )
+        item.source_url = canonical_url
+        if cls._discard_invalid_douyin_item_cache(
+            item,
+            canonical_url,
+            expected_id,
+        ):
+            raise AuthenticationRequiredError(
+                DOUYIN_ITEM_EXPANSION_MESSAGE,
+                verification_url=canonical_url,
+            )
+        cls._bind_douyin_item_metadata(job, item)
+
+    @classmethod
+    def _bind_douyin_item_metadata(
+        cls,
+        job: DownloadJob,
+        item: DownloadItem,
+    ) -> tuple[bool, bool]:
+        target = cls._douyin_item_target(job)
+        if not target:
+            return False, False
+        canonical_url, expected_id = target
+        if item.media_id != expected_id or not cls._is_bound_douyin_item_url(
+            item.source_url,
+            canonical_url,
+            expected_id,
+        ):
+            return False, False
+
+        changed = item.source_url != canonical_url
+        item.source_url = canonical_url
+        for key in (
+            "profile_url",
+            "profile_owner_verified",
+            "douyin_profile_media",
+        ):
+            if key in item.metadata:
+                item.metadata.pop(key, None)
+                changed = True
+        if item.metadata.get("verification_url") != canonical_url:
+            item.metadata["verification_url"] = canonical_url
+            changed = True
+        return True, changed
+
+    @staticmethod
+    def _discard_invalid_douyin_item_cache(
+        item: DownloadItem,
+        canonical_url: str,
+        expected_id: str,
+    ) -> bool:
+        if "douyin_item_media" not in item.metadata:
+            return False
+        cached = item.metadata.get("douyin_item_media")
+        valid = (
+            item.metadata.get("item_identity_verified") is True
+            and item.metadata.get("verification_url") == canonical_url
+            and isinstance(cached, dict)
+            and str(cached.get("media_id") or "").strip() == expected_id
+            and re.fullmatch(
+                r"[A-Za-z0-9_-]{10,200}",
+                str(cached.get("video_uri") or "").strip(),
+            )
+            is not None
+        )
+        if valid:
+            return False
+        item.metadata.pop("douyin_item_media", None)
+        item.metadata.pop("item_identity_verified", None)
+        return True
+
+    @staticmethod
+    def _is_bound_douyin_item_url(
+        value: str,
+        canonical_url: str,
+        expected_id: str,
+    ) -> bool:
+        try:
+            source = identify_url(value)
+        except (TypeError, ValueError):
+            return False
+        return (
+            source.platform == Platform.DOUYIN
+            and source.kind == SourceKind.ITEM
+            and source.url == canonical_url
+            and MediaDownloader._douyin_video_id(source.url) == expected_id
+        )
+
+    @staticmethod
+    def _sanitize_persisted_errors(job: DownloadJob) -> bool:
+        changed = False
+        for attribute in ("error", "warning", "auth_message"):
+            value = getattr(job, attribute)
+            if value is None:
+                continue
+            safe_value = safe_external_error_message(value)
+            if safe_value != value:
+                setattr(job, attribute, safe_value)
+                changed = True
+        for item in job.items:
+            for attribute in ("error", "auth_message"):
+                value = getattr(item, attribute)
+                if value is None:
+                    continue
+                safe_value = safe_external_error_message(value)
+                if safe_value != value:
+                    setattr(item, attribute, safe_value)
+                    changed = True
+        return changed
+
+    @classmethod
+    def _verification_url(cls, job: DownloadJob, fallback: str) -> str:
+        target = cls._douyin_item_target(job)
+        return target[0] if target else fallback
+
     def _ensure_not_running(self, job_id: str) -> None:
         future = self._futures.get(job_id)
         if future is not None and not future.done():
@@ -713,6 +1207,17 @@ class DownloadManager:
 
     @staticmethod
     def _should_rediscover_on_retry(job: DownloadJob) -> bool:
+        if job.platform == Platform.DOUYIN and job.source_kind == SourceKind.ITEM:
+            return job.status in {
+                JobStatus.FAILED,
+                JobStatus.NEEDS_AUTH,
+                JobStatus.INTERRUPTED,
+                JobStatus.PARTIAL,
+                JobStatus.CANCELLED,
+            } or any(
+                item.retryable and item.status in RETRYABLE_ITEM_STATUSES
+                for item in job.items
+            )
         return (
             job.source_kind == SourceKind.PROFILE
             and job.platform in {Platform.XIAOHONGSHU, Platform.DOUYIN}
@@ -720,6 +1225,13 @@ class DownloadManager:
                 job.status in {JobStatus.NEEDS_AUTH, JobStatus.INTERRUPTED}
                 or any(item.status == ItemStatus.NEEDS_AUTH for item in job.items)
                 or not job.discovery_complete
+                or (
+                    job.platform == Platform.DOUYIN
+                    and any(
+                        item.retryable and item.status in RETRYABLE_ITEM_STATUSES
+                        for item in job.items
+                    )
+                )
             )
         )
 
