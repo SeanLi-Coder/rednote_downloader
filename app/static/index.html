@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#090c14">
+    <meta name="description" content="从小红书、B站、YouTube 和抖音下载最高画质的图片与视频。">
+    <title>原迹下载器</title>
+    <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="/static/styles.css">
+    <script src="/static/app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">跳到主要内容</a>
+
+    <div class="ambient ambient-one" aria-hidden="true"></div>
+    <div class="ambient ambient-two" aria-hidden="true"></div>
+
+    <header class="site-header">
+      <a class="brand" href="/" aria-label="原迹下载器首页">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" role="img">
+            <path d="M12 3v11m0 0 4.25-4.25M12 14 7.75 9.75M5 17v2h14v-2" />
+          </svg>
+        </span>
+        <span>
+          <strong>原迹下载器</strong>
+          <small>最高画质 · 原图原视频</small>
+        </span>
+      </a>
+
+      <div class="connection" id="connection-status" role="status" aria-live="polite">
+        <span class="connection-dot"></span>
+        <span>正在连接</span>
+      </div>
+    </header>
+
+    <main id="main-content" class="page-shell">
+      <section class="hero" aria-labelledby="hero-title">
+        <div class="hero-copy">
+          <p class="eyebrow">贴上主页或视频链接，剩下的交给它</p>
+          <h1 id="hero-title">一次下载，<span>保留每个精彩瞬间</span></h1>
+          <p class="hero-description">自动选择可用的最高画质，完整保存作者主页中的视频和图片，不压缩、不降质。</p>
+        </div>
+
+        <form class="download-form" id="download-form" novalidate>
+          <label for="url-input">主页或视频链接</label>
+          <div class="url-control">
+            <span class="url-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24">
+                <path d="M9.5 14.5 14.5 9m-7.75 9.25-1 1a3.54 3.54 0 0 1-5-5l4-4a3.54 3.54 0 0 1 5 0m7.5-4.5 1-1a3.54 3.54 0 0 1 5 5l-4 4a3.54 3.54 0 0 1-5 0" />
+              </svg>
+            </span>
+            <input
+              id="url-input"
+              name="url"
+              type="url"
+              inputmode="url"
+              autocomplete="url"
+              spellcheck="false"
+              placeholder="粘贴小红书、B站、YouTube 或抖音链接"
+              aria-describedby="url-help form-error"
+              required
+            >
+            <button class="primary-button" id="download-button" type="submit">
+              <span>开始下载</span>
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="m9 18 6-6-6-6" />
+              </svg>
+            </button>
+          </div>
+          <div class="form-meta">
+            <div class="platforms" id="url-help" aria-label="支持的平台">
+              <span><i class="platform-dot red"></i>小红书</span>
+              <span><i class="platform-dot pink"></i>B站</span>
+              <span><i class="platform-dot blue"></i>YouTube</span>
+              <span><i class="platform-dot cyan"></i>抖音</span>
+            </div>
+            <p class="form-error" id="form-error" role="alert"></p>
+          </div>
+        </form>
+      </section>
+
+      <div class="content-grid">
+        <section class="panel job-panel" aria-labelledby="job-heading">
+          <div id="empty-state" class="empty-state">
+            <div class="empty-art" aria-hidden="true">
+              <svg viewBox="0 0 96 96">
+                <rect x="17" y="22" width="62" height="52" rx="12" />
+                <path d="M34 45h28M34 56h18" />
+                <circle cx="68" cy="68" r="14" />
+                <path d="M68 61v14m0 0 5-5m-5 5-5-5" />
+              </svg>
+            </div>
+            <h2>准备就绪</h2>
+            <p>在上方粘贴链接，下载任务的实时进度会显示在这里。</p>
+          </div>
+
+          <div id="job-view" class="job-view" hidden>
+            <div class="job-heading-row">
+              <div class="job-identity">
+                <div class="platform-mark" id="platform-mark" aria-hidden="true">链</div>
+                <div>
+                  <div class="job-overline">
+                    <span id="job-platform">正在识别平台</span>
+                    <span aria-hidden="true">·</span>
+                    <time id="job-time">刚刚</time>
+                  </div>
+                  <h2 id="job-heading">正在识别作者…</h2>
+                </div>
+              </div>
+              <span class="status-pill" id="job-status">等待中</span>
+            </div>
+
+            <div class="auth-alert" id="auth-alert" role="alert" hidden>
+              <div class="auth-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24">
+                  <path d="M12 8v5m0 3.5v.5M5.2 20h13.6a2 2 0 0 0 1.73-3L13.73 5.2a2 2 0 0 0-3.46 0L3.47 17a2 2 0 0 0 1.73 3Z" />
+                </svg>
+              </div>
+              <div class="auth-copy">
+                <strong>需要你在 Chrome 中完成验证</strong>
+                <p id="auth-message">请打开对应网站，完成登录或验证码后回到这里继续。</p>
+              </div>
+              <div class="auth-actions">
+                <button class="auth-button auth-open-button" id="auth-open-button" type="button">打开 Chrome 验证</button>
+                <button class="auth-button" id="auth-retry-button" type="button">我已完成，继续重试</button>
+              </div>
+            </div>
+
+            <div class="warning-alert" id="warning-alert" role="status" hidden>
+              <div class="auth-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24">
+                  <path d="M12 8v5m0 3.5v.5M5.2 20h13.6a2 2 0 0 0 1.73-3L13.73 5.2a2 2 0 0 0-3.46 0L3.47 17a2 2 0 0 0 1.73 3Z" />
+                </svg>
+              </div>
+              <div class="auth-copy">
+                <strong id="warning-title">任务提示</strong>
+                <p id="warning-message">本次结果可能不完整，请查看提示并重试。</p>
+              </div>
+            </div>
+
+            <div class="progress-block">
+              <div class="progress-copy">
+                <span>总进度</span>
+                <strong id="progress-percent">0%</strong>
+              </div>
+              <div
+                class="progress-track"
+                id="progress-track"
+                role="progressbar"
+                aria-label="下载总进度"
+                aria-valuemin="0"
+                aria-valuemax="100"
+                aria-valuenow="0"
+              >
+                <span id="progress-bar"></span>
+              </div>
+              <div class="progress-detail">
+                <span id="progress-label">正在准备任务…</span>
+                <span><span id="job-speed">—</span> <i aria-hidden="true">·</i> 剩余 <span id="job-eta">—</span></span>
+              </div>
+            </div>
+
+            <dl class="stats-grid">
+              <div class="stat-item success-stat">
+                <dt>成功</dt>
+                <dd id="success-count">0</dd>
+              </div>
+              <div class="stat-item failure-stat">
+                <dt>失败</dt>
+                <dd id="failure-count">0</dd>
+              </div>
+              <div class="stat-item">
+                <dt>处理中</dt>
+                <dd id="active-count">0</dd>
+              </div>
+              <div class="stat-item">
+                <dt>总计</dt>
+                <dd id="total-count">—</dd>
+              </div>
+            </dl>
+
+            <div class="job-actions">
+              <button class="secondary-button" id="retry-all-button" type="button" hidden>
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M20 7v5h-5M4 17v-5h5m10.2-2A8 8 0 0 0 6.1 6.1L4 8m16 8-2.1 1.9A8 8 0 0 1 4.8 14" />
+                </svg>
+                <span id="retry-all-label">重试全部失败项</span>
+              </button>
+              <button class="danger-button" id="cancel-button" type="button" hidden>
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M6 6l12 12M18 6 6 18" />
+                </svg>
+                取消任务
+              </button>
+            </div>
+
+            <div class="items-section">
+              <div class="section-heading">
+                <div>
+                  <h3>下载明细</h3>
+                  <p id="items-summary">任务开始后会显示每个作品的状态</p>
+                </div>
+                <div class="filter-tabs" id="filter-tabs" aria-label="筛选下载明细">
+                  <button class="filter-tab active" type="button" data-filter="all" aria-pressed="true">全部</button>
+                  <button class="filter-tab" type="button" data-filter="success" aria-pressed="false">成功</button>
+                  <button class="filter-tab" type="button" data-filter="failed" aria-pressed="false">失败</button>
+                </div>
+              </div>
+              <div class="items-list" id="items-list" aria-live="polite"></div>
+            </div>
+          </div>
+        </section>
+
+        <aside class="side-column" aria-label="设置与最近任务">
+          <section class="panel settings-panel" aria-labelledby="settings-heading">
+            <div class="section-heading compact">
+              <div>
+                <p class="eyebrow">保存位置与登录</p>
+                <h2 id="settings-heading">下载设置</h2>
+              </div>
+              <span class="settings-saved" id="settings-saved" role="status" aria-live="polite"></span>
+            </div>
+
+            <form id="settings-form">
+              <label class="switch-row" for="chrome-cookies">
+                <span>
+                  <strong>自动读取 Chrome Cookie</strong>
+                  <small>用于登录状态和验证码验证</small>
+                </span>
+                <span class="switch">
+                  <input id="chrome-cookies" type="checkbox" role="switch">
+                  <span class="switch-track" aria-hidden="true"><i></i></span>
+                </span>
+              </label>
+
+              <label class="field-label" for="download-dir">
+                下载目录
+                <span class="path-input">
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M3 7.5h7l2 2h9v9.5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7.5Zm0 0V5a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v2.5" />
+                  </svg>
+                  <input id="download-dir" type="text" autocomplete="off" placeholder="downloads">
+                </span>
+              </label>
+
+              <p class="settings-note">文件会按作者分文件夹，并以发布日期开头命名。</p>
+              <button class="save-button" id="save-settings-button" type="submit">保存设置</button>
+            </form>
+          </section>
+
+          <section class="panel history-panel" aria-labelledby="history-heading">
+            <div class="section-heading compact">
+              <div>
+                <p class="eyebrow">自动保留本次运行记录</p>
+                <h2 id="history-heading">最近任务</h2>
+              </div>
+              <button class="icon-button" id="refresh-button" type="button" aria-label="刷新任务列表" title="刷新任务列表">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M20 7v5h-5M4 17v-5h5m10.2-2A8 8 0 0 0 6.1 6.1L4 8m16 8-2.1 1.9A8 8 0 0 1 4.8 14" />
+                </svg>
+              </button>
+            </div>
+            <div class="history-list" id="history-list">
+              <p class="history-empty">还没有下载任务</p>
+            </div>
+          </section>
+        </aside>
+      </div>
+    </main>
+
+    <div class="toast-region" id="toast-region" aria-live="polite" aria-atomic="false"></div>
+
+    <template id="item-template">
+      <article class="download-item">
+        <div class="item-status-icon" aria-hidden="true"></div>
+        <div class="item-main">
+          <div class="item-title-row">
+            <h4 class="item-title"></h4>
+            <span class="item-status"></span>
+          </div>
+          <p class="item-meta"></p>
+          <div class="item-progress" aria-hidden="true"><span></span></div>
+          <p class="item-error"></p>
+          <details class="item-files" hidden>
+            <summary></summary>
+            <ul></ul>
+          </details>
+        </div>
+        <button class="item-retry-button" type="button" hidden>
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M20 7v5h-5M5.3 8A8 8 0 1 1 4 14" />
+          </svg>
+          重试
+        </button>
+      </article>
+    </template>
+  </body>
+</html>

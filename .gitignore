@@ -1,0 +1,16 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+.idea/
+.pytest_cache/
+.venv/
+.vscode/
+__pycache__/
+*.py[cod]
+*.log
+cookies*.json
+cookies*.txt
+data/
+downloads/
+*.part
