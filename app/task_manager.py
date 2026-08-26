@@ -39,6 +39,10 @@ class ItemNotRetryableError(RuntimeError):
 
 
 Listener = Callable[[ManagerEvent, DownloadJob], None]
+LEGACY_DOUYIN_RESULT_ERROR = (
+    "This legacy Douyin profile result must be manually reviewed; "
+    "create a new task before downloading again."
+)
 
 
 class DownloadManager:
@@ -73,6 +77,7 @@ class DownloadManager:
         self.load_warnings = warnings
         for job in jobs:
             changed = False
+            legacy_douyin_result = False
             if job.status in ACTIVE_JOB_STATUSES:
                 job.status = JobStatus.INTERRUPTED
                 job.error = "The application stopped before this task finished. Retry to continue."
@@ -81,6 +86,18 @@ class DownloadManager:
                 job.finished_at = utc_now()
                 changed = True
             for item in job.items:
+                if (
+                    job.platform == Platform.DOUYIN
+                    and job.source_kind == SourceKind.PROFILE
+                    and item.status == ItemStatus.COMPLETED
+                    and not item.metadata.get("profile_owner_verified")
+                ):
+                    item.status = ItemStatus.FAILED
+                    item.error = LEGACY_DOUYIN_RESULT_ERROR
+                    item.retryable = False
+                    item.updated_at = utc_now()
+                    legacy_douyin_result = True
+                    changed = True
                 if item.status in {ItemStatus.DOWNLOADING, ItemStatus.POSTPROCESSING}:
                     item.status = ItemStatus.FAILED
                     item.error = "Interrupted when the application stopped"
@@ -89,7 +106,13 @@ class DownloadManager:
                     changed = True
             if changed:
                 job.refresh_counts()
-                if job.total_items and job.completed_items == job.total_items:
+                if legacy_douyin_result:
+                    job.status = (
+                        JobStatus.PARTIAL if job.completed_items else JobStatus.FAILED
+                    )
+                    job.error = LEGACY_DOUYIN_RESULT_ERROR
+                    job.finished_at = utc_now()
+                elif job.total_items and job.completed_items == job.total_items:
                     if job.discovery_complete:
                         job.status = JobStatus.COMPLETED
                         job.error = None
@@ -138,7 +161,8 @@ class DownloadManager:
                 targets = [
                     item.id
                     for item in job.items
-                    if item.status
+                    if item.retryable
+                    and item.status
                     in {
                         ItemStatus.QUEUED,
                         ItemStatus.FAILED,
@@ -193,7 +217,7 @@ class DownloadManager:
             job = self._require_job(job_id)
             self._ensure_not_running(job_id)
             item = self._find_item(job, item_id)
-            if item.status not in RETRYABLE_ITEM_STATUSES:
+            if item.status not in RETRYABLE_ITEM_STATUSES or not item.retryable:
                 raise ItemNotRetryableError(
                     f"Item {item_id} is not failed, cancelled, or waiting for authentication"
                 )
@@ -210,9 +234,6 @@ class DownloadManager:
         with self._lock:
             job = self._require_job(job_id)
             self._ensure_not_running(job_id)
-            if self._should_rediscover_on_retry(job):
-                self._submit_locked(job, None, rediscover=True)
-                return self.get_job(job_id)
             resume_queued = job.status in {
                 JobStatus.NEEDS_AUTH,
                 JobStatus.INTERRUPTED,
@@ -221,9 +242,17 @@ class DownloadManager:
             targets = [
                 item.id
                 for item in job.items
-                if item.status in RETRYABLE_ITEM_STATUSES
-                or (resume_queued and item.status == ItemStatus.QUEUED)
+                if item.retryable
+                and (
+                    item.status in RETRYABLE_ITEM_STATUSES
+                    or (resume_queued and item.status == ItemStatus.QUEUED)
+                )
             ]
+            if job.items and not targets:
+                raise ItemNotRetryableError("This task has no failed items to retry")
+            if self._should_rediscover_on_retry(job):
+                self._submit_locked(job, None, rediscover=True)
+                return self.get_job(job_id)
             if not job.items and job.status in {
                 JobStatus.FAILED,
                 JobStatus.NEEDS_AUTH,
@@ -356,8 +385,11 @@ class DownloadManager:
                         target_items = [
                             item
                             for item in job.items
-                            if item.status == ItemStatus.QUEUED
-                            or item.status in RETRYABLE_ITEM_STATUSES
+                            if item.retryable
+                            and (
+                                item.status == ItemStatus.QUEUED
+                                or item.status in RETRYABLE_ITEM_STATUSES
+                            )
                         ]
                     else:
                         target_items = [
@@ -370,6 +402,7 @@ class DownloadManager:
                                     and item.media_id in requested_media_ids
                                 )
                             )
+                            and item.retryable
                             and (
                                 item.status == ItemStatus.QUEUED
                                 or item.status in RETRYABLE_ITEM_STATUSES
@@ -414,6 +447,11 @@ class DownloadManager:
                     item_snapshot.metadata["_job_id"] = job_id
                     output_dir = job.output_path
                     platform = job.platform
+                    if (
+                        platform == Platform.DOUYIN
+                        and job.source_kind == SourceKind.PROFILE
+                    ):
+                        item_snapshot.metadata["profile_url"] = job.source_url
                 self._notify(self.get_job(job_id), "item_started", item_id)
 
                 try:
@@ -437,6 +475,12 @@ class DownloadManager:
                         item.media_type = outcome.media_type or item.media_type
                         item.selected_format = outcome.selected_format
                         item.resolution = outcome.resolution
+                        if (
+                            job.platform == Platform.DOUYIN
+                            and job.source_kind == SourceKind.PROFILE
+                        ):
+                            item.metadata["profile_url"] = job.source_url
+                            item.metadata["profile_owner_verified"] = True
                         item.progress.percent = 100.0
                         item.error = None
                         item.updated_at = utc_now()
@@ -568,7 +612,9 @@ class DownloadManager:
                 item.status = ItemStatus.POSTPROCESSING
             elif event.event == "downloading":
                 item.status = ItemStatus.DOWNLOADING
-            if event.message:
+            if event.event == "probing" and event.message:
+                item.progress.filename = event.message
+            elif event.message:
                 job.warning = event.message
             elif event.cookie_fallback_used and not job.warning:
                 job.warning = (
@@ -735,10 +781,9 @@ class DownloadManager:
             if old.id in matched_previous_ids:
                 continue
             retained = old.model_copy(deep=True)
-            if retained.status != ItemStatus.COMPLETED:
+            if retained.status != ItemStatus.COMPLETED and retained.retryable:
                 retained.status = ItemStatus.FAILED
                 retained.error = "Item was not found when the profile was refreshed"
-                retained.retryable = True
                 retained.updated_at = utc_now()
             merged.append(retained)
 

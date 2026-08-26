@@ -2,22 +2,28 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import json
 import mimetypes
 import os
 import re
+import shutil
+import subprocess
 import threading
+import time
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 
 from yt_dlp import YoutubeDL
+from yt_dlp.extractor.tiktok import DouyinIE
 from yt_dlp.networking import Request
 from yt_dlp.postprocessor.common import PostProcessor
 from yt_dlp.utils import DownloadCancelled, DownloadError
 
 from .douyin import discover_profile as discover_douyin_profile
+from .douyin_signing import fetch_signed_aweme_detail
 from .errors import (
     AuthenticationRequiredError,
     DiscoveryError,
@@ -34,6 +40,20 @@ MAX_TITLE_BYTES = 180
 MAX_MEDIA_ID_BYTES = 64
 MAX_FILENAME_COMPONENT_BYTES = 255
 RESERVED_EXTENSION_BYTES = 16
+DOUYIN_PROBE_RATIOS = ("4k", "2k", "1080p", "720p")
+DOUYIN_PROBE_BYTES = 256 * 1024
+DOUYIN_PROBE_HTTP_TIMEOUT_SECONDS = 6.0
+DOUYIN_FFPROBE_PIPE_TIMEOUT_SECONDS = 3.0
+DOUYIN_FFPROBE_REMOTE_TIMEOUT_SECONDS = 5.0
+DOUYIN_PROCESS_POLL_SECONDS = 0.1
+DOUYIN_MEDIA_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Mobile Safari/537.36"
+    ),
+    "Referer": "https://www.douyin.com/",
+    "Accept": "*/*",
+}
 OUTPUT_TEMPLATE = (
     "%(upload_date>%Y-%m-%d,release_date>%Y-%m-%d|Unknown-Date)s-"
     "%(_filename_title,title|Untitled)s "
@@ -77,6 +97,12 @@ COOKIE_ACCESS_MESSAGE = (
     "Chrome cookies could not be read. Fully quit Chrome and retry, approve any "
     "system cookie-access prompt, or disable Chrome Cookie in settings to continue "
     "explicitly without login and create a new task."
+)
+DOUYIN_EMPTY_DETAIL_MARKERS = (
+    "aweme detail is empty",
+    "empty aweme detail",
+    "no aweme detail",
+    "unable to extract aweme detail",
 )
 _INVALID_FILENAME = re.compile(r"[\x00-\x1f<>:\"/\\|?*]+")
 _WINDOWS_RESERVED = {
@@ -329,19 +355,35 @@ class MediaDownloader:
                 allow_cookie_fallback=self.config.allow_cookie_fallback,
                 should_cancel=should_cancel,
             )
-            items = [
-                DownloadItem(
-                    id=_item_key(platform, self._media_id(entry), entry, index),
-                    media_id=self._media_id(entry),
-                    source_url=entry,
-                    title=self._media_id(entry) or "Douyin video",
-                    author=profile.author,
-                    playlist_index=index,
-                    extractor_key="Douyin",
-                    media_type=MediaType.VIDEO,
+            items: list[DownloadItem] = []
+            for index, entry in enumerate(profile.video_urls, start=1):
+                media_id = self._media_id(entry)
+                cached_media = profile.media_metadata.get(media_id or "")
+                metadata: dict[str, Any] = {
+                    "profile_url": url,
+                    "profile_owner_verified": True,
+                }
+                if cached_media:
+                    metadata["douyin_profile_media"] = dict(cached_media)
+                items.append(
+                    DownloadItem(
+                        id=_item_key(platform, media_id, entry, index),
+                        media_id=media_id,
+                        source_url=entry,
+                        title=str(
+                            (cached_media or {}).get("title")
+                            or media_id
+                            or "Douyin video"
+                        ),
+                        author=str(
+                            (cached_media or {}).get("author") or profile.author
+                        ),
+                        playlist_index=index,
+                        extractor_key="Douyin",
+                        media_type=MediaType.VIDEO,
+                        metadata=metadata,
+                    )
                 )
-                for index, entry in enumerate(profile.video_urls, start=1)
-            ]
             return DiscoveryResult(
                 author=profile.author,
                 items=items,
@@ -437,6 +479,7 @@ class MediaDownloader:
         return self._download_with_ytdlp(
             item,
             output_path,
+            platform=platform,
             callback=callback,
             should_cancel=should_cancel,
         )
@@ -524,6 +567,11 @@ class MediaDownloader:
                 result = ydl.extract_info(url, download=False)
                 if not isinstance(result, dict):
                     raise DownloadError("The URL returned no downloadable media")
+                if platform == Platform.DOUYIN:
+                    expected_id = self._douyin_video_id(url)
+                    if not expected_id:
+                        raise DownloadError("The Douyin URL has no video identifier")
+                    self._validate_douyin_info(result, expected_id, url)
 
                 probed_author: str | None = None
                 raw_entries = result.get("entries")
@@ -579,6 +627,9 @@ class MediaDownloader:
                     extractor_key=str(entry.get("extractor_key") or "") or None,
                     playlist_index=index,
                     media_type=self._media_type(entry),
+                    metadata=(
+                        {"verification_url": url} if platform == Platform.DOUYIN else {}
+                    ),
                 )
             )
         return DiscoveryResult(
@@ -588,15 +639,604 @@ class MediaDownloader:
             warning=COOKIE_FALLBACK_WARNING if fallback else None,
         )
 
+    @staticmethod
+    def _download_format_options(platform: Platform) -> dict[str, Any]:
+        options: dict[str, Any] = {"format": "bestvideo*+bestaudio/best"}
+        if platform == Platform.DOUYIN:
+            options["format_sort"] = ["res"]
+        return options
+
+    @staticmethod
+    def _douyin_video_id(url: str) -> str | None:
+        match = re.search(r"/video/(\d+)(?:[/?#]|$)", url)
+        return match.group(1) if match else None
+
+    @staticmethod
+    def _douyin_profile_id(url: str) -> str | None:
+        match = re.search(r"/user/([^/?#]+)(?:[/?#]|$)", url)
+        return unquote(match.group(1)).strip() if match else None
+
+    @staticmethod
+    def _is_douyin_media_host(hostname: str | None) -> bool:
+        normalized = (hostname or "").lower().rstrip(".")
+        return normalized == "amemv.com" or normalized.endswith(".amemv.com")
+
+    @staticmethod
+    def _raise_douyin_mismatch(
+        expected_id: str, actual_id: str, verification_url: str
+    ) -> None:
+        raise AuthenticationRequiredError(
+            "Douyin returned data for a different video while requesting "
+            f"{expected_id} (received {actual_id}). Open the original profile in "
+            "Chrome, finish verification, then retry.",
+            verification_url=verification_url,
+        )
+
+    def _validate_douyin_info(
+        self,
+        info: dict[str, Any],
+        expected_id: str,
+        verification_url: str,
+        expected_profile_id: str | None = None,
+    ) -> None:
+        actual_id = str(info.get("id") or "").strip()
+        if actual_id != expected_id:
+            self._raise_douyin_mismatch(
+                expected_id, actual_id or "missing", verification_url
+            )
+        if expected_profile_id:
+            actual_profile_id = str(info.get("channel_id") or "").strip()
+            if actual_profile_id != expected_profile_id:
+                raise AuthenticationRequiredError(
+                    "Douyin returned data from a different author while requesting "
+                    f"profile {expected_profile_id} (received "
+                    f"{actual_profile_id or 'missing'}). Open the original profile "
+                    "in Chrome, finish verification, then retry.",
+                    verification_url=verification_url,
+                )
+
+    def _douyin_video_uri(
+        self,
+        info: dict[str, Any],
+        expected_id: str,
+        verification_url: str,
+        expected_profile_id: str | None = None,
+    ) -> str | None:
+        self._validate_douyin_info(
+            info,
+            expected_id,
+            verification_url,
+            expected_profile_id,
+        )
+        uris: set[str] = set()
+        for value in info.get("formats") or []:
+            if not isinstance(value, dict):
+                continue
+            media_url = value.get("url")
+            if not isinstance(media_url, str):
+                continue
+            parsed = urlsplit(media_url)
+            if (
+                not self._is_douyin_media_host(parsed.hostname)
+                or parsed.path.rstrip("/") != "/aweme/v1/play"
+            ):
+                continue
+            for uri in parse_qs(parsed.query).get("video_id", []):
+                if re.fullmatch(r"[A-Za-z0-9_-]{10,200}", uri):
+                    uris.add(uri)
+        if len(uris) > 1:
+            raise AuthenticationRequiredError(
+                "Douyin returned multiple media identities for one video. Open the "
+                "original profile in Chrome, finish verification, then retry.",
+                verification_url=verification_url,
+            )
+        return next(iter(uris), None)
+
+    @staticmethod
+    def _should_use_douyin_signed_detail(error: DownloadError) -> bool:
+        message = str(error).lower()
+        return _is_auth_error(message) or any(
+            marker in message for marker in DOUYIN_EMPTY_DETAIL_MARKERS
+        )
+
+    def _extract_douyin_raw_info(
+        self,
+        ydl: YoutubeDL,
+        source_url: str,
+        *,
+        expected_id: str,
+        expected_profile_id: str | None,
+        verification_url: str,
+        profile_metadata: dict[str, Any] | None,
+        fallback_title: str,
+        should_cancel: CancelCallback,
+    ) -> dict[str, Any]:
+        cached_result = self._douyin_raw_info_from_profile_metadata(
+            profile_metadata,
+            expected_id=expected_id,
+            expected_profile_id=expected_profile_id,
+            verification_url=verification_url,
+            fallback_title=fallback_title,
+        )
+        if cached_result:
+            return cached_result
+        try:
+            raw_result = ydl.extract_info(
+                source_url,
+                download=False,
+                process=False,
+            )
+            if isinstance(raw_result, dict):
+                return raw_result
+            extraction_error = DownloadError("Douyin returned an empty aweme detail")
+        except DownloadError as exc:
+            extraction_error = exc
+
+        if not self.config.cookie_browser or not self._should_use_douyin_signed_detail(
+            extraction_error
+        ):
+            raise extraction_error
+        if should_cancel():
+            raise DownloadCancelled("Task cancelled")
+
+        detail = fetch_signed_aweme_detail(
+            expected_id,
+            verification_url=verification_url,
+            expected_sec_uid=expected_profile_id,
+            cookie_profile=self.config.cookie_profile,
+            should_cancel=should_cancel,
+        )
+        parsed = DouyinIE(ydl)._parse_aweme_video_app(detail)
+        if not isinstance(parsed, dict):
+            raise DownloadError("Douyin signed detail returned no downloadable media")
+        parsed.setdefault("webpage_url", source_url)
+        parsed.setdefault("original_url", source_url)
+        parsed.setdefault("extractor", "Douyin")
+        parsed.setdefault("extractor_key", "Douyin")
+        return parsed
+
+    def _douyin_raw_info_from_profile_metadata(
+        self,
+        metadata: dict[str, Any] | None,
+        *,
+        expected_id: str,
+        expected_profile_id: str | None,
+        verification_url: str,
+        fallback_title: str,
+    ) -> dict[str, Any] | None:
+        if not metadata or "douyin_profile_media" not in metadata:
+            return None
+        cached = metadata.get("douyin_profile_media")
+        if (
+            not isinstance(cached, dict)
+            or metadata.get("profile_owner_verified") is not True
+            or not expected_profile_id
+        ):
+            raise AuthenticationRequiredError(
+                "Douyin profile metadata could not be verified. Create a new task "
+                "from the original profile and retry.",
+                verification_url=verification_url,
+            )
+        cached_id = str(cached.get("media_id") or "").strip()
+        if cached_id != expected_id:
+            self._raise_douyin_mismatch(
+                expected_id,
+                cached_id or "missing",
+                verification_url,
+            )
+        cached_owner = str(cached.get("owner_id") or "").strip()
+        if cached_owner != expected_profile_id:
+            raise AuthenticationRequiredError(
+                "Douyin profile metadata belongs to a different author. Create a "
+                "new task from the original profile and retry.",
+                verification_url=verification_url,
+            )
+        video_uri = str(cached.get("video_uri") or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{10,200}", video_uri):
+            raise AuthenticationRequiredError(
+                "Douyin profile metadata has no verified media identity. Create a "
+                "new task from the original profile and retry.",
+                verification_url=verification_url,
+            )
+
+        result: dict[str, Any] = {
+            "id": expected_id,
+            "channel_id": expected_profile_id,
+            "channel": str(cached.get("author") or "Douyin Author"),
+            "title": str(cached.get("title") or fallback_title or expected_id),
+            "formats": [
+                {
+                    "format_id": "profile-cached-play",
+                    "url": self._douyin_ratio_url(video_uri, "720p"),
+                    "ext": "mp4",
+                    "preference": -1,
+                    "source_preference": -2,
+                }
+            ],
+            "_format_sort_fields": ("quality", "codec", "size", "br"),
+            "_douyin_profile_cache_only": True,
+        }
+        duration_ms = cached.get("duration_ms")
+        if isinstance(duration_ms, int) and duration_ms > 0:
+            result["duration"] = duration_ms / 1_000
+        create_time = cached.get("create_time")
+        if isinstance(create_time, int) and create_time > 0:
+            result["timestamp"] = create_time
+        self._validate_douyin_info(
+            result,
+            expected_id,
+            verification_url,
+            expected_profile_id,
+        )
+        return result
+
+    @staticmethod
+    def _douyin_ratio_url(video_uri: str, ratio: str) -> str:
+        query = urlencode(
+            {
+                "video_id": video_uri,
+                "ratio": ratio,
+                "line": "0",
+                "is_play_url": "1",
+                "source": "PackSourceEnum_AWEME_DETAIL",
+            }
+        )
+        return f"https://api-play.amemv.com/aweme/v1/play/?{query}"
+
+    def _add_douyin_probe_formats(
+        self,
+        ydl: YoutubeDL,
+        info: dict[str, Any],
+        *,
+        expected_id: str,
+        verification_url: str,
+        expected_profile_id: str | None = None,
+        callback: EventCallback | None = None,
+        should_cancel: CancelCallback,
+    ) -> bool:
+        video_uri = self._douyin_video_uri(
+            info,
+            expected_id,
+            verification_url,
+            expected_profile_id,
+        )
+        if not video_uri:
+            return False
+        expected_duration = self._float_or_none(info.get("duration"))
+        probes: list[dict[str, Any]] = []
+        ratio_count = len(DOUYIN_PROBE_RATIOS)
+        for index, ratio in enumerate(DOUYIN_PROBE_RATIOS, start=1):
+            if should_cancel():
+                raise DownloadCancelled("Task cancelled")
+            if callback:
+                callback(
+                    EngineEvent(
+                        event="probing",
+                        message=(
+                            f"Checking Douyin quality {index}/{ratio_count}: {ratio}"
+                        ),
+                    )
+                )
+            candidate_url = self._douyin_ratio_url(video_uri, ratio)
+            try:
+                probe = self._probe_douyin_candidate(
+                    ydl,
+                    candidate_url,
+                    expected_duration=expected_duration,
+                    should_cancel=should_cancel,
+                )
+                if probe:
+                    probe["requested_ratio"] = ratio
+                    probes.append(probe)
+            except DownloadCancelled:
+                raise
+            except Exception:
+                continue
+            if should_cancel():
+                raise DownloadCancelled("Task cancelled")
+
+        unique_probes: dict[tuple[int, int, str, str, int, int], dict[str, Any]] = {}
+        for probe in probes:
+            video_codec = str(probe.get("vcodec") or "").lower()
+            if video_codec in {"bytevc2", "h266", "vvc"}:
+                continue
+            signature = (
+                int(probe["width"]),
+                int(probe["height"]),
+                video_codec,
+                str(probe.get("acodec") or ""),
+                int(probe.get("bit_rate") or 0),
+                int(probe.get("filesize") or 0),
+            )
+            unique_probes.setdefault(signature, probe)
+
+        formats = info.setdefault("formats", [])
+        for index, probe in enumerate(unique_probes.values(), start=1):
+            width = int(probe["width"])
+            height = int(probe["height"])
+            bit_rate = int(probe.get("bit_rate") or 0)
+            formats.append(
+                {
+                    "format_id": f"douyin-api-{width}x{height}-{index}",
+                    "format_note": "Verified original-quality endpoint",
+                    "url": probe["url"],
+                    "ext": "mp4",
+                    "vcodec": probe.get("vcodec") or "h264",
+                    "acodec": probe.get("acodec") or "aac",
+                    "width": width,
+                    "height": height,
+                    "tbr": bit_rate / 1000 if bit_rate else None,
+                    "filesize": probe.get("filesize"),
+                    "preference": -1,
+                    "http_headers": dict(DOUYIN_MEDIA_HEADERS),
+                }
+            )
+        if unique_probes and info.get("_douyin_profile_cache_only"):
+            info["formats"] = [
+                value
+                for value in formats
+                if value.get("format_id") != "profile-cached-play"
+            ]
+        return bool(unique_probes)
+
+    def _probe_douyin_candidate(
+        self,
+        ydl: YoutubeDL,
+        candidate_url: str,
+        *,
+        expected_duration: float | None,
+        should_cancel: CancelCallback,
+    ) -> dict[str, Any] | None:
+        if should_cancel():
+            raise DownloadCancelled("Task cancelled")
+        headers = {
+            **DOUYIN_MEDIA_HEADERS,
+            "Range": f"bytes=0-{DOUYIN_PROBE_BYTES - 1}",
+        }
+        response = ydl.urlopen(
+            Request(
+                candidate_url,
+                headers=headers,
+                extensions={"timeout": DOUYIN_PROBE_HTTP_TIMEOUT_SECONDS},
+            )
+        )
+        try:
+            final_url = str(response.url)
+            final_url_parts = urlsplit(final_url)
+            if (
+                final_url_parts.scheme not in {"http", "https"}
+                or not final_url_parts.hostname
+            ):
+                return None
+            content_type = (
+                str(response.headers.get("Content-Type") or "").split(";", 1)[0].lower()
+            )
+            if not content_type.startswith("video/"):
+                return None
+            payload = bytearray()
+            while len(payload) < DOUYIN_PROBE_BYTES:
+                if should_cancel():
+                    raise DownloadCancelled("Task cancelled")
+                chunk = response.read(DOUYIN_PROBE_BYTES - len(payload))
+                if not chunk:
+                    break
+                payload.extend(chunk)
+            if len(payload) < 12 or payload[4:8] != b"ftyp":
+                return None
+            content_range = str(response.headers.get("Content-Range") or "")
+            size_match = re.search(r"/(\d+)$", content_range)
+            filesize = int(size_match.group(1)) if size_match else None
+        finally:
+            response.close()
+
+        if should_cancel():
+            raise DownloadCancelled("Task cancelled")
+        media = self._ffprobe_douyin_media(
+            bytes(payload),
+            final_url,
+            should_cancel=should_cancel,
+        )
+        if not media:
+            return None
+        width = int(media.get("width") or 0)
+        height = int(media.get("height") or 0)
+        if width <= 0 or height <= 0:
+            return None
+        duration = self._float_or_none(media.get("duration"))
+        if expected_duration is not None:
+            if duration is None:
+                return None
+            tolerance = max(3.0, expected_duration * 0.05)
+            if abs(duration - expected_duration) > tolerance:
+                return None
+        return {
+            **media,
+            "url": final_url,
+            "filesize": filesize,
+        }
+
+    def _ffprobe_douyin_media(
+        self,
+        initial_bytes: bytes,
+        candidate_url: str,
+        *,
+        should_cancel: CancelCallback,
+    ) -> dict[str, Any] | None:
+        executable = shutil.which("ffprobe")
+        if not executable:
+            return None
+        entries = (
+            "stream=codec_type,codec_name,width,height,bit_rate,duration:"
+            "format=duration,bit_rate,size"
+        )
+        base_command = [
+            executable,
+            "-v",
+            "error",
+            "-show_entries",
+            entries,
+            "-of",
+            "json",
+        ]
+        payload = self._run_ffprobe(
+            [*base_command, "-i", "pipe:0"],
+            input_data=initial_bytes,
+            timeout_seconds=DOUYIN_FFPROBE_PIPE_TIMEOUT_SECONDS,
+            should_cancel=should_cancel,
+        )
+        parsed = self._parse_ffprobe_payload(payload)
+        if parsed:
+            return parsed
+
+        header_blob = "".join(
+            f"{key}: {value}\r\n" for key, value in DOUYIN_MEDIA_HEADERS.items()
+        )
+        payload = self._run_ffprobe(
+            [
+                *base_command,
+                "-rw_timeout",
+                str(int(DOUYIN_FFPROBE_REMOTE_TIMEOUT_SECONDS * 1_000_000)),
+                "-headers",
+                header_blob,
+                "-i",
+                candidate_url,
+            ],
+            timeout_seconds=DOUYIN_FFPROBE_REMOTE_TIMEOUT_SECONDS,
+            should_cancel=should_cancel,
+        )
+        return self._parse_ffprobe_payload(payload)
+
+    def _run_ffprobe(
+        self,
+        command: list[str],
+        *,
+        input_data: bytes | None = None,
+        timeout_seconds: float,
+        should_cancel: CancelCallback,
+    ) -> bytes | None:
+        try:
+            process = subprocess.Popen(
+                command,
+                stdin=(
+                    subprocess.PIPE if input_data is not None else subprocess.DEVNULL
+                ),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError:
+            return None
+
+        deadline = time.monotonic() + max(0.1, timeout_seconds)
+        pending_input = input_data
+        while True:
+            if should_cancel():
+                self._terminate_process(process)
+                raise DownloadCancelled("Task cancelled")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._terminate_process(process)
+                return None
+            try:
+                stdout, _ = process.communicate(
+                    input=pending_input,
+                    timeout=min(DOUYIN_PROCESS_POLL_SECONDS, remaining),
+                )
+                return stdout or None
+            except subprocess.TimeoutExpired:
+                pending_input = None
+
+    @staticmethod
+    def _terminate_process(process: subprocess.Popen[bytes]) -> None:
+        with contextlib.suppress(OSError):
+            process.terminate()
+        try:
+            process.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(OSError):
+                process.kill()
+            with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+                process.wait(timeout=0.5)
+
+    @staticmethod
+    def _parse_ffprobe_payload(payload: bytes | None) -> dict[str, Any] | None:
+        if not payload:
+            return None
+        try:
+            data = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        streams = data.get("streams") or []
+        video = next(
+            (
+                stream
+                for stream in streams
+                if isinstance(stream, dict) and stream.get("codec_type") == "video"
+            ),
+            None,
+        )
+        if not video:
+            return None
+        audio = next(
+            (
+                stream
+                for stream in streams
+                if isinstance(stream, dict) and stream.get("codec_type") == "audio"
+            ),
+            None,
+        )
+        format_data = data.get("format") or {}
+
+        def safe_int(value: Any) -> int:
+            try:
+                return int(value or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        return {
+            "width": safe_int(video.get("width")),
+            "height": safe_int(video.get("height")),
+            "vcodec": video.get("codec_name"),
+            "acodec": audio.get("codec_name") if audio else "none",
+            "bit_rate": safe_int(video.get("bit_rate") or format_data.get("bit_rate")),
+            "duration": (video.get("duration") or format_data.get("duration")),
+        }
+
+    @staticmethod
+    def _float_or_none(value: Any) -> float | None:
+        try:
+            return float(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
     def _download_with_ytdlp(
         self,
         item: DownloadItem,
         output_dir: Path,
         *,
+        platform: Platform,
         callback: EventCallback | None,
         should_cancel: CancelCallback,
     ) -> DownloadOutcome:
         final_paths: list[str] = []
+        verification_url = str(
+            item.metadata.get("profile_url")
+            or item.metadata.get("verification_url")
+            or item.source_url
+        )
+        expected_douyin_id: str | None = None
+        expected_douyin_profile_id: str | None = None
+        if platform == Platform.DOUYIN:
+            expected_douyin_profile_id = self._douyin_profile_id(
+                str(item.metadata.get("profile_url") or "")
+            )
+            expected_douyin_id = item.media_id or self._douyin_video_id(item.source_url)
+            source_id = self._douyin_video_id(item.source_url)
+            if not expected_douyin_id or source_id != expected_douyin_id:
+                self._raise_douyin_mismatch(
+                    expected_douyin_id or "unknown",
+                    source_id or "missing",
+                    verification_url,
+                )
 
         def emit(event: EngineEvent) -> None:
             if callback:
@@ -648,6 +1288,19 @@ class MediaDownloader:
         def post_hook(filename: str) -> None:
             final_paths.append(str(Path(filename).resolve()))
 
+        def match_filter(info: dict[str, Any], *, incomplete: bool = False) -> None:
+            if not expected_douyin_id:
+                return None
+            if incomplete and not info.get("id"):
+                return None
+            self._validate_douyin_info(
+                info,
+                expected_douyin_id,
+                verification_url,
+                expected_douyin_profile_id,
+            )
+            return None
+
         def operation(use_cookies: bool) -> tuple[dict[str, Any], list[str]]:
             final_paths.clear()
             job_scope = safe_component(
@@ -661,11 +1314,11 @@ class MediaDownloader:
             logger = _YdlLogger(callback)
             options = {
                 **self._base_options(use_cookies),
-                "format": "bestvideo*+bestaudio/best",
+                **self._download_format_options(platform),
                 "paths": {"home": str(output_dir), "temp": str(parts_dir)},
                 "outtmpl": {"default": OUTPUT_TEMPLATE},
                 "windowsfilenames": True,
-                "continuedl": True,
+                "continuedl": platform != Platform.DOUYIN,
                 "overwrites": True,
                 "ignoreerrors": False,
                 "noplaylist": True,
@@ -675,6 +1328,8 @@ class MediaDownloader:
                 "post_hooks": [post_hook],
                 "logger": logger,
             }
+            if expected_douyin_id:
+                options["match_filter"] = match_filter
             with YoutubeDL(options) as ydl:
                 ydl.add_post_processor(
                     _SafeFilenamePostProcessor(
@@ -684,15 +1339,73 @@ class MediaDownloader:
                     ),
                     when="pre_process",
                 )
-                result = ydl.extract_info(item.source_url, download=True)
+                if expected_douyin_id:
+                    raw_result = self._extract_douyin_raw_info(
+                        ydl,
+                        item.source_url,
+                        expected_id=expected_douyin_id,
+                        expected_profile_id=expected_douyin_profile_id,
+                        verification_url=verification_url,
+                        profile_metadata=item.metadata,
+                        fallback_title=item.title,
+                        should_cancel=should_cancel,
+                    )
+                    self._validate_douyin_info(
+                        raw_result,
+                        expected_douyin_id,
+                        verification_url,
+                        expected_douyin_profile_id,
+                    )
+                    probe_added = self._add_douyin_probe_formats(
+                        ydl,
+                        raw_result,
+                        expected_id=expected_douyin_id,
+                        verification_url=verification_url,
+                        expected_profile_id=expected_douyin_profile_id,
+                        callback=emit,
+                        should_cancel=should_cancel,
+                    )
+                    if not probe_added and raw_result.get("_douyin_profile_cache_only"):
+                        raise DownloadError(
+                            "Douyin profile media was discovered, but its highest "
+                            "quality could not be verified. Retry this item; no "
+                            "lower-quality fallback was downloaded."
+                        )
+                    if not probe_added:
+                        emit(
+                            EngineEvent(
+                                event="warning",
+                                message=(
+                                    "Douyin's original-quality endpoint could not be "
+                                    "verified, so the highest yt-dlp format was used."
+                                ),
+                            )
+                        )
+                    result = ydl.process_ie_result(raw_result, download=True)
+                else:
+                    result = ydl.extract_info(item.source_url, download=True)
                 if not isinstance(result, dict):
                     raise DownloadError("The URL returned no downloadable media")
+                if expected_douyin_id:
+                    self._validate_douyin_info(
+                        result,
+                        expected_douyin_id,
+                        verification_url,
+                        expected_douyin_profile_id,
+                    )
                 candidates = self._paths_from_info(result, ydl)
             return result, [*final_paths, *candidates]
 
-        (info, paths), fallback = self._run_with_cookie_fallback(
-            operation, url=item.source_url
-        )
+        try:
+            (info, paths), fallback = self._run_with_cookie_fallback(
+                operation, url=item.source_url
+            )
+        except AuthenticationRequiredError as exc:
+            if platform == Platform.DOUYIN and exc.verification_url != verification_url:
+                raise AuthenticationRequiredError(
+                    str(exc), verification_url=verification_url
+                ) from exc
+            raise
         unique_paths = self._existing_unique_paths(paths)
         if not unique_paths:
             raise MediaDownloadError("yt-dlp finished but no output file was found")

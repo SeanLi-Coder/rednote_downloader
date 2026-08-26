@@ -3,14 +3,15 @@ from __future__ import annotations
 import contextlib
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http.cookiejar import CookieJar
-from typing import Any, Callable, Iterable
-from urllib.parse import urljoin, urlsplit
+from typing import Any, Callable
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from yt_dlp.cookies import extract_cookies_from_browser
 
 from .browser import chrome_user_agent
+from .douyin_signing import fetch_signed_profile_awemes
 from .errors import AuthenticationRequiredError, DiscoveryError, DownloadCancelledError
 
 
@@ -34,6 +35,7 @@ class DouyinProfile:
     cookie_fallback_used: bool = False
     warning: str | None = None
     discovery_complete: bool = True
+    media_metadata: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def __iter__(self):
         yield self.author
@@ -57,6 +59,113 @@ class _QuietCookieLogger:
 def _looks_like_auth_page(text: str) -> bool:
     lowered = text.lower()
     return any(pattern in lowered for pattern in AUTH_TEXT_PATTERNS)
+
+
+def _profile_id(url: str) -> str | None:
+    match = re.search(r"/user/([^/?#]+)", urlsplit(url).path)
+    return unquote(match.group(1)) if match else None
+
+
+def _is_target_post_response(response_url: str, profile_id: str) -> bool:
+    parsed = urlsplit(response_url)
+    hostname = (parsed.hostname or "").lower().rstrip(".")
+    if (
+        parsed.scheme != "https"
+        or not (hostname == "douyin.com" or hostname.endswith(".douyin.com"))
+        or parsed.path.rstrip("/") != "/aweme/v1/web/aweme/post"
+    ):
+        return False
+    return profile_id in parse_qs(parsed.query).get("sec_user_id", [])
+
+
+def _parse_profile_awemes(
+    data: dict[str, Any], profile_id: str
+) -> tuple[list[tuple[str, str]], list[str], bool | None]:
+    entries: list[tuple[str, str]] = []
+    authors: list[str] = []
+    values = data.get("aweme_list") or data.get("awemeList") or []
+    if not isinstance(values, list):
+        return entries, authors, None
+    for aweme in values:
+        if not isinstance(aweme, dict):
+            continue
+        author_data = aweme.get("author") or {}
+        if not isinstance(author_data, dict):
+            continue
+        owner_id = str(
+            author_data.get("sec_uid") or author_data.get("secUid") or ""
+        ).strip()
+        if owner_id != profile_id:
+            continue
+        nickname = author_data.get("nickname")
+        if isinstance(nickname, str) and nickname.strip():
+            authors.append(nickname.strip())
+        video_data = aweme.get("video")
+        if not isinstance(video_data, dict) or not video_data:
+            continue
+        aweme_id = str(aweme.get("aweme_id") or aweme.get("awemeId") or "")
+        if aweme_id.isdigit():
+            entries.append((aweme_id, f"https://www.douyin.com/video/{aweme_id}"))
+    has_more = data.get("has_more")
+    return entries, authors, bool(has_more) if has_more is not None else None
+
+
+def _minimal_aweme_metadata(
+    aweme: dict[str, Any], profile_id: str
+) -> tuple[str, dict[str, Any]] | None:
+    aweme_id = str(aweme.get("aweme_id") or aweme.get("awemeId") or "").strip()
+    author = aweme.get("author")
+    if not aweme_id.isdigit() or not isinstance(author, dict):
+        return None
+    owner_id = str(author.get("sec_uid") or author.get("secUid") or "").strip()
+    if owner_id != profile_id:
+        return None
+    video = aweme.get("video")
+    if not isinstance(video, dict):
+        return None
+    video_uri = ""
+    addresses = [
+        video.get(address_key)
+        for address_key in (
+            "play_addr",
+            "play_addr_h264",
+            "play_addr_265",
+            "play_addr_bytevc1",
+        )
+    ]
+    bit_rates = video.get("bit_rate")
+    if isinstance(bit_rates, list):
+        addresses.extend(
+            value.get("play_addr") for value in bit_rates if isinstance(value, dict)
+        )
+    for address in addresses:
+        if not isinstance(address, dict):
+            continue
+        candidate = str(address.get("uri") or "").strip()
+        if re.fullmatch(r"[A-Za-z0-9_-]{10,200}", candidate):
+            video_uri = candidate
+            break
+    if not video_uri:
+        return None
+
+    metadata: dict[str, Any] = {
+        "media_id": aweme_id,
+        "owner_id": owner_id,
+        "video_uri": video_uri,
+    }
+    duration_ms = video.get("duration")
+    if isinstance(duration_ms, int) and duration_ms > 0:
+        metadata["duration_ms"] = duration_ms
+    create_time = aweme.get("create_time")
+    if isinstance(create_time, int) and create_time > 0:
+        metadata["create_time"] = create_time
+    description = aweme.get("desc")
+    if isinstance(description, str) and description.strip():
+        metadata["title"] = description.strip()
+    nickname = author.get("nickname")
+    if isinstance(nickname, str) and nickname.strip():
+        metadata["author"] = nickname.strip()
+    return aweme_id, metadata
 
 
 def _cookie_jar_to_playwright(cookie_jar: CookieJar) -> list[dict[str, Any]]:
@@ -122,6 +231,33 @@ def discover_profile(
     stable_rounds: int = 15,
     navigation_timeout_ms: int = 45_000,
 ) -> DouyinProfile:
+    profile_id = _profile_id(url)
+    if not profile_id:
+        raise DiscoveryError("The Douyin profile URL has no profile identifier")
+    if use_browser_cookies:
+        try:
+            signed_awemes = fetch_signed_profile_awemes(
+                url,
+                profile_id,
+                cookie_profile=cookie_profile,
+                should_cancel=should_cancel,
+            )
+        except AuthenticationRequiredError:
+            pass
+        else:
+            signed_data = {"aweme_list": signed_awemes, "has_more": False}
+            entries, authors, _ = _parse_profile_awemes(signed_data, profile_id)
+            metadata = dict(
+                value
+                for aweme in signed_awemes
+                if (value := _minimal_aweme_metadata(aweme, profile_id))
+            )
+            return DouyinProfile(
+                author=authors[0] if authors else "Douyin Author",
+                video_urls=[video_url for _, video_url in entries],
+                discovery_complete=True,
+                media_metadata=metadata,
+            )
     try:
         from playwright.sync_api import Error as PlaywrightError
         from playwright.sync_api import sync_playwright
@@ -160,38 +296,31 @@ def discover_profile(
                 if browser_cookies:
                     context.add_cookies(browser_cookies)
                 discovered: dict[str, str] = {}
+                media_metadata: dict[str, dict[str, Any]] = {}
                 api_authors: list[str] = []
                 api_has_more: bool | None = None
 
                 def capture_post_response(response: Any) -> None:
                     nonlocal api_has_more
-                    if "/aweme/v1/web/aweme/post/" not in response.url:
+                    if not _is_target_post_response(response.url, profile_id):
                         return
                     try:
                         data = response.json()
                     except Exception:
                         return
+                    entries, authors, has_more = _parse_profile_awemes(data, profile_id)
                     values = data.get("aweme_list") or data.get("awemeList") or []
                     for aweme in values:
                         if not isinstance(aweme, dict):
                             continue
-                        author_data = aweme.get("author") or {}
-                        nickname = author_data.get("nickname")
-                        if isinstance(nickname, str) and nickname.strip():
-                            api_authors.append(nickname.strip())
-                        video_data = aweme.get("video")
-                        if not isinstance(video_data, dict) or not video_data:
-                            continue
-                        aweme_id = str(
-                            aweme.get("aweme_id") or aweme.get("awemeId") or ""
-                        )
-                        if aweme_id.isdigit():
-                            discovered.setdefault(
-                                aweme_id, f"https://www.douyin.com/video/{aweme_id}"
-                            )
-                    has_more = data.get("has_more")
+                        metadata = _minimal_aweme_metadata(aweme, profile_id)
+                        if metadata:
+                            media_metadata.setdefault(*metadata)
+                    api_authors.extend(authors)
+                    for aweme_id, video_url in entries:
+                        discovered.setdefault(aweme_id, video_url)
                     if has_more is not None:
-                        api_has_more = bool(has_more)
+                        api_has_more = has_more
 
                 page = context.new_page()
                 page.on("response", capture_post_response)
@@ -226,33 +355,10 @@ def discover_profile(
                 for _ in range(max_scrolls):
                     if should_cancel and should_cancel():
                         raise DownloadCancelledError("Task cancelled")
-                    try:
-                        hrefs: Iterable[str] = page.locator(
-                            "a[href*='/video/']"
-                        ).evaluate_all(
-                            "elements => elements.map(element => element.href)"
-                        )
-                    except Exception:
-                        hrefs = []
-                    before = len(discovered)
-                    for href in hrefs:
-                        absolute = urljoin(page.url, href)
-                        match = re.search(r"/video/(\d+)", urlsplit(absolute).path)
-                        if match:
-                            discovered.setdefault(match.group(1), absolute)
-                    unchanged_rounds = (
-                        unchanged_rounds + 1 if len(discovered) == before else 0
-                    )
-                    if api_has_more is False and unchanged_rounds >= 2:
+                    if api_has_more is False:
                         discovery_complete = True
                         break
-                    if unchanged_rounds >= stable_rounds:
-                        discovery_warning = (
-                            "Douyin stopped returning new videos before the profile "
-                            "reported completion. The discovered list may be incomplete; "
-                            "retry after checking Chrome verification."
-                        )
-                        break
+                    before = len(discovered)
                     page.mouse.wheel(0, 5_000)
                     with contextlib.suppress(Exception):
                         page.evaluate(
@@ -278,6 +384,19 @@ def discover_profile(
                             "Complete it in Chrome and retry.",
                             verification_url=url,
                         )
+                    unchanged_rounds = (
+                        unchanged_rounds + 1 if len(discovered) == before else 0
+                    )
+                    if api_has_more is False:
+                        discovery_complete = True
+                        break
+                    if unchanged_rounds >= stable_rounds:
+                        discovery_warning = (
+                            "Douyin stopped returning new videos before the profile "
+                            "reported completion. The discovered list may be incomplete; "
+                            "retry after checking Chrome verification."
+                        )
+                        break
                 if not discovery_complete and not discovery_warning:
                     discovery_warning = (
                         "Douyin reached the discovery safety limit before confirming the "
@@ -285,9 +404,10 @@ def discover_profile(
                     )
 
                 if not discovered:
-                    raise DiscoveryError(
-                        "No Douyin videos were found. The profile may be empty, private, "
-                        "or verification may be required."
+                    raise AuthenticationRequiredError(
+                        "Douyin did not return verifiable profile-owned video data. Open "
+                        "this profile in Chrome, finish verification, then retry.",
+                        verification_url=url,
                     )
                 return DouyinProfile(
                     author=(api_authors[0] if api_authors else author),
@@ -295,6 +415,7 @@ def discover_profile(
                     cookie_fallback_used=cookie_fallback_used,
                     warning=discovery_warning,
                     discovery_complete=discovery_complete,
+                    media_metadata=media_metadata,
                 )
             finally:
                 browser.close()

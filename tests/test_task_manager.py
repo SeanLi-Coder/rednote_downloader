@@ -3,6 +3,8 @@ from __future__ import annotations
 import threading
 from pathlib import Path
 
+import pytest
+
 from app.downloader import DiscoveryResult, DownloadOutcome, EngineEvent
 from app.errors import AuthenticationRequiredError, MediaDownloadError
 from app.models import (
@@ -16,7 +18,7 @@ from app.models import (
     TransferProgress,
 )
 from app.storage import JsonJobStore
-from app.task_manager import DownloadManager
+from app.task_manager import DownloadManager, ItemNotRetryableError
 
 
 class FakeEngine:
@@ -217,6 +219,121 @@ class SelectiveProfileRetryEngine:
 def wait_for_job(manager: DownloadManager, job_id: str):
     manager._futures[job_id].result(timeout=5)
     return manager.get_job(job_id)
+
+
+def test_legacy_douyin_profile_snapshot_gets_owner_url_without_probe_warning(
+    monkeypatch, tmp_path
+) -> None:
+    profile_url = "https://www.douyin.com/user/profile-a"
+    captured_profile_urls = []
+
+    class LegacyDouyinEngine:
+        def download_item(self, item, platform, output_dir, *, callback, should_cancel):
+            captured_profile_urls.append(item.metadata.get("profile_url"))
+            callback(
+                EngineEvent(
+                    event="probing",
+                    message="Checking Douyin quality 1/4: 4k",
+                )
+            )
+            return DownloadOutcome(
+                output_paths=[str(Path(output_dir) / "legacy.mp4")],
+                title=item.title,
+                upload_date="2025-11-14",
+                author="Profile A",
+                media_type=MediaType.VIDEO,
+                selected_format="douyin-api-1080x1920-1",
+                resolution="1080x1920",
+            )
+
+    manager = DownloadManager(
+        state_dir=tmp_path / "state",
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    monkeypatch.setattr(manager, "_engine_for_job", lambda job: LegacyDouyinEngine())
+
+    try:
+        created = manager.create_job(profile_url, auto_start=False)
+        with manager._lock:
+            job = manager._require_job(created.id)
+            job.author = "Profile A"
+            job.items = [
+                DownloadItem(
+                    id="legacy-item",
+                    media_id="2222222222222222222",
+                    source_url=("https://www.douyin.com/video/2222222222222222222"),
+                    title="Legacy video",
+                    media_type=MediaType.VIDEO,
+                    metadata={},
+                )
+            ]
+            job.refresh_counts()
+            manager._commit_locked(job)
+
+        manager.start_job(created.id)
+        completed = wait_for_job(manager, created.id)
+
+        assert completed.status == JobStatus.COMPLETED
+        assert captured_profile_urls == [profile_url]
+        assert completed.warning is None
+        assert completed.items[0].progress.filename == "Checking Douyin quality 1/4: 4k"
+    finally:
+        manager.shutdown()
+
+
+def test_restore_marks_unverified_legacy_douyin_results_for_manual_review(
+    tmp_path,
+) -> None:
+    state_dir = tmp_path / "state"
+    output_path = tmp_path / "downloads" / "legacy.mp4"
+    job = DownloadJob(
+        id="legacy-douyin-job",
+        source_url="https://www.douyin.com/user/profile-a",
+        platform=Platform.DOUYIN,
+        source_kind=SourceKind.PROFILE,
+        output_root=str(tmp_path / "downloads"),
+        output_dir=str(tmp_path / "downloads"),
+        status=JobStatus.COMPLETED,
+        items=[
+            DownloadItem(
+                id="legacy-item",
+                media_id="2222222222222222222",
+                source_url="https://www.douyin.com/video/2222222222222222222",
+                title="Legacy video",
+                media_type=MediaType.VIDEO,
+                status=ItemStatus.COMPLETED,
+                output_paths=[str(output_path)],
+                retryable=True,
+                metadata={},
+            )
+        ],
+        total_items=1,
+        completed_items=1,
+        discovery_complete=False,
+    )
+    JsonJobStore(state_dir).save(job)
+
+    manager = DownloadManager(
+        state_dir=state_dir,
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    try:
+        restored = manager.get_job(job.id)
+        item = restored.items[0]
+
+        assert restored.status == JobStatus.FAILED
+        assert item.status == ItemStatus.FAILED
+        assert item.retryable is False
+        assert item.output_paths == [str(output_path)]
+        assert "manually reviewed" in (item.error or "")
+        with pytest.raises(ItemNotRetryableError):
+            manager.retry_item(job.id, item.id)
+        with pytest.raises(ItemNotRetryableError):
+            manager.retry_failed(job.id)
+    finally:
+        manager.shutdown()
 
 
 def test_single_and_batch_retry_only_run_failed_items(monkeypatch, tmp_path) -> None:

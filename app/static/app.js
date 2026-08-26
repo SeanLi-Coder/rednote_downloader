@@ -594,6 +594,10 @@
       return job?.active_item_id ? String(itemId) === String(job.active_item_id) : isRunning(item);
     });
     if (activeItem) {
+      const phaseMessage = activeItem?.progress?.filename;
+      if (typeof phaseMessage === "string" && phaseMessage.startsWith("Checking Douyin quality")) {
+        return phaseMessage.replace("Checking Douyin quality", "正在检测抖音最高画质");
+      }
       const index = Math.max(0, getItems(job).indexOf(activeItem));
       return `正在处理：${itemTitle(activeItem, index)}`;
     }
