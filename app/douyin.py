@@ -330,6 +330,7 @@ def discover_item_metadata_from_profile(
     awemes = fetch_signed_profile_awemes(
         profile_url,
         profile_id,
+        target_aweme_id=media_id,
         cookie_profile=cookie_profile,
         should_cancel=should_cancel,
     )

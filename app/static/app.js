@@ -489,6 +489,9 @@
     if (text.includes("Douyin could not create a verified signed request")) {
       return "抖音暂时无法创建经过验证的请求。请在 Chrome 打开原视频，完成验证码或登录后再重试。";
     }
+    if (text.includes("Douyin temporarily limited the verified author-feed request") || text.includes("Douyin temporarily limited a signed request")) {
+      return "抖音作者接口正在短时限流，程序已自动退避重试，仍未恢复。请等待一两分钟后重试；程序没有改下低清版本，也不需要先打开作者主页验证。";
+    }
     if (text.includes("The site requires login, fresh browser cookies, or a CAPTCHA")) {
       return "该网站需要登录、最新的 Chrome Cookie 或验证码。请在 Chrome 完成验证后重试。";
     }
@@ -814,13 +817,19 @@
         "请打开对应网站，完成登录或验证码后回到这里继续。"
       ));
     }
+    const items = getItems(job);
+    const discoveryFailureMessage = canonicalStatus(job) === "failed" && (items.length === 0 || job?.discovery_complete === false)
+      ? localizeRuntimeMessage(firstDefined(job?.error_message, job?.error, job?.message))
+      : "";
     const discoveryIncomplete = job?.discovery_complete === false;
     const cookieFallback = Boolean(job?.cookie_fallback_used);
-    const warningMessage = asText(job?.warning);
+    const warningMessage = discoveryFailureMessage || asText(job?.warning);
     const hasWarning = (discoveryIncomplete && (!isRunning(job) || Boolean(warningMessage))) || cookieFallback || Boolean(warningMessage);
     elements.warningAlert.hidden = !hasWarning;
     if (hasWarning) {
-      elements.warningTitle.textContent = discoveryIncomplete
+      elements.warningTitle.textContent = discoveryFailureMessage
+        ? "任务暂时失败"
+        : discoveryIncomplete
         ? "主页发现可能不完整"
         : cookieFallback
           ? "Chrome Cookie 读取失败，当前使用未登录模式"
@@ -833,7 +842,6 @@
     }
     const hasUnprocessedItems = counts.total !== null && counts.success + counts.failed < counts.total;
     const resumable = ["cancelled", "interrupted"].includes(rawStatus(job)) || discoveryIncomplete || (rawStatus(job) === "partial" && hasUnprocessedItems);
-    const items = getItems(job);
     const hasRetryableItems = items.some(isRetryableItem);
     const canRetryDiscovery = items.length === 0 && (needsAuth || canonicalStatus(job) === "failed" || resumable);
     elements.retryAllButton.hidden = job?.retryable === false || isRunning(job) || (!hasRetryableItems && !resumable && !canRetryDiscovery);
@@ -841,6 +849,8 @@
       ? "继续发现"
       : resumable
         ? "继续任务"
+        : canRetryDiscovery
+          ? "重试任务"
         : "重试全部失败项";
     elements.cancelButton.hidden = !isRunning(job) && !needsAuth;
     elements.cancelButton.disabled = Boolean(job?.cancel_requested);

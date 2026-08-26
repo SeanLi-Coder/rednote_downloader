@@ -6,15 +6,21 @@ import pytest
 
 from app.douyin_signing import (
     _SigningFailure,
+    _TransientSigningFailure,
     _build_signing_document,
     _extract_sdk_glue_tags,
     _is_douyin_url,
     _validate_detail_response,
     _validate_profile_response,
+    _wait_for_signed_response,
     fetch_signed_aweme_detail,
     fetch_signed_profile_awemes,
 )
-from app.errors import AuthenticationRequiredError, DownloadCancelledError
+from app.errors import (
+    AuthenticationRequiredError,
+    DownloadCancelledError,
+    TemporaryAccessError,
+)
 
 
 AWEME_ID = "7671259887394052209"
@@ -165,6 +171,28 @@ def test_validate_detail_response_returns_only_verified_aweme_detail() -> None:
 
     assert detail["aweme_id"] == AWEME_ID
     assert detail["author"]["sec_uid"] == SEC_UID
+
+
+def test_validate_detail_response_marks_http_429_as_transient() -> None:
+    with pytest.raises(_TransientSigningFailure, match="temporarily limited"):
+        _validate_detail_response(
+            _detail_response(http_status=429),
+            AWEME_ID,
+            SEC_UID,
+        )
+
+
+def test_invalid_json_http_503_is_treated_as_transient() -> None:
+    page = FakePage(
+        {
+            "state": "error",
+            "reason": "invalid_json",
+            "httpStatus": 503,
+        }
+    )
+
+    with pytest.raises(_TransientSigningFailure, match="temporary HTTP status"):
+        _wait_for_signed_response(page, 1_000, lambda: False)
 
 
 @pytest.mark.parametrize(
@@ -662,6 +690,39 @@ def test_fetch_signed_profile_awemes_paginates_on_one_signer_page(
     assert manager.resources_closed_on_exit is True
 
 
+def test_profile_target_stops_before_a_later_transient_page(monkeypatch) -> None:
+    target_aweme_id = "7000000000000000002"
+    empty_response = {
+        "state": "done",
+        "httpStatus": 200,
+        "payload": {"status_code": 0},
+    }
+    page, context, browser, manager = _install_fake_playwright(
+        monkeypatch,
+        [
+            _profile_response(
+                ["7000000000000000001", target_aweme_id],
+                has_more=1,
+                max_cursor="123",
+            ),
+            empty_response,
+        ],
+    )
+
+    awemes = fetch_signed_profile_awemes(
+        PROFILE_URL,
+        SEC_UID,
+        target_aweme_id=target_aweme_id,
+        signer_settle_ms=0,
+    )
+
+    assert [aweme["aweme_id"] for aweme in awemes] == [target_aweme_id]
+    assert len(page.signed_requests) == 1
+    assert page.signed_requests[0]["params"]["max_cursor"] == "0"
+    assert page.closed and context.closed and browser.closed
+    assert manager.resources_closed_on_exit is True
+
+
 def test_profile_fetch_retries_transient_empty_signed_response(monkeypatch) -> None:
     empty_response = {
         "state": "done",
@@ -690,8 +751,67 @@ def test_profile_fetch_retries_transient_empty_signed_response(monkeypatch) -> N
         "0",
         "0",
     ]
+    assert [request["params"]["count"] for request in page.signed_requests] == [
+        "50",
+        "18",
+    ]
     assert page.closed and context.closed and browser.closed
     assert manager.resources_closed_on_exit is True
+
+
+def test_profile_fetch_retries_with_a_fresh_signing_session(monkeypatch) -> None:
+    calls = []
+    delays = []
+
+    def run(*args, **kwargs):
+        calls.append((args, kwargs))
+        if len(calls) == 1:
+            raise _TransientSigningFailure("temporary empty profile response")
+        return [_profile_aweme(AWEME_ID)]
+
+    monkeypatch.setattr("app.douyin_signing._run_with_signing_page", run)
+    monkeypatch.setattr(
+        "app.douyin_signing._wait_without_page_with_cancel",
+        lambda duration_ms, should_cancel: delays.append(duration_ms),
+    )
+
+    awemes = fetch_signed_profile_awemes(
+        PROFILE_URL,
+        SEC_UID,
+        target_aweme_id=AWEME_ID,
+        signer_settle_ms=0,
+    )
+
+    assert [aweme["aweme_id"] for aweme in awemes] == [AWEME_ID]
+    assert len(calls) == 2
+    assert delays == [5_000]
+
+
+def test_profile_transient_exhaustion_is_not_mislabeled_as_captcha(
+    monkeypatch,
+) -> None:
+    delays = []
+
+    monkeypatch.setattr(
+        "app.douyin_signing._run_with_signing_page",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            _TransientSigningFailure("temporary empty profile response")
+        ),
+    )
+    monkeypatch.setattr(
+        "app.douyin_signing._wait_without_page_with_cancel",
+        lambda duration_ms, should_cancel: delays.append(duration_ms),
+    )
+
+    with pytest.raises(TemporaryAccessError, match="temporarily limited"):
+        fetch_signed_profile_awemes(
+            PROFILE_URL,
+            SEC_UID,
+            target_aweme_id=AWEME_ID,
+            signer_settle_ms=0,
+        )
+
+    assert delays == [5_000, 10_000]
 
 
 def test_profile_page_limit_maps_to_auth_and_closes_resources(monkeypatch) -> None:

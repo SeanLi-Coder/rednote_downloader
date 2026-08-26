@@ -6,7 +6,11 @@ from pathlib import Path
 import pytest
 
 from app.downloader import DiscoveryResult, DownloadOutcome, EngineEvent
-from app.errors import AuthenticationRequiredError, MediaDownloadError
+from app.errors import (
+    AuthenticationRequiredError,
+    MediaDownloadError,
+    TemporaryAccessError,
+)
 from app.models import (
     DownloadItem,
     DownloadJob,
@@ -314,6 +318,78 @@ def test_douyin_item_auth_always_opens_canonical_video(monkeypatch, tmp_path) ->
         assert blocked.verification_url == source_url
         assert blocked.items[0].metadata["verification_url"] == source_url
         assert "profile_url" not in blocked.items[0].metadata
+    finally:
+        manager.shutdown()
+
+
+def test_douyin_rate_limit_retry_clears_stale_auth_state(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    media_id = "7664225419386607205"
+    source_url = f"https://www.douyin.com/video/{media_id}"
+
+    class AuthThenLimitedEngine:
+        def __init__(self) -> None:
+            self.discovery_calls = 0
+
+        def discover(self, url, platform, kind, *, should_cancel):
+            self.discovery_calls += 1
+            if self.discovery_calls == 2:
+                raise TemporaryAccessError(
+                    "Douyin temporarily limited a signed request after automatic retries"
+                )
+            return DiscoveryResult(
+                author="Verified author",
+                items=[
+                    DownloadItem(
+                        id="target",
+                        media_id=media_id,
+                        source_url=source_url,
+                        title="Target video",
+                        media_type=MediaType.VIDEO,
+                    )
+                ],
+            )
+
+        def download_item(
+            self,
+            item,
+            platform,
+            output_dir,
+            *,
+            callback,
+            should_cancel,
+        ):
+            raise AuthenticationRequiredError(
+                "Complete verification in Chrome",
+                verification_url=source_url,
+            )
+
+    manager = DownloadManager(
+        state_dir=tmp_path / "state",
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    engine = AuthThenLimitedEngine()
+    monkeypatch.setattr(manager, "_engine_for_job", lambda job: engine)
+
+    try:
+        created = manager.create_job(source_url, auto_start=True)
+        blocked = wait_for_job(manager, created.id)
+        assert blocked.status == JobStatus.NEEDS_AUTH
+        assert blocked.items[0].status == ItemStatus.NEEDS_AUTH
+
+        manager.retry_failed(created.id)
+        limited = wait_for_job(manager, created.id)
+
+        assert limited.status == JobStatus.FAILED
+        assert limited.auth_message is None
+        assert limited.verification_url is None
+        assert limited.items[0].status == ItemStatus.FAILED
+        assert limited.items[0].auth_message is None
+        assert limited.items[0].retryable is True
+        assert "temporarily limited" in (limited.error or "")
     finally:
         manager.shutdown()
 
@@ -1718,6 +1794,54 @@ def test_cancel_after_discovery_needs_auth_publication_converges_to_cancelled(
         )
     finally:
         release_worker.set()
+        manager.shutdown()
+
+
+def test_cancel_while_temporary_limit_propagates_converges_to_cancelled(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    manager = DownloadManager(
+        state_dir=tmp_path / "state",
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    discovery_started = threading.Event()
+    release_discovery = threading.Event()
+
+    class BlockingLimitedEngine:
+        def discover(self, url, platform, kind, *, should_cancel):
+            discovery_started.set()
+            release_discovery.wait(timeout=5)
+            raise TemporaryAccessError(
+                "Douyin temporarily limited a signed request after automatic retries"
+            )
+
+    monkeypatch.setattr(
+        manager,
+        "_engine_for_job",
+        lambda job: BlockingLimitedEngine(),
+    )
+
+    try:
+        created = manager.create_job(
+            "https://www.douyin.com/video/7664225419386607205",
+            auto_start=True,
+        )
+        assert discovery_started.wait(timeout=2)
+
+        cancelling = manager.cancel_job(created.id)
+        assert cancelling.cancel_requested is True
+
+        release_discovery.set()
+        final = wait_for_job(manager, created.id)
+
+        assert final.status == JobStatus.CANCELLED
+        assert final.cancel_requested is False
+        assert final.auth_message is None
+        assert final.verification_url is None
+    finally:
+        release_discovery.set()
         manager.shutdown()
 
 

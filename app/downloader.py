@@ -20,6 +20,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 from yt_dlp import YoutubeDL
 from yt_dlp.extractor.tiktok import DouyinIE
 from yt_dlp.networking import Request
+from yt_dlp.networking.exceptions import HTTPError, TransportError
 from yt_dlp.postprocessor.common import PostProcessor
 from yt_dlp.utils import DownloadCancelled, DownloadError
 
@@ -32,6 +33,7 @@ from .errors import (
     DiscoveryError,
     DownloadCancelledError,
     MediaDownloadError,
+    TemporaryAccessError,
 )
 from .models import DownloadItem, MediaType, Platform, SourceKind, TransferProgress
 from .platforms import identify_url
@@ -47,7 +49,9 @@ DOUYIN_PROBE_RATIOS = ("default", "4k", "2k", "1080p", "720p")
 DOUYIN_PROBE_BYTES = 256 * 1024
 DOUYIN_DEFAULT_PROBE_HOST = "api-play-hl.amemv.com"
 DOUYIN_RATIO_PROBE_HOST = "api-play.amemv.com"
-DOUYIN_PROBE_HTTP_TIMEOUT_SECONDS = 6.0
+DOUYIN_PROBE_HTTP_TIMEOUT_SECONDS = 10.0
+DOUYIN_PROBE_ATTEMPTS = 3
+DOUYIN_PROBE_RETRY_BASE_SECONDS = 1.0
 DOUYIN_FFPROBE_PIPE_TIMEOUT_SECONDS = 3.0
 DOUYIN_FFPROBE_REMOTE_TIMEOUT_SECONDS = 15.0
 DOUYIN_PROCESS_POLL_SECONDS = 0.1
@@ -599,11 +603,17 @@ class MediaDownloader:
                 )
             except DownloadCancelledError:
                 raise
+            except TemporaryAccessError as exc:
+                raise TemporaryAccessError(
+                    "Douyin temporarily limited the verified author-feed request "
+                    "after automatic retries. Wait a minute or two and retry the "
+                    "original video; no lower-quality media was downloaded."
+                ) from exc
             except (AuthenticationRequiredError, DiscoveryError) as exc:
                 raise AuthenticationRequiredError(
                     "Douyin could not verify the author's highest-quality "
-                    "renditions. Open the original video in Chrome, finish "
-                    "verification, then retry.",
+                    "renditions after automatic retries. Open the original video "
+                    "in Chrome, finish verification, then retry.",
                     verification_url=url,
                 ) from exc
             if not enriched_media:
@@ -1353,7 +1363,8 @@ class MediaDownloader:
                     raise
                 except MediaDownloadError:
                     raise
-                except Exception:
+                except Exception as exc:
+                    self._close_douyin_probe_error(exc)
                     continue
                 if direct_probe:
                     break
@@ -1376,10 +1387,12 @@ class MediaDownloader:
                 )
             candidate_url = self._douyin_ratio_url(video_uri, ratio)
             try:
-                probe = self._probe_douyin_candidate(
+                probe = self._probe_douyin_ratio_with_retry(
                     ydl,
                     candidate_url,
+                    ratio=ratio,
                     expected_duration=expected_duration,
+                    callback=callback,
                     should_cancel=should_cancel,
                 )
                 if probe:
@@ -1509,6 +1522,81 @@ class MediaDownloader:
             ]
         info.pop("_douyin_probe_failure", None)
         return True
+
+    def _probe_douyin_ratio_with_retry(
+        self,
+        ydl: YoutubeDL,
+        candidate_url: str,
+        *,
+        ratio: str,
+        expected_duration: float | None,
+        callback: EventCallback | None,
+        should_cancel: CancelCallback,
+    ) -> dict[str, Any] | None:
+        for attempt in range(1, DOUYIN_PROBE_ATTEMPTS + 1):
+            try:
+                return self._probe_douyin_candidate(
+                    ydl,
+                    candidate_url,
+                    expected_duration=expected_duration,
+                    should_cancel=should_cancel,
+                )
+            except (DownloadCancelled, MediaDownloadError):
+                raise
+            except Exception as exc:
+                retryable = self._is_retryable_douyin_probe_error(exc)
+                self._close_douyin_probe_error(exc)
+                if (
+                    attempt >= DOUYIN_PROBE_ATTEMPTS
+                    or not retryable
+                ):
+                    raise
+                if callback:
+                    callback(
+                        EngineEvent(
+                            event="probing",
+                            message=(
+                                f"Retrying Douyin quality {ratio} after a "
+                                f"temporary network error "
+                                f"({attempt + 1}/{DOUYIN_PROBE_ATTEMPTS})"
+                            ),
+                        )
+                    )
+                self._wait_for_douyin_probe_retry(
+                    DOUYIN_PROBE_RETRY_BASE_SECONDS * (2 ** (attempt - 1)),
+                    should_cancel,
+                )
+        return None
+
+    @staticmethod
+    def _is_retryable_douyin_probe_error(exc: Exception) -> bool:
+        if isinstance(exc, _DouyinProbeRejected):
+            return False
+        if isinstance(exc, HTTPError):
+            return exc.status in {408, 425, 429, 500, 502, 503, 504}
+        if isinstance(exc, (TransportError, TimeoutError, ConnectionError, OSError)):
+            return True
+        return False
+
+    @staticmethod
+    def _close_douyin_probe_error(exc: Exception) -> None:
+        if isinstance(exc, HTTPError):
+            with contextlib.suppress(Exception):
+                exc.close()
+
+    @staticmethod
+    def _wait_for_douyin_probe_retry(
+        delay_seconds: float,
+        should_cancel: CancelCallback,
+    ) -> None:
+        deadline = time.monotonic() + max(delay_seconds, 0.0)
+        while True:
+            if should_cancel():
+                raise DownloadCancelled("Task cancelled")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(DOUYIN_PROCESS_POLL_SECONDS, remaining))
 
     @staticmethod
     def _safe_douyin_probe_failure(exc: Exception) -> str:

@@ -19,5 +19,9 @@ class DiscoveryError(DownloaderCoreError):
     pass
 
 
+class TemporaryAccessError(DownloaderCoreError):
+    pass
+
+
 class MediaDownloadError(DownloaderCoreError):
     pass

@@ -18,7 +18,11 @@ from .downloader import (
     safe_component,
     safe_external_error_message,
 )
-from .errors import AuthenticationRequiredError, DownloadCancelledError
+from .errors import (
+    AuthenticationRequiredError,
+    DownloadCancelledError,
+    TemporaryAccessError,
+)
 from .models import (
     ACTIVE_JOB_STATUSES,
     RETRYABLE_ITEM_STATUSES,
@@ -775,6 +779,33 @@ class DownloadManager:
                     self._notify(self.get_job(job_id), "item_failed", item_id)
 
             self._finish_job(job_id)
+        except TemporaryAccessError as exc:
+            safe_message = safe_external_error_message(exc)
+            with self._lock:
+                job = self._require_job(job_id)
+                cancelled = cancel_event.is_set() or job.cancel_requested
+                if cancelled:
+                    self._mark_cancelled_locked(job)
+                else:
+                    job.status = JobStatus.FAILED
+                    job.error = safe_message
+                    job.auth_message = None
+                    job.verification_url = None
+                    job.active_item_id = None
+                    job.finished_at = utc_now()
+                    for item in job.items:
+                        if item.status != ItemStatus.NEEDS_AUTH:
+                            continue
+                        item.status = ItemStatus.FAILED
+                        item.error = safe_message
+                        item.auth_message = None
+                        item.retryable = True
+                        item.updated_at = utc_now()
+                    job.refresh_counts()
+                self._commit_locked(job)
+            self._notify(
+                self.get_job(job_id), "cancelled" if cancelled else "failed"
+            )
         except AuthenticationRequiredError as exc:
             with self._lock:
                 job = self._require_job(job_id)

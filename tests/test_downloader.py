@@ -3,11 +3,14 @@ from __future__ import annotations
 import json
 import sys
 import time
+from io import BytesIO
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from yt_dlp import YoutubeDL
+from yt_dlp.networking import Response
+from yt_dlp.networking.exceptions import HTTPError
 from yt_dlp.utils import DownloadCancelled, DownloadError
 
 from app.downloader import (
@@ -20,7 +23,11 @@ from app.downloader import (
     safe_external_error_message,
 )
 from app.douyin import DouyinProfile
-from app.errors import AuthenticationRequiredError, MediaDownloadError
+from app.errors import (
+    AuthenticationRequiredError,
+    MediaDownloadError,
+    TemporaryAccessError,
+)
 from app.models import DownloadItem, MediaType, Platform, SourceKind
 from app.xiaohongshu import RemoteAsset, XiaohongshuNote
 
@@ -500,6 +507,43 @@ def test_douyin_item_discovery_fails_closed_when_author_feed_is_unverified(
         engine.discover(source_url, Platform.DOUYIN, SourceKind.ITEM)
 
     assert error.value.verification_url == source_url
+
+
+def test_douyin_item_discovery_reports_transient_profile_limiting(
+    monkeypatch,
+) -> None:
+    media_id = "7638230489560727931"
+    source_url = f"https://www.douyin.com/video/{media_id}"
+    video_uri = "v0200fg10000fixturevideoid"
+
+    class DirectItemYoutubeDL(FakeYoutubeDL):
+        def extract_info(self, url: str, download: bool, process: bool = True):
+            return {
+                "id": media_id,
+                "title": "Verified title",
+                "channel": "Verified author",
+                "channel_id": "MS4wLjABAAAAexpected-owner",
+                "formats": [
+                    {
+                        "url": (
+                            "https://api-play.amemv.com/aweme/v1/play/"
+                            f"?video_id={video_uri}&ratio=720p"
+                        )
+                    }
+                ],
+            }
+
+    monkeypatch.setattr("app.downloader.YoutubeDL", DirectItemYoutubeDL)
+    monkeypatch.setattr(
+        "app.downloader.discover_item_metadata_from_profile",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            TemporaryAccessError("temporary profile limiting")
+        ),
+    )
+    engine = MediaDownloader(DownloaderConfig(cookie_browser="chrome"))
+
+    with pytest.raises(TemporaryAccessError, match="no lower-quality"):
+        engine.discover(source_url, Platform.DOUYIN, SourceKind.ITEM)
 
 
 def test_douyin_item_enrichment_never_lowers_native_quality_floor(
@@ -1841,7 +1885,7 @@ def test_douyin_probe_caps_range_omits_cookie_and_validates_duration(
     assert probed_urls == ["https://cdn.example.com/verified-video.mp4"]
     assert "cookie" not in request_headers
     assert request_headers["range"] == "bytes=0-262143"
-    assert ydl.request.extensions["timeout"] == 6.0
+    assert ydl.request.extensions["timeout"] == 10.0
     assert ydl.response.offset == 256 * 1024
     assert ydl.response.closed is True
 
@@ -1888,6 +1932,103 @@ def test_douyin_probe_failures_are_safe_and_actionable(monkeypatch) -> None:
         "default,4k,2k,1080p,720p: media endpoint network request failed"
     )
     assert "must-not-leak" not in info["_douyin_probe_failure"]
+
+
+def test_douyin_official_probe_retries_transient_timeout(monkeypatch) -> None:
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    info = _douyin_raw_info()
+    attempts: dict[str, int] = {}
+    delays = []
+    messages = []
+
+    def probe(ydl, url, *, expected_duration, should_cancel):
+        ratio = parse_qs(urlsplit(url).query)["ratio"][0]
+        attempts[ratio] = attempts.get(ratio, 0) + 1
+        if ratio == "4k" and attempts[ratio] < 3:
+            raise TimeoutError("temporary timeout")
+        width, height = (720, 1280) if ratio == "720p" else (1080, 1920)
+        return {
+            "url": url,
+            "width": width,
+            "height": height,
+            "bit_rate": 1_000_000,
+            "filesize": 9_000_000,
+            "duration": expected_duration,
+            "vcodec": "h264",
+            "acodec": "aac",
+        }
+
+    monkeypatch.setattr(engine, "_probe_douyin_candidate", probe)
+    monkeypatch.setattr(
+        engine,
+        "_wait_for_douyin_probe_retry",
+        lambda delay, should_cancel: delays.append(delay),
+    )
+
+    assert engine._add_douyin_probe_formats(
+        object(),
+        info,
+        expected_id="1111111111111111111",
+        verification_url="https://www.douyin.com/video/1111111111111111111",
+        callback=lambda event: messages.append(event.message),
+        should_cancel=lambda: False,
+    )
+    assert attempts == {
+        "default": 1,
+        "4k": 3,
+        "2k": 1,
+        "1080p": 1,
+        "720p": 1,
+    }
+    assert delays == [1.0, 2.0]
+    assert sum(message.startswith("Retrying Douyin quality 4k") for message in messages) == 2
+
+
+def test_douyin_probe_closes_retryable_http_error(monkeypatch) -> None:
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    response = Response(
+        BytesIO(),
+        url="https://api-play.amemv.com/aweme/v1/play/",
+        headers={},
+        status=429,
+        reason="Too Many Requests",
+    )
+    http_error = HTTPError(response)
+    attempts = 0
+
+    def probe(ydl, url, *, expected_duration, should_cancel):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise http_error
+        return {
+            "url": url,
+            "width": 1080,
+            "height": 1920,
+            "duration": expected_duration,
+            "vcodec": "h264",
+            "acodec": "aac",
+        }
+
+    monkeypatch.setattr(engine, "_probe_douyin_candidate", probe)
+    monkeypatch.setattr(
+        engine,
+        "_wait_for_douyin_probe_retry",
+        lambda delay, should_cancel: None,
+    )
+
+    result = engine._probe_douyin_ratio_with_retry(
+        object(),
+        "https://api-play.amemv.com/aweme/v1/play/",
+        ratio="4k",
+        expected_duration=23.0,
+        callback=None,
+        should_cancel=lambda: False,
+    )
+
+    assert result and result["width"] == 1080
+    assert attempts == 2
+    assert response.closed is True
 
 
 def test_douyin_partial_probe_success_never_allows_720p_fallback(monkeypatch) -> None:

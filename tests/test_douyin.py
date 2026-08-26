@@ -6,10 +6,37 @@ from app.douyin import (
     _is_target_post_response,
     _minimal_aweme_metadata,
     _parse_profile_awemes,
+    discover_item_metadata_from_profile,
     discover_profile,
     quality_floor_dimensions,
 )
 from app.errors import AuthenticationRequiredError
+
+
+def test_item_metadata_profile_lookup_stops_at_target(monkeypatch) -> None:
+    profile_id = "MS4wLjABAAAAexpected"
+    media_id = "1111111111111111111"
+    calls = []
+
+    def fetch(profile_url, requested_profile_id, **kwargs):
+        calls.append((profile_url, requested_profile_id, kwargs))
+        return [
+            {
+                "aweme_id": media_id,
+                "author": {"sec_uid": profile_id, "nickname": "Test Author"},
+                "video": {
+                    "play_addr": {"uri": "v0200fg10000fixturevideoid"}
+                },
+            }
+        ]
+
+    monkeypatch.setattr("app.douyin.fetch_signed_profile_awemes", fetch)
+
+    result = discover_item_metadata_from_profile(profile_id, media_id)
+
+    assert result and result["media_id"] == media_id
+    assert len(calls) == 1
+    assert calls[0][2]["target_aweme_id"] == media_id
 
 
 def test_douyin_signed_profile_discovery_returns_verified_complete_metadata(
