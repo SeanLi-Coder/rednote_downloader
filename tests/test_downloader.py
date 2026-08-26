@@ -118,6 +118,29 @@ def test_safe_component_honors_length_limit() -> None:
     assert safe_component("a" * 200, limit=24) == "a" * 24
 
 
+def test_douyin_author_prefers_display_name_over_numeric_uploader() -> None:
+    assert (
+        MediaDownloader._author_from_info(
+            {
+                "extractor_key": "Douyin",
+                "uploader": "30509580784",
+                "channel": "温柚柚",
+            }
+        )
+        == "温柚柚"
+    )
+    assert (
+        MediaDownloader._author_from_info(
+            {
+                "extractor_key": "Generic",
+                "uploader": "Uploader Name",
+                "channel": "Channel Name",
+            }
+        )
+        == "Uploader Name"
+    )
+
+
 def test_item_key_is_stable_when_profile_tokens_change() -> None:
     first = _item_key(
         Platform.XIAOHONGSHU,
@@ -555,6 +578,64 @@ def test_douyin_profile_metadata_rejects_wrong_cached_owner() -> None:
         )
 
 
+def test_douyin_cached_profile_item_can_recover_default_2k_master(
+    monkeypatch,
+) -> None:
+    media_id = "2222222222222222222"
+    profile_id = "profile-a"
+    engine = MediaDownloader(DownloaderConfig(cookie_browser="chrome"))
+    info = engine._douyin_raw_info_from_profile_metadata(
+        {
+            "profile_owner_verified": True,
+            "douyin_profile_media": {
+                "media_id": media_id,
+                "owner_id": profile_id,
+                "video_uri": "v0200fg10000fixturevideoid",
+                "duration_ms": 23_400,
+            },
+        },
+        expected_id=media_id,
+        expected_profile_id=profile_id,
+        verification_url=f"https://www.douyin.com/user/{profile_id}",
+        fallback_title="Video",
+    )
+    assert info is not None
+
+    def probe(ydl, url, *, expected_duration, should_cancel):
+        ratio = parse_qs(urlsplit(url).query)["ratio"][0]
+        if ratio != "default":
+            return None
+        return {
+            "url": url,
+            "width": 1440,
+            "height": 2560,
+            "bit_rate": 20_132_350,
+            "filesize": 59_093_472,
+            "duration": expected_duration,
+            "vcodec": "h265",
+            "acodec": "aac",
+        }
+
+    monkeypatch.setattr(engine, "_probe_douyin_candidate", probe)
+    assert engine._add_douyin_probe_formats(
+        object(),
+        info,
+        expected_id=media_id,
+        expected_profile_id=profile_id,
+        verification_url=f"https://www.douyin.com/user/{profile_id}",
+        should_cancel=lambda: False,
+    )
+    assert all(value["format_id"] != "profile-cached-play" for value in info["formats"])
+
+    with YoutubeDL(
+        {"quiet": True, **engine._download_format_options(Platform.DOUYIN)}
+    ) as ydl:
+        selected = ydl.process_ie_result(info, download=False)
+
+    assert selected["format_id"].startswith("douyin-api-1440x2560")
+    assert (selected["width"], selected["height"]) == (1440, 2560)
+
+
 def test_douyin_cached_profile_item_never_falls_back_to_unverified_720(
     monkeypatch, tmp_path
 ) -> None:
@@ -744,13 +825,16 @@ def test_douyin_ratio_candidates_use_probed_resolution_not_requested_label(
     engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
     info = _douyin_raw_info()
     actual = {
+        "default": (1440, 2560, 20_132_350, 59_093_472),
         "4k": (1080, 1920, 1_100_000, 10_000_000),
-        "2k": (1440, 2560, 1_500_000, 15_000_000),
+        "2k": (1080, 1920, 1_100_000, 10_000_000),
         "1080p": (1080, 1920, 1_000_000, 9_000_000),
         "720p": (720, 1280, 700_000, 7_000_000),
     }
+    probed_urls = []
 
     def probe(ydl, url, *, expected_duration, should_cancel):
+        probed_urls.append(url)
         ratio = parse_qs(urlsplit(url).query)["ratio"][0]
         width, height, bit_rate, filesize = actual[ratio]
         return {
@@ -760,7 +844,7 @@ def test_douyin_ratio_candidates_use_probed_resolution_not_requested_label(
             "bit_rate": bit_rate,
             "filesize": filesize,
             "duration": expected_duration,
-            "vcodec": "h264",
+            "vcodec": "h265" if ratio == "default" else "h264",
             "acodec": "aac",
         }
 
@@ -791,6 +875,23 @@ def test_douyin_ratio_candidates_use_probed_resolution_not_requested_label(
         9_000_000,
         10_000_000,
     }
+    urls_by_ratio = {
+        parse_qs(urlsplit(value).query)["ratio"][0]: value for value in probed_urls
+    }
+    assert urlsplit(urls_by_ratio["default"]).hostname == "api-play-hl.amemv.com"
+    assert all(
+        urlsplit(urls_by_ratio[ratio]).hostname == "api-play.amemv.com"
+        for ratio in ("4k", "2k", "1080p", "720p")
+    )
+
+    with YoutubeDL(
+        {"quiet": True, **engine._download_format_options(Platform.DOUYIN)}
+    ) as ydl:
+        selected = ydl.process_ie_result(info, download=False)
+
+    assert selected["format_id"].startswith("douyin-api-1440x2560")
+    assert (selected["width"], selected["height"]) == (1440, 2560)
+    assert selected["vcodec"] == "h265"
 
 
 def test_douyin_probe_reports_each_ratio_and_propagates_cancellation(
@@ -815,12 +916,13 @@ def test_douyin_probe_reports_each_ratio_and_propagates_cancellation(
         should_cancel=lambda: False,
     )
 
-    assert [event.event for event in events] == ["probing"] * 4
+    assert [event.event for event in events] == ["probing"] * 5
     assert [event.message for event in events] == [
-        "Checking Douyin quality 1/4: 4k",
-        "Checking Douyin quality 2/4: 2k",
-        "Checking Douyin quality 3/4: 1080p",
-        "Checking Douyin quality 4/4: 720p",
+        "Checking Douyin quality 1/5: default",
+        "Checking Douyin quality 2/5: 4k",
+        "Checking Douyin quality 3/5: 2k",
+        "Checking Douyin quality 4/5: 1080p",
+        "Checking Douyin quality 5/5: 720p",
     ]
 
     def cancel_probe(ydl, url, *, expected_duration, should_cancel):
@@ -1177,8 +1279,59 @@ def test_douyin_ffprobe_uses_short_independent_timeouts(monkeypatch) -> None:
         )
         is None
     )
-    assert [call[2] for call in calls] == [3.0, 5.0]
-    assert "5000000" in calls[1][0]
+    assert [call[2] for call in calls] == [3.0, 15.0]
+    assert "15000000" in calls[1][0]
+
+
+def test_douyin_ffprobe_uses_remote_range_seek_when_moov_is_at_tail(
+    monkeypatch,
+) -> None:
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    calls = []
+    monkeypatch.setattr("app.downloader.shutil.which", lambda name: "/bin/ffprobe")
+
+    def run(command, *, input_data=None, timeout_seconds, should_cancel):
+        calls.append((command, input_data, timeout_seconds))
+        if input_data is not None:
+            return None
+        return json.dumps(
+            {
+                "streams": [
+                    {
+                        "codec_type": "video",
+                        "codec_name": "hevc",
+                        "width": 1440,
+                        "height": 2560,
+                        "duration": "23.353333",
+                        "bit_rate": "20132350",
+                    },
+                    {
+                        "codec_type": "audio",
+                        "codec_name": "aac",
+                    },
+                ],
+                "format": {
+                    "duration": "23.357823",
+                    "size": "59093472",
+                },
+            }
+        ).encode()
+
+    monkeypatch.setattr(engine, "_run_ffprobe", run)
+
+    result = engine._ffprobe_douyin_media(
+        b"prefix-without-tail-moov",
+        "https://cdn.example.com/default-master.mp4",
+        should_cancel=lambda: False,
+    )
+
+    assert result is not None
+    assert (result["width"], result["height"]) == (1440, 2560)
+    assert result["vcodec"] == "hevc"
+    assert [call[2] for call in calls] == [3.0, 15.0]
+    assert calls[0][1] == b"prefix-without-tail-moov"
+    assert calls[1][1] is None
+    assert "https://cdn.example.com/default-master.mp4" in calls[1][0]
 
 
 def test_bilibili_profile_probes_first_video_when_playlist_has_no_author(

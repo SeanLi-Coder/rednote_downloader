@@ -596,7 +596,9 @@
     if (activeItem) {
       const phaseMessage = activeItem?.progress?.filename;
       if (typeof phaseMessage === "string" && phaseMessage.startsWith("Checking Douyin quality")) {
-        return phaseMessage.replace("Checking Douyin quality", "正在检测抖音最高画质");
+        return phaseMessage
+          .replace("Checking Douyin quality", "正在检测抖音最高画质")
+          .replace(": default", ": 原始档");
       }
       const index = Math.max(0, getItems(job).indexOf(activeItem));
       return `正在处理：${itemTitle(activeItem, index)}`;

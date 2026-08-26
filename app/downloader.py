@@ -40,11 +40,13 @@ MAX_TITLE_BYTES = 180
 MAX_MEDIA_ID_BYTES = 64
 MAX_FILENAME_COMPONENT_BYTES = 255
 RESERVED_EXTENSION_BYTES = 16
-DOUYIN_PROBE_RATIOS = ("4k", "2k", "1080p", "720p")
+DOUYIN_PROBE_RATIOS = ("default", "4k", "2k", "1080p", "720p")
 DOUYIN_PROBE_BYTES = 256 * 1024
+DOUYIN_DEFAULT_PROBE_HOST = "api-play-hl.amemv.com"
+DOUYIN_RATIO_PROBE_HOST = "api-play.amemv.com"
 DOUYIN_PROBE_HTTP_TIMEOUT_SECONDS = 6.0
 DOUYIN_FFPROBE_PIPE_TIMEOUT_SECONDS = 3.0
-DOUYIN_FFPROBE_REMOTE_TIMEOUT_SECONDS = 5.0
+DOUYIN_FFPROBE_REMOTE_TIMEOUT_SECONDS = 15.0
 DOUYIN_PROCESS_POLL_SECONDS = 0.1
 DOUYIN_MEDIA_HEADERS = {
     "User-Agent": (
@@ -872,6 +874,9 @@ class MediaDownloader:
 
     @staticmethod
     def _douyin_ratio_url(video_uri: str, ratio: str) -> str:
+        hostname = (
+            DOUYIN_DEFAULT_PROBE_HOST if ratio == "default" else DOUYIN_RATIO_PROBE_HOST
+        )
         query = urlencode(
             {
                 "video_id": video_uri,
@@ -881,7 +886,7 @@ class MediaDownloader:
                 "source": "PackSourceEnum_AWEME_DETAIL",
             }
         )
-        return f"https://api-play.amemv.com/aweme/v1/play/?{query}"
+        return f"https://{hostname}/aweme/v1/play/?{query}"
 
     def _add_douyin_probe_formats(
         self,
@@ -1821,13 +1826,15 @@ class MediaDownloader:
     def _author_from_info(
         info: dict[str, Any], fallback: str | None = "Unknown Author"
     ) -> str | None:
-        for key in (
-            "uploader",
-            "channel",
-            "playlist_uploader",
-            "creator",
-            "artist",
-        ):
+        extractor = " ".join(
+            str(info.get(key) or "") for key in ("extractor", "extractor_key")
+        ).lower()
+        keys = (
+            ("channel", "uploader", "playlist_uploader", "creator", "artist")
+            if "douyin" in extractor
+            else ("uploader", "channel", "playlist_uploader", "creator", "artist")
+        )
+        for key in keys:
             value = info.get(key)
             if isinstance(value, str) and value.strip():
                 return value.strip()
