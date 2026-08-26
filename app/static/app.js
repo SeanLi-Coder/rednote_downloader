@@ -478,7 +478,39 @@
   function itemError(item) {
     if (!isRetryableItem(item)) return "";
     const fallback = canonicalStatus(item) === "cancelled" ? "下载已取消，可以重新尝试" : "下载失败，请重试";
-    return asText(firstDefined(item?.error_message, item?.error, item?.reason, item?.message, fallback));
+    return localizeRuntimeMessage(firstDefined(item?.error_message, item?.error, item?.reason, item?.message, fallback));
+  }
+
+  function localizeRuntimeMessage(value) {
+    let text = asText(value);
+    if (text.includes("FFprobe was found but could not be started")) {
+      return "已找到 FFprobe，但程序无法启动它。请重新安装包含 FFprobe 的 FFmpeg，然后完全停止并重启程序。";
+    }
+    if (text.includes("FFprobe was not found")) {
+      return "未找到 FFprobe，无法验证抖音最高画质。请安装包含 FFprobe 的 FFmpeg，将其 bin 目录加入 PATH，然后完全停止并重启程序；macOS Homebrew 可运行 brew install ffmpeg。";
+    }
+    if (!text.includes("Douyin profile media was discovered")) return text;
+
+    text = text
+      .replace(
+        /Douyin profile media was discovered, but its highest quality could not be verified\.[\s\S]*?Probe details:\s*/,
+        "已发现该抖音作品，但无法验证其最高画质；为避免下错低清版本，本次没有下载。探测详情："
+      )
+      .replaceAll("media request or FFprobe timed out", "媒体请求或 FFprobe 探测超时")
+      .replaceAll("secure media connection failed", "安全媒体连接失败")
+      .replaceAll("media endpoint network request failed", "媒体地址网络请求失败")
+      .replaceAll("media endpoint returned an HTTP error", "媒体地址返回 HTTP 错误")
+      .replaceAll("media endpoint did not return video data", "媒体地址未返回视频数据")
+      .replaceAll("media endpoint did not return an MP4 file", "媒体地址未返回有效 MP4 文件")
+      .replaceAll("FFprobe could not parse the media stream", "FFprobe 无法解析媒体流")
+      .replaceAll("FFprobe returned no video dimensions", "FFprobe 未返回视频分辨率")
+      .replaceAll("FFprobe returned no media duration", "FFprobe 未返回媒体时长")
+      .replaceAll("media duration did not match the requested Douyin item", "媒体时长与目标抖音作品不匹配")
+      .replaceAll("no verified media identity was available", "没有可验证的媒体身份")
+      .replaceAll("no playable candidate was returned", "未返回可播放的候选媒体")
+      .replaceAll("media metadata could not be parsed", "无法解析媒体元数据")
+      .replaceAll("default", "原始档");
+    return text;
   }
 
   function authRequired(job) {

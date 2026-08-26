@@ -14,8 +14,11 @@ if ! python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 10))'; then
   exit 1
 fi
 
+if ! command -v ffprobe >/dev/null 2>&1; then
+  echo "Warning: FFprobe was not found. Douyin quality verification will fail."
+fi
 if ! command -v ffmpeg >/dev/null 2>&1; then
-  echo "Warning: FFmpeg was not found. Highest-quality split video/audio downloads may fail."
+  echo "Warning: FFmpeg was not found. Split video/audio downloads may fail."
 fi
 
 if [ ! -x ".venv/bin/python" ]; then

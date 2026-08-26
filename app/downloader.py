@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import math
 import mimetypes
 import os
 import re
@@ -48,6 +49,10 @@ DOUYIN_PROBE_HTTP_TIMEOUT_SECONDS = 6.0
 DOUYIN_FFPROBE_PIPE_TIMEOUT_SECONDS = 3.0
 DOUYIN_FFPROBE_REMOTE_TIMEOUT_SECONDS = 15.0
 DOUYIN_PROCESS_POLL_SECONDS = 0.1
+FFPROBE_FALLBACK_PATHS = (
+    "/opt/homebrew/bin/ffprobe",
+    "/usr/local/bin/ffprobe",
+)
 DOUYIN_MEDIA_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) "
@@ -115,6 +120,20 @@ _WINDOWS_RESERVED = {
     *(f"COM{index}" for index in range(1, 10)),
     *(f"LPT{index}" for index in range(1, 10)),
 }
+
+FFPROBE_REQUIRED_MESSAGE = (
+    "FFprobe was not found. Install FFmpeg with FFprobe, make sure its bin "
+    "directory is on PATH, fully stop this app, and restart it. On macOS with "
+    "Homebrew, run `brew install ffmpeg` and then `./start.command`."
+)
+FFPROBE_START_MESSAGE = (
+    "FFprobe was found but could not be started. Reinstall FFmpeg with FFprobe, "
+    "fully stop this app, and restart it."
+)
+
+
+class _DouyinProbeRejected(RuntimeError):
+    pass
 
 
 def safe_component(
@@ -906,9 +925,11 @@ class MediaDownloader:
             expected_profile_id,
         )
         if not video_uri:
+            info["_douyin_probe_failure"] = "no verified media identity was available"
             return False
         expected_duration = self._float_or_none(info.get("duration"))
         probes: list[dict[str, Any]] = []
+        failures: list[tuple[str, str]] = []
         ratio_count = len(DOUYIN_PROBE_RATIOS)
         for index, ratio in enumerate(DOUYIN_PROBE_RATIOS, start=1):
             if should_cancel():
@@ -933,9 +954,14 @@ class MediaDownloader:
                 if probe:
                     probe["requested_ratio"] = ratio
                     probes.append(probe)
+                else:
+                    failures.append((ratio, "media metadata could not be parsed"))
             except DownloadCancelled:
                 raise
-            except Exception:
+            except MediaDownloadError:
+                raise
+            except Exception as exc:
+                failures.append((ratio, self._safe_douyin_probe_failure(exc)))
                 continue
             if should_cancel():
                 raise DownloadCancelled("Task cancelled")
@@ -982,7 +1008,47 @@ class MediaDownloader:
                 for value in formats
                 if value.get("format_id") != "profile-cached-play"
             ]
+        if not unique_probes:
+            info["_douyin_probe_failure"] = self._summarize_douyin_probe_failures(
+                failures
+            )
         return bool(unique_probes)
+
+    @staticmethod
+    def _safe_douyin_probe_failure(exc: Exception) -> str:
+        if isinstance(exc, _DouyinProbeRejected):
+            return str(exc)
+        text = f"{type(exc).__name__} {exc}".lower()
+        if "timeout" in text or "timed out" in text:
+            return "media request or FFprobe timed out"
+        if "ssl" in text or "certificate" in text:
+            return "secure media connection failed"
+        if any(
+            marker in text
+            for marker in ("connection", "network", "resolve", "remote end")
+        ):
+            return "media endpoint network request failed"
+        if (
+            type(exc).__name__.lower() == "httperror"
+            or "http error" in text
+            or "http status" in text
+            or "status code" in text
+        ):
+            return "media endpoint returned an HTTP error"
+        return f"media probe failed ({type(exc).__name__})"
+
+    @staticmethod
+    def _summarize_douyin_probe_failures(
+        failures: list[tuple[str, str]],
+    ) -> str:
+        if not failures:
+            return "no playable candidate was returned"
+        grouped: dict[str, list[str]] = {}
+        for ratio, reason in failures:
+            grouped.setdefault(reason, []).append(ratio)
+        return "; ".join(
+            f"{','.join(ratios)}: {reason}" for reason, ratios in grouped.items()
+        )
 
     def _probe_douyin_candidate(
         self,
@@ -1012,12 +1078,22 @@ class MediaDownloader:
                 final_url_parts.scheme not in {"http", "https"}
                 or not final_url_parts.hostname
             ):
-                return None
+                raise _DouyinProbeRejected(
+                    "media endpoint returned an invalid redirect"
+                )
             content_type = (
                 str(response.headers.get("Content-Type") or "").split(";", 1)[0].lower()
             )
-            if not content_type.startswith("video/"):
-                return None
+            if content_type and not (
+                content_type.startswith("video/")
+                or content_type
+                in {
+                    "application/mp4",
+                    "application/octet-stream",
+                    "binary/octet-stream",
+                }
+            ):
+                raise _DouyinProbeRejected("media endpoint did not return video data")
             payload = bytearray()
             while len(payload) < DOUYIN_PROBE_BYTES:
                 if should_cancel():
@@ -1027,7 +1103,7 @@ class MediaDownloader:
                     break
                 payload.extend(chunk)
             if len(payload) < 12 or payload[4:8] != b"ftyp":
-                return None
+                raise _DouyinProbeRejected("media endpoint did not return an MP4 file")
             content_range = str(response.headers.get("Content-Range") or "")
             size_match = re.search(r"/(\d+)$", content_range)
             filesize = int(size_match.group(1)) if size_match else None
@@ -1042,18 +1118,20 @@ class MediaDownloader:
             should_cancel=should_cancel,
         )
         if not media:
-            return None
+            raise _DouyinProbeRejected("FFprobe could not parse the media stream")
         width = int(media.get("width") or 0)
         height = int(media.get("height") or 0)
         if width <= 0 or height <= 0:
-            return None
+            raise _DouyinProbeRejected("FFprobe returned no video dimensions")
         duration = self._float_or_none(media.get("duration"))
         if expected_duration is not None:
             if duration is None:
-                return None
+                raise _DouyinProbeRejected("FFprobe returned no media duration")
             tolerance = max(3.0, expected_duration * 0.05)
             if abs(duration - expected_duration) > tolerance:
-                return None
+                raise _DouyinProbeRejected(
+                    "media duration did not match the requested Douyin item"
+                )
         return {
             **media,
             "url": final_url,
@@ -1067,9 +1145,9 @@ class MediaDownloader:
         *,
         should_cancel: CancelCallback,
     ) -> dict[str, Any] | None:
-        executable = shutil.which("ffprobe")
+        executable = self._find_ffprobe_executable()
         if not executable:
-            return None
+            raise MediaDownloadError(FFPROBE_REQUIRED_MESSAGE)
         entries = (
             "stream=codec_type,codec_name,width,height,bit_rate,duration:"
             "format=duration,bit_rate,size"
@@ -1083,15 +1161,18 @@ class MediaDownloader:
             "-of",
             "json",
         ]
-        payload = self._run_ffprobe(
-            [*base_command, "-i", "pipe:0"],
-            input_data=initial_bytes,
-            timeout_seconds=DOUYIN_FFPROBE_PIPE_TIMEOUT_SECONDS,
-            should_cancel=should_cancel,
-        )
-        parsed = self._parse_ffprobe_payload(payload)
-        if parsed:
-            return parsed
+        try:
+            payload = self._run_ffprobe(
+                [*base_command, "-i", "pipe:0"],
+                input_data=initial_bytes,
+                timeout_seconds=DOUYIN_FFPROBE_PIPE_TIMEOUT_SECONDS,
+                should_cancel=should_cancel,
+            )
+        except TimeoutError:
+            payload = None
+        prefix_media = self._parse_ffprobe_payload(payload)
+        if self._douyin_probe_metadata_complete(prefix_media):
+            return prefix_media
 
         header_blob = "".join(
             f"{key}: {value}\r\n" for key, value in DOUYIN_MEDIA_HEADERS.items()
@@ -1109,7 +1190,51 @@ class MediaDownloader:
             timeout_seconds=DOUYIN_FFPROBE_REMOTE_TIMEOUT_SECONDS,
             should_cancel=should_cancel,
         )
-        return self._parse_ffprobe_payload(payload)
+        remote_media = self._parse_ffprobe_payload(payload)
+        return self._merge_douyin_probe_metadata(prefix_media, remote_media)
+
+    @classmethod
+    def _douyin_probe_metadata_complete(cls, media: dict[str, Any] | None) -> bool:
+        if not media:
+            return False
+        return (
+            int(media.get("width") or 0) > 0
+            and int(media.get("height") or 0) > 0
+            and (cls._float_or_none(media.get("duration")) or 0) > 0
+        )
+
+    @classmethod
+    def _merge_douyin_probe_metadata(
+        cls,
+        prefix_media: dict[str, Any] | None,
+        remote_media: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if not prefix_media:
+            return remote_media
+        if not remote_media:
+            return prefix_media
+        merged = dict(prefix_media)
+        for key, value in remote_media.items():
+            if key in {"width", "height", "bit_rate"}:
+                if int(value or 0) > 0:
+                    merged[key] = value
+            elif key == "duration":
+                if (cls._float_or_none(value) or 0) > 0:
+                    merged[key] = value
+            elif value not in {None, "", "none"}:
+                merged[key] = value
+        return merged
+
+    @staticmethod
+    def _find_ffprobe_executable() -> str | None:
+        executable = shutil.which("ffprobe")
+        if executable:
+            return executable
+        for value in FFPROBE_FALLBACK_PATHS:
+            candidate = Path(value)
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return str(candidate)
+        return None
 
     def _run_ffprobe(
         self,
@@ -1128,8 +1253,8 @@ class MediaDownloader:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
             )
-        except OSError:
-            return None
+        except OSError as exc:
+            raise MediaDownloadError(FFPROBE_START_MESSAGE) from exc
 
         deadline = time.monotonic() + max(0.1, timeout_seconds)
         pending_input = input_data
@@ -1140,7 +1265,7 @@ class MediaDownloader:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 self._terminate_process(process)
-                return None
+                raise TimeoutError("FFprobe timed out while reading media")
             try:
                 stdout, _ = process.communicate(
                     input=pending_input,
@@ -1193,25 +1318,39 @@ class MediaDownloader:
 
         def safe_int(value: Any) -> int:
             try:
-                return int(value or 0)
+                parsed = int(value or 0)
             except (TypeError, ValueError):
                 return 0
+            return parsed if parsed > 0 else 0
+
+        def safe_number(*values: Any) -> Any | None:
+            for value in values:
+                try:
+                    parsed = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(parsed) and parsed > 0:
+                    return value
+            return None
 
         return {
             "width": safe_int(video.get("width")),
             "height": safe_int(video.get("height")),
             "vcodec": video.get("codec_name"),
             "acodec": audio.get("codec_name") if audio else "none",
-            "bit_rate": safe_int(video.get("bit_rate") or format_data.get("bit_rate")),
-            "duration": (video.get("duration") or format_data.get("duration")),
+            "bit_rate": safe_int(
+                safe_number(video.get("bit_rate"), format_data.get("bit_rate"))
+            ),
+            "duration": safe_number(video.get("duration"), format_data.get("duration")),
         }
 
     @staticmethod
     def _float_or_none(value: Any) -> float | None:
         try:
-            return float(value) if value is not None else None
+            parsed = float(value) if value is not None else None
         except (TypeError, ValueError):
             return None
+        return parsed if parsed is not None and math.isfinite(parsed) else None
 
     def _download_with_ytdlp(
         self,
@@ -1371,18 +1510,28 @@ class MediaDownloader:
                         should_cancel=should_cancel,
                     )
                     if not probe_added and raw_result.get("_douyin_profile_cache_only"):
+                        probe_failure = str(
+                            raw_result.get("_douyin_probe_failure")
+                            or "no playable candidate was returned"
+                        )
                         raise DownloadError(
                             "Douyin profile media was discovered, but its highest "
                             "quality could not be verified. Retry this item; no "
-                            "lower-quality fallback was downloaded."
+                            "lower-quality fallback was downloaded. Probe details: "
+                            f"{probe_failure}."
                         )
                     if not probe_added:
+                        probe_failure = str(
+                            raw_result.get("_douyin_probe_failure")
+                            or "no playable candidate was returned"
+                        )
                         emit(
                             EngineEvent(
                                 event="warning",
                                 message=(
                                     "Douyin's original-quality endpoint could not be "
-                                    "verified, so the highest yt-dlp format was used."
+                                    "verified, so the highest yt-dlp format was used. "
+                                    f"Probe details: {probe_failure}."
                                 ),
                             )
                         )

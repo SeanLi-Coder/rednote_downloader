@@ -1,6 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
+export PATH="/opt/homebrew/bin:/usr/local/bin:${PATH:-/usr/bin:/bin}"
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
@@ -16,8 +18,13 @@ if ! python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 10))'; then
   exit 1
 fi
 
+if ! command -v ffprobe >/dev/null 2>&1; then
+  echo "Warning: FFprobe was not found. Douyin quality verification will fail."
+  echo "On macOS with Homebrew, run: brew install ffmpeg"
+fi
 if ! command -v ffmpeg >/dev/null 2>&1; then
-  echo "Warning: FFmpeg was not found. Highest-quality split video/audio downloads may fail."
+  echo "Warning: FFmpeg was not found. Split video/audio downloads may fail."
+  echo "On macOS with Homebrew, run: brew install ffmpeg"
 fi
 
 if [ ! -x ".venv/bin/python" ]; then

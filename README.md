@@ -62,6 +62,7 @@
 ```bash
 python3 --version
 ffmpeg -version
+ffprobe -version
 ```
 
 macOS 可使用 Homebrew 安装 FFmpeg：
@@ -69,6 +70,8 @@ macOS 可使用 Homebrew 安装 FFmpeg：
 ```bash
 brew install ffmpeg
 ```
+
+Apple Silicon Mac 的 Homebrew 通常把 `ffmpeg` 和 `ffprobe` 安装到 `/opt/homebrew/bin`。`start.command` 会自动把该目录加入 `PATH`；如果画质探测仍提示找不到 FFprobe，请完全停止旧进程，再重新双击 `start.command`。
 
 Ubuntu/Debian 可使用：
 
@@ -222,6 +225,10 @@ downloads/
 ### 为什么只有 1080p，没有 2K/4K？
 
 工具没有设置分辨率上限。通常原因是平台本次只向当前账号返回到 1080p、账号没有对应权限、Cookie 失效、地区限制，或原作品本身没有更高版本。Bilibili 的部分 4K/HDR/高码率格式需要登录或会员权限。抖音的“2K”标签不保证文件像素达到 1440p，而且真正的最高画质有时位于 `default` 原始档而不是 `2k` 参数：工具会同时探测并以实际字节为准，不会把标签伪报成 2K，也不会漏掉独立的 1440×2560 原始档。
+
+### 为什么所有抖音作品都提示最高画质无法验证？
+
+如果所有作品同时失败，先在启动程序的同一个终端执行 `ffprobe -version`。抖音画质探测必须使用 FFprobe 读取媒体的真实分辨率；macOS 可运行 `brew install ffmpeg` 安装，然后完全停止程序并重新运行 `./start.command`。当前版本也会在任务错误中分别显示 FFprobe 缺失、网络超时、HTTP、非视频响应、MP4 文件头、时长不匹配等安全诊断，不再只显示一条笼统错误。
 
 ### 为什么抖音旧任务可能显示需要人工检查？
 

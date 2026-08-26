@@ -1091,15 +1091,16 @@ def test_douyin_uri_accepts_amemv_subdomains_but_rejects_lookalikes() -> None:
     )
 
 
+@pytest.mark.parametrize("content_type", ["video/mp4", "application/octet-stream"])
 def test_douyin_probe_caps_range_omits_cookie_and_validates_duration(
-    monkeypatch,
+    monkeypatch, content_type: str
 ) -> None:
     payload = b"\x00\x00\x00\x18ftypisom" + b"x" * (400_000 - 12)
 
     class Headers:
         def get(self, name: str, default=None):
             values = {
-                "Content-Type": "video/mp4",
+                "Content-Type": content_type,
                 "Content-Range": "bytes 0-262143/10425019",
             }
             return values.get(name, default)
@@ -1175,15 +1176,81 @@ def test_douyin_probe_caps_range_omits_cookie_and_validates_duration(
             "duration": 200,
         },
     )
-    assert (
+    with pytest.raises(RuntimeError, match="duration did not match"):
         engine._probe_douyin_candidate(
             ProbeYoutubeDL(),
             "https://api-play.amemv.com/aweme/v1/play/" "?video_id=fixture&ratio=4k",
             expected_duration=72.8,
             should_cancel=lambda: False,
         )
-        is None
+
+
+def test_douyin_probe_failures_are_safe_and_actionable(monkeypatch) -> None:
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    info = _douyin_raw_info()
+
+    def fail(ydl, url, *, expected_duration, should_cancel):
+        raise RuntimeError(
+            "connection reset for https://cdn.example/video?token=must-not-leak"
+        )
+
+    monkeypatch.setattr(engine, "_probe_douyin_candidate", fail)
+
+    assert (
+        engine._add_douyin_probe_formats(
+            object(),
+            info,
+            expected_id="1111111111111111111",
+            verification_url="https://www.douyin.com/user/profile-a",
+            should_cancel=lambda: False,
+        )
+        is False
     )
+    assert info["_douyin_probe_failure"] == (
+        "default,4k,2k,1080p,720p: media endpoint network request failed"
+    )
+    assert "must-not-leak" not in info["_douyin_probe_failure"]
+
+
+def test_douyin_ffprobe_missing_is_explicit(monkeypatch) -> None:
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    monkeypatch.setattr("app.downloader.shutil.which", lambda name: None)
+    monkeypatch.setattr("app.downloader.FFPROBE_FALLBACK_PATHS", ())
+
+    with pytest.raises(MediaDownloadError, match="FFprobe was not found"):
+        engine._ffprobe_douyin_media(
+            b"fixture",
+            "https://cdn.example.com/video.mp4",
+            should_cancel=lambda: False,
+        )
+
+
+def test_douyin_ffprobe_start_failure_is_explicit(monkeypatch) -> None:
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+
+    def fail(*args, **kwargs):
+        raise OSError("invalid executable")
+
+    monkeypatch.setattr("app.downloader.subprocess.Popen", fail)
+
+    with pytest.raises(MediaDownloadError, match="could not be started"):
+        engine._run_ffprobe(
+            ["ffprobe"],
+            timeout_seconds=1,
+            should_cancel=lambda: False,
+        )
+
+
+def test_douyin_ffprobe_finds_apple_silicon_homebrew_path(
+    monkeypatch, tmp_path
+) -> None:
+    executable = tmp_path / "ffprobe"
+    executable.write_bytes(b"fixture")
+    executable.chmod(0o755)
+    monkeypatch.setattr("app.downloader.shutil.which", lambda name: None)
+    monkeypatch.setattr("app.downloader.FFPROBE_FALLBACK_PATHS", (str(executable),))
+
+    assert MediaDownloader._find_ffprobe_executable() == str(executable)
 
 
 def test_douyin_ffprobe_payload_parses_video_and_audio_streams() -> None:
@@ -1237,6 +1304,31 @@ def test_douyin_ffprobe_payload_tolerates_unknown_numeric_values() -> None:
     assert parsed["width"] == 0
     assert parsed["height"] == 0
     assert parsed["bit_rate"] == 0
+    assert parsed["duration"] is None
+
+
+def test_douyin_ffprobe_payload_uses_valid_format_numeric_values() -> None:
+    payload = json.dumps(
+        {
+            "streams": [
+                {
+                    "codec_type": "video",
+                    "codec_name": "hevc",
+                    "width": 1440,
+                    "height": 2560,
+                    "duration": "N/A",
+                    "bit_rate": "N/A",
+                }
+            ],
+            "format": {"duration": "23.357823", "bit_rate": "20132350"},
+        }
+    ).encode()
+
+    parsed = MediaDownloader._parse_ffprobe_payload(payload)
+
+    assert parsed is not None
+    assert parsed["duration"] == "23.357823"
+    assert parsed["bit_rate"] == 20_132_350
 
 
 def test_douyin_ffprobe_process_can_be_cancelled_promptly() -> None:
@@ -1283,6 +1375,42 @@ def test_douyin_ffprobe_uses_short_independent_timeouts(monkeypatch) -> None:
     assert "15000000" in calls[1][0]
 
 
+def test_douyin_ffprobe_prefix_timeout_continues_to_remote(monkeypatch) -> None:
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    calls = []
+    monkeypatch.setattr("app.downloader.shutil.which", lambda name: "/bin/ffprobe")
+
+    def run(command, *, input_data=None, timeout_seconds, should_cancel):
+        calls.append((command, input_data, timeout_seconds))
+        if input_data is not None:
+            raise TimeoutError("prefix timed out")
+        return json.dumps(
+            {
+                "streams": [
+                    {
+                        "codec_type": "video",
+                        "codec_name": "h264",
+                        "width": 1080,
+                        "height": 1920,
+                        "duration": "20.0",
+                    }
+                ]
+            }
+        ).encode()
+
+    monkeypatch.setattr(engine, "_run_ffprobe", run)
+
+    result = engine._ffprobe_douyin_media(
+        b"fixture",
+        "https://cdn.example.com/video.mp4",
+        should_cancel=lambda: False,
+    )
+
+    assert result is not None
+    assert (result["width"], result["height"]) == (1080, 1920)
+    assert [call[2] for call in calls] == [3.0, 15.0]
+
+
 def test_douyin_ffprobe_uses_remote_range_seek_when_moov_is_at_tail(
     monkeypatch,
 ) -> None:
@@ -1293,7 +1421,20 @@ def test_douyin_ffprobe_uses_remote_range_seek_when_moov_is_at_tail(
     def run(command, *, input_data=None, timeout_seconds, should_cancel):
         calls.append((command, input_data, timeout_seconds))
         if input_data is not None:
-            return None
+            return json.dumps(
+                {
+                    "streams": [
+                        {
+                            "codec_type": "video",
+                            "codec_name": "hevc",
+                            "width": 1440,
+                            "height": 2560,
+                            "duration": "N/A",
+                        }
+                    ],
+                    "format": {"duration": "N/A"},
+                }
+            ).encode()
         return json.dumps(
             {
                 "streams": [
@@ -1332,6 +1473,56 @@ def test_douyin_ffprobe_uses_remote_range_seek_when_moov_is_at_tail(
     assert calls[0][1] == b"prefix-without-tail-moov"
     assert calls[1][1] is None
     assert "https://cdn.example.com/default-master.mp4" in calls[1][0]
+
+
+def test_douyin_ffprobe_uses_remote_when_prefix_has_no_dimensions(
+    monkeypatch,
+) -> None:
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    calls = []
+    monkeypatch.setattr("app.downloader.shutil.which", lambda name: "/bin/ffprobe")
+
+    def run(command, *, input_data=None, timeout_seconds, should_cancel):
+        calls.append((command, input_data, timeout_seconds))
+        if input_data is not None:
+            return json.dumps(
+                {
+                    "streams": [
+                        {
+                            "codec_type": "video",
+                            "codec_name": "hevc",
+                            "width": 0,
+                            "height": 0,
+                            "duration": "23.357823",
+                        }
+                    ]
+                }
+            ).encode()
+        return json.dumps(
+            {
+                "streams": [
+                    {
+                        "codec_type": "video",
+                        "codec_name": "hevc",
+                        "width": 1440,
+                        "height": 2560,
+                        "duration": "23.357823",
+                    }
+                ]
+            }
+        ).encode()
+
+    monkeypatch.setattr(engine, "_run_ffprobe", run)
+
+    result = engine._ffprobe_douyin_media(
+        b"prefix-without-dimensions",
+        "https://cdn.example.com/default-master.mp4",
+        should_cancel=lambda: False,
+    )
+
+    assert result is not None
+    assert (result["width"], result["height"]) == (1440, 2560)
+    assert [call[2] for call in calls] == [3.0, 15.0]
 
 
 def test_bilibili_profile_probes_first_video_when_playlist_has_no_author(
