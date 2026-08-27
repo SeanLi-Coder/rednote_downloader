@@ -528,6 +528,88 @@
       .replaceAll("FFprobe could not parse the media stream", "FFprobe 无法解析媒体流");
   }
 
+  const douyinRedirectReasonLabels = Object.freeze({
+    "malformed-url": "跳转地址格式异常",
+    "embedded-credentials": "跳转地址包含不应出现的账号信息",
+    "missing-host": "跳转地址缺少主机名",
+    "hostname-too-long": "主机名长度异常",
+    "non-ascii-host": "主机名不是可验证的 ASCII 域名",
+    "ip-literal": "跳转目标是 IP 地址，不是可验证的官方 CDN 域名",
+    "local-or-special-use-host": "跳转目标是本地、内网或保留用途域名",
+    "single-label-host": "跳转目标不是完整域名",
+    "invalid-hostname": "主机名格式不符合 DNS 规则",
+    "non-https-scheme": "媒体地址被降级为非 HTTPS",
+    "nonstandard-port": "媒体地址使用了非标准 HTTPS 端口",
+    "too-many-redirects": "媒体地址的连续跳转次数超过安全上限",
+    "unverified-source-binding": "域名属于已知 CDN，但当前任务缺少把它绑定到该作品最高画质的完整校验指纹",
+    "unrecognized-host": "该域名尚未列入可信抖音媒体 CDN",
+  });
+
+  const douyinCdnFamilies = Object.freeze([
+    "douyin.com",
+    "douyinvod.com",
+    "amemv.com",
+    "zjcdn.com",
+    "douyincdn.com",
+    "idouyinvod.com",
+    "pstatp.com",
+  ]);
+
+  function douyinCdnFamily(host) {
+    return douyinCdnFamilies.find((family) => (
+      host === family || host.endsWith(`.${family}`)
+    )) || "";
+  }
+
+  function douyinRedirectDiagnostic(text) {
+    const rawHost = (text.match(/(?:Redirect host:\s*|\(host:\s*)([a-z0-9.-]+)/i)?.[1] || "")
+      .toLowerCase()
+      .replace(/\.+$/, "");
+    const fingerprint = (
+      text.match(/(?:Redirect host fingerprint:\s*|host-fingerprint:\s*)([0-9a-f]{12})/i)?.[1] || ""
+    ).toLowerCase();
+    const reason = text.match(/(?:Redirect reason:\s*|reason:\s*)([a-z0-9-]+)/i)?.[1]?.toLowerCase() || "";
+    const labels = rawHost.split(".");
+    const isSafeHostname = (
+      rawHost.length <= 253 &&
+      labels.length >= 2 &&
+      !labels.every((label) => /^\d+$/.test(label)) &&
+      labels.every((label) => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label))
+    );
+    return {
+      host: isSafeHostname ? rawHost : "",
+      fingerprint,
+      legacyInvalidHost: rawHost === "invalid-host" && !reason,
+      reason,
+      reasonText: douyinRedirectReasonLabels[reason] || "具体类别未知",
+    };
+  }
+
+  function douyinRedirectMessage(text, phase) {
+    const diagnostic = douyinRedirectDiagnostic(text);
+    if (diagnostic.legacyInvalidHost) {
+      return `这是旧版本保存的抖音${phase}地址校验结果：“invalid-host”不是实际域名，旧记录没有保留具体失败类别。这个被拦截的媒体响应没有保存，此前已完成的文件会保留，并暂停了后续队列；请从原链接重试，若再次被拦截会显示具体原因。请先检查代理或 VPN，不需要打开 Chrome 验证。`;
+    }
+    if (!diagnostic.reason && diagnostic.host) {
+      return `这是旧版本保存的抖音${phase}地址校验结果。旧记录没有保留具体失败类别，而且主机名可能包含敏感标识，因此新版不会回显或要求你发送它。这个被拦截的媒体响应没有保存，此前已完成的文件会保留，并暂停了后续队列；请从原链接重试，若再次被拦截会显示可安全反馈的具体原因或校验指纹，不需要打开 Chrome 验证。`;
+    }
+    if (diagnostic.reason === "unverified-source-binding") {
+      const family = douyinCdnFamily(diagnostic.host);
+      const hostText = family ? `（CDN 域名族：${family}）` : "";
+      return `抖音${phase}跳转到了已知媒体 CDN${hostText}，但当前任务缺少把该地址绑定到这条作品最高画质所需的完整校验指纹。这个媒体响应没有保存，此前已完成的文件会保留，并暂停了后续队列；请从原主页或原视频链接继续或重试，让程序重新解析最高画质，不需要打开 Chrome 验证。`;
+    }
+    if (diagnostic.reason === "unrecognized-host") {
+      const fingerprintText = diagnostic.fingerprint ? `（校验指纹：${diagnostic.fingerprint}）` : "";
+      const feedbackText = diagnostic.fingerprint
+        ? "若关闭代理后仍出现，只需把这个校验指纹发给开发者"
+        : diagnostic.reason
+          ? "若关闭代理后仍出现，请从原链接重试；新版再次拦截时会显示可反馈的校验指纹"
+          : "若关闭代理后仍出现，请从原链接重试";
+      return `抖音${phase}跳转到了尚未识别的媒体 CDN${fingerprintText}。程序在读取文件前已拦截，这个媒体响应没有保存；此前已完成的文件会保留，并暂停了后续队列。请先检查代理或 VPN 后重试；${feedbackText}，不要发送带签名的完整媒体链接，也不需要打开 Chrome 验证。`;
+    }
+    return `抖音${phase}的重定向地址未通过安全校验。原因：${diagnostic.reasonText}。程序在读取文件前已拦截，这个媒体响应没有保存；此前已完成的文件会保留，并暂停了后续队列。请检查代理或 VPN 是否改写了媒体地址，稍后从原链接重试，不需要打开 Chrome 验证。`;
+  }
+
   function localizeRuntimeMessage(value, job = null) {
     let text = asText(value);
     if (text.includes("Chrome cookies could not be read") && text.includes("Fully quit Chrome")) {
@@ -592,14 +674,10 @@
       return "抖音原文件传输遇到临时网络错误或限流。程序已保留完成的文件并暂停后续队列，避免整页连续失败；请稍等后点击继续任务，不需要打开其他作品或作者主页验证。";
     }
     if (text.includes("Douyin media redirect could not be trusted")) {
-      const hostMatch = text.match(/Redirect host:\s*([a-z0-9.-]+)/i);
-      const host = hostMatch?.[1] || "未知主机";
-      return `抖音原文件跳转到了尚未识别或不受信任的 CDN 主机（${host}）。程序没有保存该媒体文件，并已暂停后续队列；请检查网络代理后重试，不需要打开 Chrome 验证。`;
+      return douyinRedirectMessage(text, "原文件下载");
     }
     if (text.includes("media endpoint redirected to an unrecognized Douyin CDN host")) {
-      const hostMatch = text.match(/\(host:\s*([a-z0-9.-]+)\)/i);
-      const host = hostMatch?.[1] || "未知主机";
-      return `抖音画质探测跳转到了当前版本尚未识别的 CDN 主机（${host}）。程序没有保存该媒体文件，并已暂停后续队列，不会让余下作品连续失败；请检查代理，或把这个主机名反馈给开发者，不需要打开 Chrome 验证。`;
+      return douyinRedirectMessage(text, "画质探测");
     }
     if (text.includes("The site temporarily rate-limited the request")) {
       return "网站正在短时限流。请等待一两分钟后直接重试；没有明确验证码或登录页面时，不需要打开 Chrome 验证。";
@@ -721,10 +799,10 @@
       return "未找到 FFprobe，无法验证抖音或小红书视频的最高画质。请安装包含 FFprobe 的 FFmpeg，将其 bin 目录加入 PATH，然后完全停止并重启程序；macOS Homebrew 可运行 brew install ffmpeg。";
     }
     if (text.includes("Douyin media request redirected to an untrusted URL")) {
-      return "这是旧版本保存的抖音媒体跳转错误；旧版没有记录实际跳转主机，因此不能据此安全放行。请确认页面底部是当前版本，然后从原主页或原视频链接重新创建任务；新版会重新解析，并在再次拦截时显示具体 CDN 主机名。";
+      return "这是旧版本保存的抖音媒体跳转错误；旧版没有记录实际跳转主机，因此不能据此安全放行。请确认页面底部是当前版本，然后从原主页或原视频链接重新创建任务；新版会重新解析，并在再次拦截时显示具体安全校验原因，只在安全时显示 CDN 域名。";
     }
     if (text.includes("This task contains a Douyin media redirect failure recorded by an older version")) {
-      return "这是旧版本保存的抖音媒体跳转错误，旧版没有记录实际 CDN 主机。已下载文件均已保留；点击重试会从原链接重新解析，新版若再次拦截会显示具体主机名，也不需要打开 Chrome 验证。";
+      return "这是旧版本保存的抖音媒体跳转错误，旧版没有记录实际 CDN 主机。已下载文件均已保留；点击重试会从原链接重新解析，新版若再次拦截会显示具体安全校验原因，并在安全时显示主机名，也不需要打开 Chrome 验证。";
     }
     if (text.includes("This saved Douyin short-link task contains a media redirect failure from an older version")) {
       return "这是旧版抖音短链任务保存的跳转错误，但旧版没有保存短链当时解析到的目标，无法安全自动重试。已下载文件均已保留；请把原短链重新粘贴并新建任务，新版会先绑定目标再下载。";

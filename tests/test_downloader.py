@@ -5,17 +5,20 @@ import hashlib
 import sys
 import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from yt_dlp import YoutubeDL
-from yt_dlp.networking import Response
+from yt_dlp.dependencies import urllib3
+from yt_dlp.networking import Request, Response
 from yt_dlp.networking.exceptions import HTTPError, TransportError
 from yt_dlp.utils import DownloadCancelled, DownloadError
 
 from app.downloader import (
+    DOUYIN_MAX_MEDIA_REDIRECTS,
     DOUYIN_MAX_PROBE_FILE_BYTES,
     DOUYIN_REGIONAL_MEDIA_DOMAINS,
     DOUYIN_TRANSFER_ATTEMPTS,
@@ -113,6 +116,73 @@ class FakeYoutubeDL:
 
     def prepare_filename(self, info: dict) -> str:
         return str(Path(self.options["paths"]["home"]) / "unused.mp4")
+
+
+def _inject_fake_douyin_media_opener(
+    monkeypatch: pytest.MonkeyPatch,
+    engine: MediaDownloader,
+) -> None:
+    """Adapt lightweight fake YDLs without weakening the production fail-closed path."""
+
+    def open_response(
+        ydl,
+        request,
+        *,
+        redirect_rejection_reason,
+        should_cancel=None,
+    ):
+        if should_cancel is not None and should_cancel():
+            raise DownloadCancelled("Task cancelled")
+        initial_reason = redirect_rejection_reason(request.url)
+        if initial_reason is not None:
+            raise engine._douyin_redirect_rejection(request.url, initial_reason)
+        response = ydl.urlopen(request)
+        final_url = str(getattr(response, "url", request.url))
+        final_reason = redirect_rejection_reason(final_url)
+        if final_reason is not None:
+            response.close()
+            raise engine._douyin_redirect_rejection(final_url, final_reason)
+        return response
+
+    monkeypatch.setattr(engine, "_open_douyin_media_response", open_response)
+
+
+class _FakeRequestsRaw(BytesIO):
+    def read(self, size: int = -1, decode_content: bool = False) -> bytes:
+        return super().read(size)
+
+
+class _FakeRequestsResponse:
+    def __init__(
+        self,
+        url: str,
+        *,
+        location: str | None = None,
+        payload: bytes = b"",
+    ) -> None:
+        self.url = url
+        self.status_code = 302 if location is not None else 200
+        self.reason = "Found" if location is not None else "OK"
+        self.headers = {} if location is None else {"Location": location}
+        self.is_redirect = location is not None
+        self.raw = _FakeRequestsRaw(payload)
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+        self.raw.close()
+
+
+class _QueuedRequestsSession:
+    def __init__(self, responses: list[_FakeRequestsResponse]) -> None:
+        self.responses = responses
+        self.requests: list[dict] = []
+
+    def request(self, **kwargs):
+        self.requests.append(kwargs)
+        if len(self.requests) > len(self.responses):
+            raise AssertionError("Unexpected request after the queued redirect chain")
+        return self.responses[len(self.requests) - 1]
 
 
 @pytest.mark.parametrize(
@@ -2473,6 +2543,7 @@ def test_douyin_probe_caps_range_omits_cookie_and_validates_duration(
 
     ydl = ProbeYoutubeDL()
     engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    _inject_fake_douyin_media_opener(monkeypatch, engine)
     ffprobe_calls = []
 
     def ffprobe(data, *, local_path=None, should_cancel):
@@ -2565,6 +2636,7 @@ def test_douyin_probe_rejects_unrecognized_final_redirect_before_ffprobe(
 
     ydl = ProbeYoutubeDL()
     engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    _inject_fake_douyin_media_opener(monkeypatch, engine)
     monkeypatch.setattr(
         engine,
         "_ffprobe_douyin_media",
@@ -2575,8 +2647,8 @@ def test_douyin_probe_rejects_unrecognized_final_redirect_before_ffprobe(
 
     with pytest.raises(
         _DouyinRedirectRejected,
-        match="unrecognized Douyin CDN host.*invalid-host",
-    ):
+        match="unrecognized Douyin CDN host",
+    ) as error:
         engine._probe_douyin_candidate(
             ydl,
             (
@@ -2587,6 +2659,11 @@ def test_douyin_probe_rejects_unrecognized_final_redirect_before_ffprobe(
             should_cancel=lambda: False,
         )
 
+    message = str(error.value)
+    assert "host: unavailable" in message
+    assert "reason: non-https-scheme" in message
+    assert "127.0.0.1" not in message
+    assert "private.mp4" not in message
     assert ydl.response.read_calls == 0
     assert ydl.response.closed is True
 
@@ -2653,6 +2730,724 @@ def test_douyin_regional_media_allowlist_rejects_lookalikes_and_invalid_urls() -
         assert not engine._is_verified_douyin_media_redirect(source_url, value)
 
 
+@pytest.mark.parametrize(
+    ("value", "expected_host", "expected_reason"),
+    [
+        (
+            "http://media.vendor-cdn.net/original.mp4?token=secret-query",
+            None,
+            "non-https-scheme",
+        ),
+        (
+            "https://user:secret-password@media.vendor-cdn.net/original.mp4",
+            None,
+            "embedded-credentials",
+        ),
+        (
+            "https://media.vendor-cdn.net:8443/original.mp4",
+            None,
+            "nonstandard-port",
+        ),
+        (
+            "https://media.vendor-cdn.net:invalid/original.mp4",
+            None,
+            "malformed-url",
+        ),
+        ("https:///missing-host", None, "missing-host"),
+        ("http://127.0.0.1/private.mp4", None, "non-https-scheme"),
+        ("https://127.0.0.1/private.mp4", None, "ip-literal"),
+        ("https://010.000.000.001/private.mp4", None, "ip-literal"),
+        ("https://0x7f.0.0.1/private.mp4", None, "ip-literal"),
+        ("https://2130706433/private.mp4", None, "ip-literal"),
+        ("https://[::1]/private.mp4", None, "ip-literal"),
+        ("https://[pstatp.com]/private.mp4", None, "malformed-url"),
+        ("https://[edge.video.pstatp.com]/private.mp4", None, "malformed-url"),
+        ("https://localhost/private.mp4", None, "single-label-host"),
+        (
+            "https://media.example.com/private.mp4",
+            None,
+            "local-or-special-use-host",
+        ),
+        ("https://media.internal/private.mp4", None, "local-or-special-use-host"),
+        ("https://media.example/private.mp4", None, "local-or-special-use-host"),
+        ("https://media.onion/private.mp4", None, "local-or-special-use-host"),
+        ("https://media.alt/private.mp4", None, "local-or-special-use-host"),
+        ("https://例子.example/private.mp4", None, "non-ascii-host"),
+        (
+            "https://bad_host.example/private.mp4",
+            None,
+            "invalid-hostname",
+        ),
+        (
+            "https://unrecognized-cdn.vendor-cdn.net/original.mp4?token=secret-query",
+            "unrecognized-cdn.vendor-cdn.net",
+            "unrecognized-host",
+        ),
+        (
+            "https://media.vendor-cdn.net\\@evil.example/private.mp4",
+            None,
+            "malformed-url",
+        ),
+        ("https://media.vendor-cdn.net/private.mp4\nsecret", None, "malformed-url"),
+        (" https://media.vendor-cdn.net/private.mp4", None, "malformed-url"),
+        ("", None, "malformed-url"),
+    ],
+)
+def test_douyin_redirect_diagnostic_is_specific_and_never_persists_url_secrets(
+    value,
+    expected_host,
+    expected_reason,
+) -> None:
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+
+    host, reason = engine._douyin_redirect_diagnostic(value)
+    rejection = engine._douyin_redirect_rejection(value, reason)
+    message = str(rejection)
+
+    assert host == expected_host
+    assert reason == expected_reason
+    assert rejection.redirect_reason == expected_reason
+    if expected_reason == "unrecognized-host":
+        expected_fingerprint = hashlib.sha256(
+            expected_host.encode("ascii")
+        ).hexdigest()[:12]
+        assert rejection.redirect_host is None
+        assert rejection.redirect_host_fingerprint == expected_fingerprint
+        assert "host: unavailable" in message
+        assert f"host-fingerprint: {expected_fingerprint}" in message
+        assert expected_host not in message
+    else:
+        assert rejection.redirect_host is None
+        assert rejection.redirect_host_fingerprint is None
+        assert "host: unavailable" in message
+    assert f"reason: {expected_reason}" in message
+    for secret in (
+        "secret-query",
+        "secret-password",
+        "user:",
+        "original.mp4",
+        "private.mp4",
+        "127.0.0.1",
+        "0x7f.0.0.1",
+        "2130706433",
+        "::1",
+    ):
+        assert secret not in message
+
+
+def test_douyin_unknown_redirect_redacts_token_subdomain_and_adds_fingerprint() -> None:
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    hostname = "secret-token.unrecognized.vendor-cdn.net"
+
+    rejection = engine._douyin_redirect_rejection(
+        f"https://{hostname}/original.mp4?token=secret-query",
+        "unrecognized-host",
+    )
+
+    message = str(rejection)
+    fingerprint = hashlib.sha256(hostname.encode("ascii")).hexdigest()[:12]
+    assert rejection.redirect_host is None
+    assert rejection.redirect_host_fingerprint == fingerprint
+    assert "secret-token" not in message
+    assert "unrecognized.vendor-cdn.net" not in message
+    assert "secret-query" not in message
+    assert "vendor-cdn.net" not in message
+    assert fingerprint in message
+
+
+def test_douyin_unknown_redirect_never_persists_token_in_two_label_host() -> None:
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    hostname = "secret-token.com"
+
+    rejection = engine._douyin_redirect_rejection(
+        f"https://{hostname}/original.mp4",
+        "unrecognized-host",
+    )
+
+    message = str(rejection)
+    assert rejection.redirect_host is None
+    assert rejection.redirect_host_fingerprint == hashlib.sha256(
+        hostname.encode("ascii")
+    ).hexdigest()[:12]
+    assert hostname not in message
+    assert "secret-token" not in message
+
+
+def test_douyin_known_unbound_redirect_only_persists_allowlist_family() -> None:
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    hostname = "secret-token.edge.pstatp.com"
+
+    rejection = engine._douyin_redirect_rejection(
+        f"https://{hostname}/original.mp4",
+        "unverified-source-binding",
+    )
+
+    message = str(rejection)
+    assert rejection.redirect_host == "pstatp.com"
+    assert rejection.redirect_host_fingerprint is None
+    assert "host: pstatp.com" in message
+    assert hostname not in message
+    assert "secret-token" not in message
+
+
+def test_douyin_redirect_policy_distinguishes_known_unbound_and_unknown_hosts() -> None:
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+
+    assert engine._douyin_media_redirect_rejection_reason(
+        "https://v26-web.douyinvod.com/original.mp4",
+        MediaType.VIDEO,
+        allow_verified_regional=False,
+    ) is None
+    assert engine._douyin_media_redirect_rejection_reason(
+        "https://edge.video.pstatp.com/original.mp4",
+        MediaType.VIDEO,
+        allow_verified_regional=False,
+    ) == "unverified-source-binding"
+    assert engine._douyin_media_redirect_rejection_reason(
+        "https://edge.video.pstatp.com/original.mp4",
+        MediaType.VIDEO,
+        allow_verified_regional=True,
+    ) is None
+    assert engine._douyin_media_redirect_rejection_reason(
+        "https://unrecognized-cdn.vendor-cdn.net/original.mp4",
+        MediaType.VIDEO,
+        allow_verified_regional=True,
+    ) == "unrecognized-host"
+
+
+def test_douyin_media_open_fails_closed_without_request_director() -> None:
+    class LegacyYoutubeDL:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def urlopen(self, request):
+            self.calls += 1
+            raise AssertionError("Fail-closed media open must not use urlopen fallback")
+
+    ydl = LegacyYoutubeDL()
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+
+    with pytest.raises(
+        _DouyinProbeRejected,
+        match="requires a yt-dlp request director",
+    ):
+        engine._open_douyin_media_response(
+            ydl,
+            Request("https://v26-web.douyinvod.com/original.mp4"),
+            redirect_rejection_reason=lambda value: None,
+        )
+
+    assert ydl.calls == 0
+
+
+def test_douyin_media_open_cancellation_prevents_validation_and_request() -> None:
+    class LegacyYoutubeDL:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def urlopen(self, request):
+            self.calls += 1
+            raise AssertionError("Cancelled media open must not perform a request")
+
+    ydl = LegacyYoutubeDL()
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+
+    with pytest.raises(DownloadCancelled, match="Task cancelled"):
+        engine._open_douyin_media_response(
+            ydl,
+            Request("https://v26-web.douyinvod.com/original.mp4"),
+            redirect_rejection_reason=lambda value: pytest.fail(
+                "Cancellation must be checked before redirect validation"
+            ),
+            should_cancel=lambda: True,
+        )
+
+    assert ydl.calls == 0
+
+
+def test_douyin_media_open_cancellation_after_request_closes_response(
+    monkeypatch,
+) -> None:
+    class FinalResponse:
+        is_redirect = False
+
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    class CancellingSession:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.response = FinalResponse()
+
+        def request(self, **kwargs):
+            self.calls += 1
+            return self.response
+
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    cancellation_checks = iter((False, False, True))
+    session = CancellingSession()
+
+    with YoutubeDL({"quiet": True, "proxy": ""}) as ydl:
+        handler = ydl._request_director.handlers["Requests"]
+        monkeypatch.setattr(handler, "_get_instance", lambda **kwargs: session)
+        with pytest.raises(DownloadCancelled, match="Task cancelled"):
+            engine._open_douyin_media_response(
+                ydl,
+                Request("https://v26-web.douyinvod.com/original.mp4"),
+                redirect_rejection_reason=lambda value: None,
+                should_cancel=lambda: next(cancellation_checks),
+            )
+
+    assert session.calls == 1
+    assert session.response.closed is True
+
+
+def test_douyin_redirect_limit_never_requests_sixth_target(monkeypatch) -> None:
+    assert DOUYIN_MAX_MEDIA_REDIRECTS == 5
+    urls = [
+        f"https://v26-web.douyinvod.com/hop-{index}.mp4"
+        for index in range(DOUYIN_MAX_MEDIA_REDIRECTS + 2)
+    ]
+    redirect_responses = [
+        _FakeRequestsResponse(urls[index], location=urls[index + 1])
+        for index in range(DOUYIN_MAX_MEDIA_REDIRECTS + 1)
+    ]
+    session = _QueuedRequestsSession(redirect_responses)
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+
+    with YoutubeDL({"quiet": True, "proxy": ""}) as ydl:
+        handler = ydl._request_director.handlers["Requests"]
+        monkeypatch.setattr(handler, "_get_instance", lambda **kwargs: session)
+        with pytest.raises(
+            _DouyinRedirectRejected,
+            match="reason: too-many-redirects",
+        ):
+            engine._open_douyin_media_response(
+                ydl,
+                Request(urls[0]),
+                redirect_rejection_reason=lambda value: None,
+            )
+
+    requested_urls = [request["url"] for request in session.requests]
+    assert requested_urls == urls[: DOUYIN_MAX_MEDIA_REDIRECTS + 1]
+    assert urls[DOUYIN_MAX_MEDIA_REDIRECTS + 1] not in requested_urls
+    assert len(redirect_responses) == 6
+    assert all(response.closed for response in redirect_responses)
+
+
+def test_douyin_relative_multi_hop_redirect_chain_succeeds(monkeypatch) -> None:
+    source_url = "https://v26-web.douyinvod.com/media/start.mp4"
+    first_hop_url = "https://v26-web.douyinvod.com/step/one.mp4"
+    final_url = "https://v26-web.douyinvod.com/step/final.mp4"
+    responses = [
+        _FakeRequestsResponse(source_url, location="../step/one.mp4"),
+        _FakeRequestsResponse(first_hop_url, location="final.mp4"),
+        _FakeRequestsResponse(final_url, payload=b"verified-media"),
+    ]
+    session = _QueuedRequestsSession(responses)
+    validated_urls = []
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+
+    with YoutubeDL({"quiet": True, "proxy": ""}) as ydl:
+        handler = ydl._request_director.handlers["Requests"]
+        monkeypatch.setattr(handler, "_get_instance", lambda **kwargs: session)
+        response = engine._open_douyin_media_response(
+            ydl,
+            Request(source_url),
+            redirect_rejection_reason=lambda value: (
+                validated_urls.append(value) or None
+            ),
+        )
+        try:
+            assert response.url == final_url
+            assert response.read() == b"verified-media"
+        finally:
+            response.close()
+
+    assert [request["url"] for request in session.requests] == [
+        source_url,
+        first_hop_url,
+        final_url,
+    ]
+    assert validated_urls == [source_url, first_hop_url, final_url]
+    assert responses[0].closed is True
+    assert responses[1].closed is True
+    assert responses[2].raw.closed is True
+
+
+@pytest.mark.parametrize(
+    "location",
+    [
+        "",
+        "https://v26-web.douyinvod.com/bad path.mp4",
+        "https://v26-web.douyinvod.com\\@evil.example/media.mp4",
+        "https://v26-web.douyinvod.com/media.mp4\x1f",
+    ],
+)
+def test_douyin_malformed_redirect_location_closes_current_response(
+    monkeypatch,
+    location,
+) -> None:
+    source_url = "https://v26-web.douyinvod.com/source.mp4"
+    redirect_response = _FakeRequestsResponse(
+        source_url,
+        location="placeholder",
+    )
+    redirect_response.headers["Location"] = location
+    if not location:
+        redirect_response.is_redirect = False
+    session = _QueuedRequestsSession([redirect_response])
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+
+    with YoutubeDL({"quiet": True, "proxy": ""}) as ydl:
+        handler = ydl._request_director.handlers["Requests"]
+        monkeypatch.setattr(handler, "_get_instance", lambda **kwargs: session)
+        with pytest.raises(
+            _DouyinRedirectRejected,
+            match="reason: malformed-url",
+        ):
+            engine._open_douyin_media_response(
+                ydl,
+                Request(source_url),
+                redirect_rejection_reason=lambda value: None,
+            )
+
+    assert len(session.requests) == 1
+    assert redirect_response.closed is True
+
+
+def test_douyin_redirect_policy_exception_closes_current_response(
+    monkeypatch,
+) -> None:
+    source_url = "https://v26-web.douyinvod.com/source.mp4"
+    target_url = "https://v26-web.douyinvod.com/target.mp4"
+    redirect_response = _FakeRequestsResponse(source_url, location=target_url)
+    session = _QueuedRequestsSession([redirect_response])
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+
+    def policy(value: str) -> None:
+        if value == source_url:
+            return None
+        raise RuntimeError("policy callback failed")
+
+    with YoutubeDL({"quiet": True, "proxy": ""}) as ydl:
+        handler = ydl._request_director.handlers["Requests"]
+        monkeypatch.setattr(handler, "_get_instance", lambda **kwargs: session)
+        with pytest.raises(RuntimeError, match="policy callback failed"):
+            engine._open_douyin_media_response(
+                ydl,
+                Request(source_url),
+                redirect_rejection_reason=policy,
+            )
+
+    assert len(session.requests) == 1
+    assert redirect_response.closed is True
+
+
+def test_douyin_cross_origin_redirect_strips_sensitive_headers_and_keeps_range(
+    monkeypatch,
+) -> None:
+    source_url = "https://v26-web.douyinvod.com/source.mp4"
+    target_url = "https://v5-dy-ov-experiment.zjcdn.com/final.mp4"
+    responses = [
+        _FakeRequestsResponse(source_url, location=target_url),
+        _FakeRequestsResponse(target_url, payload=b"verified-media"),
+    ]
+    session = _QueuedRequestsSession(responses)
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+
+    with YoutubeDL({"quiet": True, "proxy": ""}) as ydl:
+        handler = ydl._request_director.handlers["Requests"]
+        monkeypatch.setattr(handler, "_get_instance", lambda **kwargs: session)
+        response = engine._open_douyin_media_response(
+            ydl,
+            Request(
+                source_url,
+                headers={
+                    "Authorization": "Bearer secret",
+                    "Cookie": "session=secret",
+                    "Proxy-Authorization": "Basic secret",
+                    "Range": "bytes=0-262143",
+                },
+            ),
+            redirect_rejection_reason=lambda value: None,
+        )
+        response.close()
+
+    assert len(session.requests) == 2
+    first_headers = {
+        key.lower(): value for key, value in session.requests[0]["headers"].items()
+    }
+    second_headers = {
+        key.lower(): value for key, value in session.requests[1]["headers"].items()
+    }
+    assert first_headers["authorization"] == "Bearer secret"
+    assert first_headers["cookie"] == "session=secret"
+    assert first_headers["proxy-authorization"] == "Basic secret"
+    assert first_headers["range"] == "bytes=0-262143"
+    assert {
+        "authorization",
+        "cookie",
+        "proxy-authorization",
+    }.isdisjoint(second_headers)
+    assert second_headers["range"] == "bytes=0-262143"
+    assert responses[0].closed is True
+    assert responses[1].raw.closed is True
+
+
+def test_douyin_safe_redirect_does_not_request_rejected_target() -> None:
+    counts = {"source": 0, "target": 0}
+    observed = {"authorization": None, "range": None}
+
+    class TargetHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            counts["target"] += 1
+            observed["authorization"] = self.headers.get("Authorization")
+            observed["range"] = self.headers.get("Range")
+            self.send_response(200)
+            self.send_header("Content-Type", "video/mp4")
+            self.end_headers()
+            self.wfile.write(b"must-not-be-requested")
+
+        def log_message(self, format, *args):
+            return
+
+    target_server = ThreadingHTTPServer(("127.0.0.1", 0), TargetHandler)
+    target_url = (
+        f"http://127.0.0.1:{target_server.server_port}/private.mp4"
+        "?token=must-not-persist"
+    )
+
+    class SourceHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            counts["source"] += 1
+            self.send_response(302)
+            self.send_header("Location", target_url)
+            self.end_headers()
+
+        def log_message(self, format, *args):
+            return
+
+    source_server = ThreadingHTTPServer(("127.0.0.1", 0), SourceHandler)
+    threads = [
+        threading.Thread(target=server.serve_forever, daemon=True)
+        for server in (source_server, target_server)
+    ]
+    for thread in threads:
+        thread.start()
+
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    source_url = f"http://127.0.0.1:{source_server.server_port}/redirect"
+    try:
+        with YoutubeDL({"quiet": True, "proxy": ""}) as ydl:
+            with pytest.raises(_DouyinRedirectRejected) as error:
+                engine._open_douyin_media_response(
+                    ydl,
+                    Request(
+                        source_url,
+                        headers={
+                            "Authorization": "Bearer must-not-forward",
+                            "Range": "bytes=0-1023",
+                        },
+                    ),
+                    redirect_rejection_reason=lambda value: (
+                        None
+                        if value == source_url
+                        else engine._douyin_media_redirect_rejection_reason(
+                            value,
+                            MediaType.VIDEO,
+                            allow_verified_regional=True,
+                        )
+                    ),
+                )
+            assert counts == {"source": 1, "target": 0}
+            response = engine._open_douyin_media_response(
+                ydl,
+                Request(
+                    source_url,
+                    headers={
+                        "Authorization": "Bearer must-not-forward",
+                        "Range": "bytes=0-1023",
+                    },
+                ),
+                redirect_rejection_reason=lambda value: None,
+            )
+            try:
+                assert response.url == target_url
+                assert response.read() == b"must-not-be-requested"
+            finally:
+                response.close()
+    finally:
+        for server in (source_server, target_server):
+            server.shutdown()
+            server.server_close()
+        for thread in threads:
+            thread.join(timeout=2)
+
+    message = str(error.value)
+    assert counts == {"source": 2, "target": 1}
+    assert observed["authorization"] is None
+    assert observed["range"] == "bytes=0-1023"
+    assert "reason: non-https-scheme" in message
+    assert "127.0.0.1" not in message
+    assert "private.mp4" not in message
+    assert "must-not-persist" not in message
+
+
+def test_douyin_redirect_policy_runs_without_buffering_redirect_body(
+    monkeypatch,
+) -> None:
+    counts = {"source": 0, "target": 0}
+    redirect_body = b"x" * (2 * 1024 * 1024)
+
+    class RedirectHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/redirect":
+                counts["source"] += 1
+                target_url = (
+                    f"http://127.0.0.1:{self.server.server_port}/blocked"
+                )
+                self.send_response(302)
+                self.send_header("Location", target_url)
+                self.send_header("Content-Length", str(len(redirect_body)))
+                self.end_headers()
+                try:
+                    self.wfile.write(redirect_body)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                return
+            counts["target"] += 1
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, format, *args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), RedirectHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    source_url = f"http://127.0.0.1:{server.server_port}/redirect"
+    media_request = Request(source_url, extensions={"timeout": 5.0})
+    captured_responses = []
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    try:
+        with YoutubeDL({"quiet": True, "proxy": ""}) as ydl:
+            handler = ydl._request_director.handlers["Requests"]
+            session = handler._get_instance(
+                cookiejar=handler._get_cookiejar(media_request),
+                legacy_ssl_support=None,
+            )
+            original_request = session.request
+
+            def observe_request(**kwargs):
+                response = original_request(**kwargs)
+                captured_responses.append(response)
+                return response
+
+            monkeypatch.setattr(session, "request", observe_request)
+            monkeypatch.setattr(handler, "_get_instance", lambda **kwargs: session)
+            with pytest.raises(
+                _DouyinRedirectRejected,
+                match="reason: non-https-scheme",
+            ):
+                engine._open_douyin_media_response(
+                    ydl,
+                    media_request,
+                    redirect_rejection_reason=lambda value: (
+                        None
+                        if value == source_url
+                        else engine._douyin_media_redirect_rejection_reason(
+                            value,
+                            MediaType.VIDEO,
+                            allow_verified_regional=True,
+                        )
+                    ),
+                )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert counts == {"source": 1, "target": 0}
+    assert len(captured_responses) == 1
+    redirect_response = captured_responses[0]
+    assert redirect_response._content_consumed is False
+    assert redirect_response._content is False
+    assert redirect_response.raw.closed is True
+
+
+def test_douyin_safe_redirect_maps_low_level_protocol_errors_for_retry(
+    monkeypatch,
+) -> None:
+    class BrokenSession:
+        def request(self, **kwargs):
+            raise urllib3.exceptions.ProtocolError("temporary connection reset")
+
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    with YoutubeDL({"quiet": True, "proxy": ""}) as ydl:
+        handler = ydl._request_director.handlers["Requests"]
+        monkeypatch.setattr(
+            handler,
+            "_get_instance",
+            lambda **kwargs: BrokenSession(),
+        )
+        with pytest.raises(TransportError) as error:
+            engine._open_douyin_media_response(
+                ydl,
+                Request("https://api-play.amemv.com/aweme/v1/play/"),
+                redirect_rejection_reason=lambda value: None,
+            )
+
+    assert "temporary connection reset" in str(error.value)
+    assert engine._is_retryable_douyin_probe_error(error.value) is True
+
+
+def test_douyin_redirect_chain_budget_stops_before_next_request(monkeypatch) -> None:
+    source_url = "https://v26-web.douyinvod.com/source.mp4"
+
+    class RedirectResponse:
+        is_redirect = True
+        url = source_url
+        headers = {"Location": "https://v26-web.douyinvod.com/next.mp4"}
+
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    class SlowRedirectSession:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.response = RedirectResponse()
+
+        def request(self, **kwargs):
+            self.calls += 1
+            assert kwargs["timeout"] == 10.0
+            return self.response
+
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    clock = iter((100.0, 100.0, 111.0))
+    monkeypatch.setattr("app.downloader.time.monotonic", lambda: next(clock))
+    session = SlowRedirectSession()
+
+    with YoutubeDL({"quiet": True, "proxy": ""}) as ydl:
+        handler = ydl._request_director.handlers["Requests"]
+        monkeypatch.setattr(handler, "_get_instance", lambda **kwargs: session)
+        with pytest.raises(TransportError, match="redirect chain timed out"):
+            engine._open_douyin_media_response(
+                ydl,
+                Request(source_url, extensions={"timeout": 10.0}),
+                redirect_rejection_reason=lambda value: None,
+            )
+
+    assert session.calls == 1
+    assert session.response.closed is True
+
+
 def test_douyin_probe_accepts_regional_redirect_and_skips_full_complete_prefix(
     monkeypatch,
 ) -> None:
@@ -2698,6 +3493,7 @@ def test_douyin_probe_accepts_regional_redirect_and_skips_full_complete_prefix(
 
     ydl = ProbeYoutubeDL()
     engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    _inject_fake_douyin_media_opener(monkeypatch, engine)
     ffprobe_calls = []
 
     def ffprobe(data, *, local_path=None, should_cancel):
@@ -2793,6 +3589,7 @@ def test_douyin_incomplete_prefix_downloads_identical_full_file_and_cleans_temp(
             return response
 
     engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    _inject_fake_douyin_media_opener(monkeypatch, engine)
     ffprobe_calls = []
     temporary_paths = []
 
@@ -2935,7 +3732,7 @@ def test_douyin_full_probe_rejects_changed_or_unsafe_media_and_cleans_temp(
                         "Content-Length": str(declared_size),
                     },
                     (
-                        "https://unrecognized-cdn.example/original.mp4"
+                        "https://unrecognized-cdn.vendor-cdn.net/original.mp4"
                         if failure_mode == "unknown_host"
                         else trusted_final_url
                     ),
@@ -2946,6 +3743,7 @@ def test_douyin_full_probe_rejects_changed_or_unsafe_media_and_cleans_temp(
             return response
 
     engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    _inject_fake_douyin_media_opener(monkeypatch, engine)
     monkeypatch.setattr(
         engine,
         "_ffprobe_douyin_media",
@@ -3116,7 +3914,7 @@ def test_douyin_live_photo_tries_later_mirror_after_unrecognized_redirect(
         def urlopen(self, request):
             self.requests.append(request.url)
             if request.url == first_mirror:
-                final_url = "https://unrecognized-cdn.example/original.mp4"
+                final_url = "https://unrecognized-cdn.vendor-cdn.net/original.mp4"
             elif request.url == second_mirror:
                 final_url = regional_final
             else:
@@ -3126,6 +3924,7 @@ def test_douyin_live_photo_tries_later_mirror_after_unrecognized_redirect(
             return response
 
     engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    _inject_fake_douyin_media_opener(monkeypatch, engine)
 
     ffprobe_count = 0
 
@@ -3218,6 +4017,7 @@ def test_douyin_probe_rejects_candidate_without_size_or_bitrate(
             return Response()
 
     engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    _inject_fake_douyin_media_opener(monkeypatch, engine)
     monkeypatch.setattr(
         engine,
         "_ffprobe_douyin_media",
@@ -3276,6 +4076,7 @@ def test_douyin_probe_derives_bitrate_from_complete_content_length(
             return Response()
 
     engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    _inject_fake_douyin_media_opener(monkeypatch, engine)
     monkeypatch.setattr(
         engine,
         "_ffprobe_douyin_media",
@@ -3343,6 +4144,7 @@ def test_douyin_probe_requires_duration_even_without_item_duration(
             return Response()
 
     engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    _inject_fake_douyin_media_opener(monkeypatch, engine)
     monkeypatch.setattr(
         engine,
         "_ffprobe_douyin_media",
@@ -3969,6 +4771,62 @@ def test_download_error_redacts_external_urls_headers_and_tokens() -> None:
     assert "dict-cookie-secret" not in message
     assert "dict-bearer-secret" not in message
     assert "standalone-secret" not in message
+
+
+@pytest.mark.parametrize(
+    ("raw_message", "expected"),
+    [
+        (
+            "media endpoint redirected to an unrecognized Douyin CDN host "
+            "(host: secret-token.vendor-cdn.net)",
+            "(host: unavailable)",
+        ),
+        (
+            "Douyin media redirect could not be trusted. Redirect host: "
+            "secret-token.vendor-cdn.net; Redirect reason: unrecognized-host",
+            "Redirect host: unavailable",
+        ),
+        (
+            "Douyin media redirect could not be trusted. Redirect host: "
+            "secret-token.edge.pstatp.com; Redirect reason: "
+            "unverified-source-binding",
+            "Redirect host: pstatp.com",
+        ),
+    ],
+)
+def test_external_error_redaction_sanitizes_saved_douyin_redirect_hosts(
+    raw_message: str,
+    expected: str,
+) -> None:
+    sanitized = safe_external_error_message(raw_message)
+
+    assert expected in sanitized
+    assert "secret-token" not in sanitized
+    assert safe_external_error_message(sanitized) == sanitized
+
+
+def test_external_error_redaction_removes_http_reason_and_ip_literals() -> None:
+    assert safe_external_error_message(
+        "HTTP Error 400: token=SECRET 127.0.0.1 [::1]"
+    ) == "HTTP Error 400"
+    sanitized = safe_external_error_message(
+        "Media transport failed at 127.0.0.1 and [::1]"
+    )
+    assert sanitized == (
+        "Media transport failed at [redacted IP] and [redacted IP]"
+    )
+    for host_value in (
+        "::1",
+        "2130706433",
+        "010.000.000.001",
+        "secret-token.vendor-cdn.net",
+    ):
+        sanitized_host = safe_external_error_message(
+            f"HTTPSConnectionPool(host='{host_value}', port=443)"
+        )
+        assert host_value not in sanitized_host
+        assert "host=[redacted]" in sanitized_host
+        assert safe_external_error_message(sanitized_host) == sanitized_host
 
 
 @pytest.mark.parametrize(
@@ -4689,6 +5547,7 @@ def test_douyin_verified_transfer_rejects_lower_final_media_without_overwrite(
     media_id = "7664225419386607205"
     payload = b"\x00\x00\x00\x18ftypisom" + b"verified-original-bytes"
     engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    _inject_fake_douyin_media_opener(monkeypatch, engine)
     direct_ydl = _configure_verified_douyin_transfer(
         monkeypatch,
         engine,
@@ -4726,6 +5585,7 @@ def test_douyin_verified_transfer_preserves_exact_bytes_and_reports_resolution(
     media_id = "7664225419386607205"
     payload = b"\x00\x00\x00\x18ftypisom" + b"verified-original-bytes"
     engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    _inject_fake_douyin_media_opener(monkeypatch, engine)
     direct_ydl = _configure_verified_douyin_transfer(
         monkeypatch,
         engine,
@@ -4766,6 +5626,7 @@ def test_douyin_verified_transfer_falls_back_to_probed_final_after_source_change
     changed_payload = b"\x00\x00\x00\x18ftypisom" + b"changed-source-response"
     assert len(changed_payload) == len(payload)
     engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    _inject_fake_douyin_media_opener(monkeypatch, engine)
     direct_ydl = _configure_verified_douyin_transfer(
         monkeypatch,
         engine,
@@ -4803,6 +5664,7 @@ def test_douyin_verified_transfer_accepts_bound_regional_cdn_and_preserves_bytes
     payload = b"\x00\x00\x00\x18ftypisom" + b"regional-original-bytes"
     final_url = "https://edge.video.pstatp.com/original.mp4"
     engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    _inject_fake_douyin_media_opener(monkeypatch, engine)
     direct_ydl = _configure_verified_douyin_transfer(
         monkeypatch,
         engine,
@@ -4840,6 +5702,7 @@ def test_douyin_verified_transfer_blocks_untrusted_final_redirect(
     media_id = "7664225419386607205"
     payload = b"\x00\x00\x00\x18ftypisom" + b"private-response"
     engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    _inject_fake_douyin_media_opener(monkeypatch, engine)
     direct_ydl = _configure_verified_douyin_transfer(
         monkeypatch,
         engine,
@@ -4856,9 +5719,17 @@ def test_douyin_verified_transfer_blocks_untrusted_final_redirect(
         metadata={"_job_id": "douyin-job"},
     )
 
-    with pytest.raises(TemporaryAccessError, match="redirect could not be trusted"):
+    with pytest.raises(
+        TemporaryAccessError,
+        match="redirect could not be trusted",
+    ) as error:
         engine.download_item(item, Platform.DOUYIN, tmp_path)
 
+    message = str(error.value)
+    assert "Redirect host: unavailable" in message
+    assert "reason: non-https-scheme" in message
+    assert "127.0.0.1" not in message
+    assert "private.mp4" not in message
     assert direct_ydl.responses[0].offset == 0
     assert direct_ydl.responses[0].closed is True
     assert not list(tmp_path.iterdir())
@@ -4871,13 +5742,15 @@ def test_douyin_verified_transfer_pauses_on_unknown_redirect_without_read_or_fil
     media_id = "7664225419386607205"
     payload = b"\x00\x00\x00\x18ftypisom" + b"unknown-cdn-response"
     engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    _inject_fake_douyin_media_opener(monkeypatch, engine)
     direct_ydl = _configure_verified_douyin_transfer(
         monkeypatch,
         engine,
         media_id=media_id,
         payload=payload,
         final_url=(
-            "https://unrecognized-cdn.example/original.mp4?token=must-not-persist"
+            "https://unrecognized-cdn.vendor-cdn.net/original.mp4"
+            "?token=must-not-persist"
         ),
     )
     item = DownloadItem(
@@ -4896,7 +5769,12 @@ def test_douyin_verified_transfer_pauses_on_unknown_redirect_without_read_or_fil
         engine.download_item(item, Platform.DOUYIN, tmp_path)
 
     message = str(error.value)
-    assert "Redirect host: unrecognized-cdn.example" in message
+    hostname = "unrecognized-cdn.vendor-cdn.net"
+    fingerprint = hashlib.sha256(hostname.encode("ascii")).hexdigest()[:12]
+    assert "Redirect host: unavailable" in message
+    assert f"Redirect host fingerprint: {fingerprint}" in message
+    assert "unrecognized-cdn" not in message
+    assert "reason: unrecognized-host" in message
     assert "original.mp4" not in message
     assert "must-not-persist" not in message
     assert len(direct_ydl.responses) == 1
@@ -4956,6 +5834,7 @@ def test_douyin_regional_transfer_requires_strict_probe_source_binding(
             "1111111111111111111",
             "https://www.douyin.com/user/verified-profile",
             media_type=MediaType.VIDEO,
+            platform=Platform.DOUYIN,
             callback=None,
             should_cancel=lambda: False,
             asset_index=1,
@@ -4967,6 +5846,80 @@ def test_douyin_regional_transfer_requires_strict_probe_source_binding(
     assert not list(tmp_path.iterdir())
 
 
+def test_douyin_redirect_to_known_regional_cdn_reports_missing_source_binding(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    payload = b"\x00\x00\x00\x18ftypisom" + b"must-not-be-read"
+
+    class Response:
+        url = "https://edge.video.pstatp.com/original.mp4"
+        headers = {"Content-Type": "video/mp4"}
+
+        def __init__(self) -> None:
+            self.read_calls = 0
+            self.closed = False
+
+        def read(self, size: int) -> bytes:
+            self.read_calls += 1
+            return payload[:size]
+
+        def close(self) -> None:
+            self.closed = True
+
+    class AssetYoutubeDL:
+        def __init__(self) -> None:
+            self.response = Response()
+
+        def urlopen(self, request):
+            return self.response
+
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    _inject_fake_douyin_media_opener(monkeypatch, engine)
+    ydl = AssetYoutubeDL()
+    with pytest.raises(
+        TemporaryAccessError,
+        match="reason: unverified-source-binding",
+    ) as error:
+        engine._download_first_available_asset(
+            ydl,
+            [
+                RemoteAsset(
+                    candidates=["https://v26-web.douyinvod.com/original.mp4"],
+                    index=1,
+                    width=1080,
+                    height=1920,
+                    size=len(payload),
+                    duration=2.0,
+                    bit_rate=2_000_000,
+                    video_codec="h264",
+                    audio_codec="none",
+                    probe_prefix_size=len(payload),
+                    probe_prefix_sha256=hashlib.sha256(payload).hexdigest(),
+                    redirect_source_url=None,
+                )
+            ],
+            tmp_path,
+            "2025-09-01",
+            "Live Photo",
+            "1111111111111111111",
+            "https://www.douyin.com/user/verified-profile",
+            media_type=MediaType.VIDEO,
+            platform=Platform.DOUYIN,
+            callback=None,
+            should_cancel=lambda: False,
+            asset_index=1,
+            verify_declared_dimensions=True,
+            require_quality_fingerprint=True,
+        )
+
+    message = str(error.value)
+    assert "Redirect host: pstatp.com" in message
+    assert ydl.response.read_calls == 0
+    assert ydl.response.closed is True
+    assert not list(tmp_path.iterdir())
+
+
 def test_douyin_verified_transfer_requires_size_or_bitrate_fingerprint(
     monkeypatch,
     tmp_path,
@@ -4974,6 +5927,7 @@ def test_douyin_verified_transfer_requires_size_or_bitrate_fingerprint(
     media_id = "7664225419386607205"
     payload = b"\x00\x00\x00\x18ftypisom" + b"unfingerprinted-bytes"
     engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    _inject_fake_douyin_media_opener(monkeypatch, engine)
     _configure_verified_douyin_transfer(
         monkeypatch,
         engine,
@@ -5023,6 +5977,7 @@ def test_douyin_verified_transfer_uses_probe_duration_when_item_omits_it(
     media_id = "7664225419386607205"
     payload = b"\x00\x00\x00\x18ftypisom" + b"wrong-duration-bytes"
     engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    _inject_fake_douyin_media_opener(monkeypatch, engine)
     _configure_verified_douyin_transfer(
         monkeypatch,
         engine,
@@ -5215,6 +6170,7 @@ def test_douyin_direct_transfer_does_not_follow_predictable_temp_symlink(
     media_id = "7664225419386607205"
     payload = b"\x00\x00\x00\x18ftypisom" + b"verified-original-bytes"
     engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    _inject_fake_douyin_media_opener(monkeypatch, engine)
     _configure_verified_douyin_transfer(
         monkeypatch,
         engine,
@@ -5654,6 +6610,7 @@ def test_iso_bmff_image_below_declared_resolution_fails_closed(tmp_path) -> None
             "note-id",
             "https://www.xiaohongshu.com/explore/note-id",
             media_type=MediaType.IMAGE,
+            platform=Platform.XIAOHONGSHU,
             callback=None,
             should_cancel=lambda: False,
             asset_index=1,
@@ -5720,6 +6677,7 @@ def test_xhs_asset_download_replaces_existing_file_with_current_candidate(
         "note-id",
         "https://www.xiaohongshu.com/explore/note-id",
         media_type=MediaType.IMAGE,
+        platform=Platform.XIAOHONGSHU,
         callback=None,
         should_cancel=lambda: False,
         asset_index=1,
@@ -5782,6 +6740,7 @@ def test_xhs_asset_request_blocks_external_host_and_redacts_referer(
             "6411cf99000000001300b6d9",
             source_url,
             media_type=MediaType.IMAGE,
+            platform=Platform.XIAOHONGSHU,
             callback=None,
             should_cancel=lambda: False,
             asset_index=1,
@@ -5803,6 +6762,7 @@ def test_xhs_asset_request_blocks_external_host_and_redacts_referer(
         "6411cf99000000001300b6d9",
         source_url,
         media_type=MediaType.IMAGE,
+        platform=Platform.XIAOHONGSHU,
         callback=None,
         should_cancel=lambda: False,
         asset_index=1,
@@ -5867,6 +6827,7 @@ def test_xhs_asset_request_blocks_untrusted_final_redirect_before_read(
             "6411cf99000000001300b6d9",
             "https://www.xiaohongshu.com/explore/6411cf99000000001300b6d9",
             media_type=MediaType.IMAGE,
+            platform=Platform.XIAOHONGSHU,
             callback=None,
             should_cancel=lambda: False,
             asset_index=1,
@@ -5878,6 +6839,7 @@ def test_xhs_asset_request_blocks_untrusted_final_redirect_before_read(
 
 
 def test_highest_asset_stream_preserves_bytes_and_reports_aggregate_progress(
+    monkeypatch,
     tmp_path,
 ) -> None:
     payload = (
@@ -5916,6 +6878,7 @@ def test_highest_asset_stream_preserves_bytes_and_reports_aggregate_progress(
             return Response()
 
     engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    _inject_fake_douyin_media_opener(monkeypatch, engine)
     events = []
     path, chosen = engine._download_first_available_asset(
         AssetYoutubeDL(),
@@ -5934,6 +6897,7 @@ def test_highest_asset_stream_preserves_bytes_and_reports_aggregate_progress(
         "1111111111111111111",
         "https://www.douyin.com/user/verified-profile",
         media_type=MediaType.IMAGE,
+        platform=Platform.DOUYIN,
         callback=events.append,
         should_cancel=lambda: False,
         asset_index=1,
@@ -5952,6 +6916,7 @@ def test_highest_asset_stream_preserves_bytes_and_reports_aggregate_progress(
 
 
 def test_highest_asset_stream_retries_candidate_below_declared_resolution(
+    monkeypatch,
     tmp_path,
 ) -> None:
     def png(width: int, height: int) -> bytes:
@@ -6001,6 +6966,7 @@ def test_highest_asset_stream_retries_candidate_below_declared_resolution(
 
     ydl = AssetYoutubeDL()
     engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    _inject_fake_douyin_media_opener(monkeypatch, engine)
     path, chosen = engine._download_first_available_asset(
         ydl,
         [
@@ -6020,6 +6986,7 @@ def test_highest_asset_stream_retries_candidate_below_declared_resolution(
         "1111111111111111111",
         "https://www.douyin.com/user/verified-profile",
         media_type=MediaType.IMAGE,
+        platform=Platform.DOUYIN,
         callback=None,
         should_cancel=lambda: False,
         asset_index=1,
@@ -6050,6 +7017,7 @@ def test_highest_asset_stream_closes_http_error_response(
             raise error
 
     engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    _inject_fake_douyin_media_opener(monkeypatch, engine)
     monkeypatch.setattr(
         engine,
         "_wait_for_douyin_probe_retry",
@@ -6073,6 +7041,7 @@ def test_highest_asset_stream_closes_http_error_response(
             "1111111111111111111",
             "https://www.douyin.com/user/verified-profile",
             media_type=MediaType.VIDEO,
+            platform=Platform.DOUYIN,
             callback=None,
             should_cancel=lambda: False,
             asset_index=1,
@@ -6122,6 +7091,7 @@ def test_douyin_transfer_retries_transport_error_then_succeeds(
             return SuccessfulResponse()
 
     engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    _inject_fake_douyin_media_opener(monkeypatch, engine)
     delays = []
     monkeypatch.setattr(
         engine,
@@ -6144,6 +7114,7 @@ def test_douyin_transfer_retries_transport_error_then_succeeds(
         "1111111111111111111",
         "https://www.douyin.com/video/1111111111111111111",
         media_type=MediaType.VIDEO,
+        platform=Platform.DOUYIN,
         callback=None,
         should_cancel=lambda: False,
     )
@@ -6193,6 +7164,7 @@ def test_douyin_transfer_read_interruption_pauses_after_finite_retries(
             return response
 
     engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    _inject_fake_douyin_media_opener(monkeypatch, engine)
     monkeypatch.setattr(
         engine,
         "_wait_for_douyin_probe_retry",
@@ -6217,6 +7189,7 @@ def test_douyin_transfer_read_interruption_pauses_after_finite_retries(
             "1111111111111111111",
             "https://www.douyin.com/video/1111111111111111111",
             media_type=MediaType.VIDEO,
+            platform=Platform.DOUYIN,
             callback=None,
             should_cancel=lambda: False,
         )
@@ -6277,6 +7250,7 @@ def test_live_photo_local_verification_retries_and_pauses_invalid_or_lower_media
             return response
 
     engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    _inject_fake_douyin_media_opener(monkeypatch, engine)
     monkeypatch.setattr(
         engine,
         "_wait_for_douyin_probe_retry",
@@ -6312,6 +7286,7 @@ def test_live_photo_local_verification_retries_and_pauses_invalid_or_lower_media
             "1111111111111111111",
             "https://www.douyin.com/user/verified-profile",
             media_type=MediaType.VIDEO,
+            platform=Platform.DOUYIN,
             callback=None,
             should_cancel=lambda: False,
             asset_index=1,

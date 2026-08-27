@@ -97,6 +97,7 @@ def test_index_injects_build_identity_and_disables_html_cache() -> None:
     try:
         response = client.get("/")
         static_response = client.get(f"/static/app.js?v={BUILD_ID}")
+        styles_response = client.get(f"/static/styles.css?v={BUILD_ID}")
     finally:
         client.close()
 
@@ -110,6 +111,8 @@ def test_index_injects_build_identity_and_disables_html_cache() -> None:
 
     assert static_response.status_code == 200
     assert static_response.headers["cache-control"] == "no-store, max-age=0"
+    assert styles_response.status_code == 200
+    assert styles_response.headers["cache-control"] == "no-store, max-age=0"
     for progress_marker in (
         "Checking Douyin Live Photo quality",
         "Checking Douyin direct quality",
@@ -131,7 +134,15 @@ def test_index_injects_build_identity_and_disables_html_cache() -> None:
         "这是旧版本留下的不完整抖音主页队列",
         "已保留的旧抖音文件",
         "FFprobe 未返回码率或完整媒体大小",
-        "抖音画质探测跳转到了当前版本尚未识别的 CDN 主机",
+        "invalid-host”不是实际域名",
+        "主机名可能包含敏感标识",
+        "媒体地址被降级为非 HTTPS",
+        "跳转目标是 IP 地址，不是可验证的官方 CDN 域名",
+        "跳转目标是本地、内网或保留用途域名",
+        "缺少把它绑定到该作品最高画质的完整校验指纹",
+        "CDN 域名族",
+        "校验指纹",
+        "不要发送带签名的完整媒体链接",
         "这是旧版本保存的抖音媒体跳转错误",
         "旧版没有记录实际 CDN 主机",
         "旧版抖音短链任务保存的跳转错误",
@@ -147,6 +158,14 @@ def test_index_injects_build_identity_and_disables_html_cache() -> None:
         in static_response.text
     )
     assert "抖音暂时无法创建经过验证的请求。请在 Chrome" not in static_response.text
+    item_error_rule = styles_response.text.rsplit(".item-error {", 1)[1].split("}", 1)[0]
+    for declaration in (
+        "overflow: visible;",
+        "overflow-wrap: anywhere;",
+        "text-overflow: clip;",
+        "white-space: normal;",
+    ):
+        assert declaration in item_error_rule
 
 
 def test_douyin_item_verification_always_opens_original_video(

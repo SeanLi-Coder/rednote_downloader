@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import ipaddress
 import json
 import math
 import mimetypes
@@ -17,12 +18,21 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
-from urllib.parse import parse_qs, unquote, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlsplit, urlunsplit
 
 from yt_dlp import YoutubeDL
+from yt_dlp.dependencies import requests, urllib3
 from yt_dlp.extractor.tiktok import DouyinIE
 from yt_dlp.networking import Request
-from yt_dlp.networking.exceptions import HTTPError, TransportError
+from yt_dlp.networking._requests import RequestsRH, RequestsResponseAdapter
+from yt_dlp.networking.exceptions import (
+    CertificateVerifyError,
+    HTTPError,
+    ProxyError,
+    RequestError,
+    SSLError,
+    TransportError,
+)
 from yt_dlp.postprocessor.common import PostProcessor
 from yt_dlp.utils import DownloadCancelled, DownloadError
 
@@ -62,6 +72,7 @@ DOUYIN_FFPROBE_FILE_TIMEOUT_SECONDS = 15.0
 DOUYIN_MAX_PROBE_FILE_BYTES = 8 * 1024 * 1024 * 1024
 DOUYIN_PROCESS_POLL_SECONDS = 0.1
 DOUYIN_MEDIA_PROBE_LOCK = threading.Lock()
+DOUYIN_MAX_MEDIA_REDIRECTS = 5
 DOUYIN_DIRECT_MEDIA_DOMAINS = (
     "douyin.com",
     "douyinvod.com",
@@ -179,6 +190,31 @@ _ERROR_BEARER_RE = re.compile(
     r"\bbearer\s+(?:\[redacted\]|[^\s,;'\"}\]]+)",
     re.IGNORECASE,
 )
+_ERROR_HTTP_REASON_RE = re.compile(
+    r"\b(HTTP Error\s+\d{3})(?::[^\r\n]*)",
+    re.IGNORECASE,
+)
+_ERROR_IPV4_RE = re.compile(
+    r"(?<![a-z0-9])(?:\d{1,3}\.){3}\d{1,3}(?![a-z0-9])",
+    re.IGNORECASE,
+)
+_ERROR_BRACKETED_IP_RE = re.compile(r"\[[0-9a-f:.%]+\]", re.IGNORECASE)
+_ERROR_HOST_FIELD_RE = re.compile(
+    r"(?<![\w-])host\s*=\s*(?:\[[^\]\r\n]*\]|'[^']*'|\"[^\"]*\"|[^,\s)\]}]+)",
+    re.IGNORECASE,
+)
+_DOUYIN_REDIRECT_ERROR_MARKERS = (
+    "media endpoint redirected to an unrecognized Douyin CDN host",
+    "Douyin media redirect could not be trusted",
+)
+_DOUYIN_REDIRECT_REASON_RE = re.compile(
+    r"(?:Redirect reason:\s*|reason:\s*)([a-z0-9-]+)",
+    re.IGNORECASE,
+)
+_DOUYIN_REDIRECT_HOST_PATTERNS = (
+    re.compile(r"(\(host:\s*)([^;)\r\n]+)", re.IGNORECASE),
+    re.compile(r"(Redirect host:\s*)([^;\r\n]+)", re.IGNORECASE),
+)
 _WINDOWS_RESERVED = {
     "CON",
     "PRN",
@@ -204,7 +240,18 @@ class _DouyinProbeRejected(RuntimeError):
 
 
 class _DouyinRedirectRejected(_DouyinProbeRejected):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        redirect_host: str | None = None,
+        redirect_host_fingerprint: str | None = None,
+        redirect_reason: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.redirect_host = redirect_host
+        self.redirect_host_fingerprint = redirect_host_fingerprint
+        self.redirect_reason = redirect_reason
 
 
 class _DouyinProbeIntegrityChanged(_DouyinProbeRejected):
@@ -226,9 +273,65 @@ def safe_component(
     return value
 
 
+def _safe_douyin_redirect_family(hostname: str) -> str | None:
+    normalized = hostname.strip().lower().rstrip(".")
+    if not normalized or len(normalized) > 253:
+        return None
+    labels = normalized.split(".")
+    if any(
+        not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+        for label in labels
+    ):
+        return None
+    return next(
+        (
+            domain
+            for domain in sorted(
+                DOUYIN_REGIONAL_MEDIA_DOMAINS,
+                key=len,
+                reverse=True,
+            )
+            if normalized == domain or normalized.endswith(f".{domain}")
+        ),
+        None,
+    )
+
+
+def _sanitize_douyin_redirect_diagnostic(message: str) -> str:
+    if not any(marker in message for marker in _DOUYIN_REDIRECT_ERROR_MARKERS):
+        return message
+    reason_match = _DOUYIN_REDIRECT_REASON_RE.search(message)
+    reason = reason_match.group(1).lower() if reason_match else ""
+
+    def safe_host(match: re.Match[str]) -> str:
+        family = (
+            _safe_douyin_redirect_family(match.group(2))
+            if reason == "unverified-source-binding"
+            else None
+        )
+        return f"{match.group(1)}{family or 'unavailable'}"
+
+    for pattern in _DOUYIN_REDIRECT_HOST_PATTERNS:
+        message = pattern.sub(safe_host, message)
+    return message
+
+
 def safe_external_error_message(value: BaseException | str) -> str:
-    message = str(value)
+    message = _sanitize_douyin_redirect_diagnostic(str(value))
     message = _ERROR_URL_RE.sub("[redacted URL]", message)
+    message = _ERROR_HTTP_REASON_RE.sub(r"\1", message)
+    message = _ERROR_HOST_FIELD_RE.sub("host=[redacted]", message)
+
+    def redact_ip_literal(match: re.Match[str]) -> str:
+        candidate = match.group(0).strip("[]").split("%", 1)[0]
+        try:
+            ipaddress.ip_address(candidate)
+        except ValueError:
+            return match.group(0)
+        return "[redacted IP]"
+
+    message = _ERROR_IPV4_RE.sub(redact_ip_literal, message)
+    message = _ERROR_BRACKETED_IP_RE.sub(redact_ip_literal, message)
     message = _ERROR_SECRET_TUPLE_RE.sub(
         lambda match: (
             f"{match.group(1)}{match.group(2)}{match.group(1)}, "
@@ -1099,32 +1202,148 @@ class MediaDownloader:
         )
 
     @staticmethod
-    def _strict_https_hostname(value: str) -> str | None:
-        try:
-            parsed = urlsplit(value)
-            hostname = (parsed.hostname or "").lower().rstrip(".")
-            if (
-                parsed.scheme != "https"
-                or parsed.username is not None
-                or parsed.password is not None
-                or parsed.port not in {None, 443}
-                or not hostname
-                or len(hostname) > 253
-            ):
-                return None
-        except (TypeError, ValueError):
+    def _douyin_regional_media_family(hostname: str | None) -> str | None:
+        normalized = (hostname or "").lower().rstrip(".")
+        return next(
+            (
+                domain
+                for domain in sorted(
+                    DOUYIN_REGIONAL_MEDIA_DOMAINS,
+                    key=len,
+                    reverse=True,
+                )
+                if normalized == domain or normalized.endswith(f".{domain}")
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _parse_legacy_ipv4_part(value: str) -> int | None:
+        if not value:
             return None
+        try:
+            if value.lower().startswith("0x"):
+                return int(value[2:], 16)
+            if len(value) > 1 and value.startswith("0"):
+                return int(value[1:], 8)
+            return int(value, 10)
+        except ValueError:
+            return None
+
+    @classmethod
+    def _looks_like_ip_literal(cls, hostname: str) -> bool:
+        try:
+            ipaddress.ip_address(hostname)
+        except ValueError:
+            pass
+        else:
+            return True
+        parts = hostname.split(".")
+        if not 1 <= len(parts) <= 4:
+            return False
+        numbers = [cls._parse_legacy_ipv4_part(part) for part in parts]
+        if any(number is None or number < 0 for number in numbers):
+            return False
+        limits = {
+            1: (0xFFFFFFFF,),
+            2: (0xFF, 0xFFFFFF),
+            3: (0xFF, 0xFF, 0xFFFF),
+            4: (0xFF, 0xFF, 0xFF, 0xFF),
+        }[len(numbers)]
+        return all(number <= limit for number, limit in zip(numbers, limits))
+
+    @staticmethod
+    def _is_special_use_hostname(hostname: str) -> bool:
+        special_names = {
+            "example.com",
+            "example.net",
+            "example.org",
+            "home.arpa",
+            "localhost",
+        }
+        special_suffixes = (
+            ".home",
+            ".home.arpa",
+            ".internal",
+            ".invalid",
+            ".lan",
+            ".local",
+            ".localhost",
+            ".alt",
+            ".example",
+            ".onion",
+            ".test",
+            ".example.com",
+            ".example.net",
+            ".example.org",
+        )
+        return hostname in special_names or hostname.endswith(special_suffixes)
+
+    @classmethod
+    def _parse_strict_https_url(
+        cls,
+        value: str,
+    ) -> tuple[str | None, str | None]:
+        raw_value = str(value or "")
+        if (
+            not raw_value
+            or len(raw_value) > 8_192
+            or "\\" in raw_value
+            or any(character.isspace() for character in raw_value)
+            or any(
+                ord(character) < 32 or ord(character) == 127
+                for character in raw_value
+            )
+        ):
+            return None, "malformed-url"
+        try:
+            parsed = urlsplit(raw_value)
+            hostname = (parsed.hostname or "").lower().rstrip(".")
+            username = parsed.username
+            password = parsed.password
+            port = parsed.port
+        except (TypeError, ValueError):
+            return None, "malformed-url"
+        if "[" in parsed.netloc or "]" in parsed.netloc:
+            return None, (
+                "ip-literal"
+                if cls._looks_like_ip_literal(hostname)
+                else "malformed-url"
+            )
+        if username is not None or password is not None:
+            return None, "embedded-credentials"
+        if not hostname:
+            return None, "missing-host"
+        if len(hostname) > 253:
+            return None, "hostname-too-long"
         try:
             hostname.encode("ascii")
         except UnicodeEncodeError:
-            return None
+            return None, "non-ascii-host"
         labels = hostname.split(".")
-        if len(labels) < 2 or any(
+        is_ip_literal = cls._looks_like_ip_literal(hostname)
+        is_dns_hostname = not is_ip_literal and len(labels) >= 2 and not any(
             not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
             for label in labels
-        ):
-            return None
-        return hostname
+        )
+        if parsed.scheme.lower() != "https":
+            return None, "non-https-scheme"
+        if is_ip_literal:
+            return None, "ip-literal"
+        if len(labels) < 2:
+            return None, "single-label-host"
+        if not is_dns_hostname:
+            return None, "invalid-hostname"
+        if cls._is_special_use_hostname(hostname):
+            return None, "local-or-special-use-host"
+        if port not in {None, 443}:
+            return None, "nonstandard-port"
+        return hostname, None
+
+    @classmethod
+    def _strict_https_hostname(cls, value: str) -> str | None:
+        hostname, reason = cls._parse_strict_https_url(value)
+        return hostname if reason is None else None
 
     @classmethod
     def _is_verified_douyin_media_redirect(
@@ -1138,8 +1357,208 @@ class MediaDownloader:
         return cls._is_douyin_regional_media_host(hostname)
 
     @classmethod
-    def _douyin_redirect_host_label(cls, value: str) -> str:
-        return cls._strict_https_hostname(value) or "invalid-host"
+    def _douyin_redirect_diagnostic(
+        cls,
+        value: str,
+    ) -> tuple[str | None, str]:
+        hostname, reason = cls._parse_strict_https_url(value)
+        return hostname, reason or "unrecognized-host"
+
+    @classmethod
+    def _douyin_media_redirect_rejection_reason(
+        cls,
+        value: str,
+        media_type: MediaType,
+        *,
+        allow_verified_regional: bool,
+    ) -> str | None:
+        hostname, validation_reason = cls._parse_strict_https_url(value)
+        if validation_reason is not None:
+            return validation_reason
+        if cls._is_trusted_douyin_asset_url(value, media_type):
+            return None
+        if (
+            media_type == MediaType.VIDEO
+            and cls._is_douyin_regional_media_host(hostname)
+        ):
+            return None if allow_verified_regional else "unverified-source-binding"
+        return "unrecognized-host"
+
+    @classmethod
+    def _douyin_redirect_rejection(
+        cls,
+        value: str,
+        reason: str,
+    ) -> _DouyinRedirectRejected:
+        hostname, _ = cls._douyin_redirect_diagnostic(value)
+        visible_hostname = (
+            cls._douyin_regional_media_family(hostname)
+            if reason == "unverified-source-binding"
+            else None
+        )
+        host_fingerprint = None
+        if hostname and reason == "unrecognized-host":
+            host_fingerprint = hashlib.sha256(
+                hostname.encode("ascii")
+            ).hexdigest()[:12]
+        return _DouyinRedirectRejected(
+            "media endpoint redirected to an unrecognized Douyin CDN host "
+            f"(host: {visible_hostname or 'unavailable'}; "
+            f"host-fingerprint: {host_fingerprint or 'unavailable'}; "
+            f"reason: {reason})",
+            redirect_host=visible_hostname,
+            redirect_host_fingerprint=host_fingerprint,
+            redirect_reason=reason,
+        )
+
+    @classmethod
+    def _open_douyin_media_response(
+        cls,
+        ydl: YoutubeDL,
+        request: Request,
+        *,
+        redirect_rejection_reason: Callable[[str], str | None],
+        should_cancel: CancelCallback | None = None,
+    ):
+        should_cancel = should_cancel or (lambda: False)
+        if should_cancel():
+            raise DownloadCancelled("Task cancelled")
+        initial_reason = redirect_rejection_reason(request.url)
+        if initial_reason is not None:
+            raise cls._douyin_redirect_rejection(request.url, initial_reason)
+        director = getattr(ydl, "_request_director", None)
+        if director is None:
+            raise _DouyinProbeRejected(
+                "secure Douyin redirect validation requires a yt-dlp request director"
+            )
+        handler = getattr(director, "handlers", {}).get("Requests")
+        if not isinstance(handler, RequestsRH) or requests is None:
+            raise _DouyinProbeRejected(
+                "secure Douyin redirect validation requires the yt-dlp requests handler"
+            )
+        headers = handler._get_headers(request)
+        session = handler._get_instance(
+            cookiejar=handler._get_cookiejar(request),
+            legacy_ssl_support=request.extensions.get("legacy_ssl"),
+        )
+        current_url = request.url
+        current_headers = dict(headers)
+        request_timeout = handler._calculate_timeout(request)
+        redirect_deadline = time.monotonic() + request_timeout
+        for redirect_count in range(DOUYIN_MAX_MEDIA_REDIRECTS + 1):
+            if should_cancel():
+                raise DownloadCancelled("Task cancelled")
+            remaining_timeout = redirect_deadline - time.monotonic()
+            if remaining_timeout <= 0:
+                raise TransportError(
+                    cause=TimeoutError("Douyin redirect chain timed out")
+                )
+            redirect_location_present = False
+            redirect_location: str | None = None
+
+            def suppress_requests_redirect_preparation(response, *args, **kwargs):
+                nonlocal redirect_location_present, redirect_location
+                redirect_location_present = "Location" in response.headers
+                redirect_location = response.headers.pop("Location", None)
+                return response
+
+            try:
+                raw_response = session.request(
+                    method=request.method,
+                    url=current_url,
+                    data=request.data,
+                    headers=current_headers,
+                    timeout=max(0.1, min(request_timeout, remaining_timeout)),
+                    proxies=handler._get_proxies(request),
+                    allow_redirects=False,
+                    stream=True,
+                    hooks={"response": suppress_requests_redirect_preparation},
+                )
+            except requests.exceptions.SSLError as exc:
+                if "CERTIFICATE_VERIFY_FAILED" in str(exc):
+                    raise CertificateVerifyError(cause=exc) from exc
+                raise SSLError(cause=exc) from exc
+            except requests.exceptions.ProxyError as exc:
+                raise ProxyError(cause=exc) from exc
+            except (
+                requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+            ) as exc:
+                raise TransportError(cause=exc) from exc
+            except urllib3.exceptions.HTTPError as exc:
+                raise TransportError(cause=exc) from exc
+            except requests.exceptions.RequestException as exc:
+                raise RequestError(cause=exc) from exc
+
+            if redirect_location_present:
+                raw_response.headers["Location"] = redirect_location or ""
+
+            if should_cancel():
+                raw_response.close()
+                raise DownloadCancelled("Task cancelled")
+
+            is_redirect_response = bool(raw_response.is_redirect) or getattr(
+                raw_response,
+                "status_code",
+                None,
+            ) in {301, 302, 303, 307, 308}
+            if is_redirect_response:
+                location = str(raw_response.headers.get("Location") or "")
+                if (
+                    not location
+                    or len(location) > 8_192
+                    or "\\" in location
+                    or any(character.isspace() for character in location)
+                    or any(
+                        ord(character) < 32 or ord(character) == 127
+                        for character in location
+                    )
+                ):
+                    raw_response.close()
+                    raise cls._douyin_redirect_rejection(
+                        "",
+                        "malformed-url",
+                    )
+                try:
+                    target_url = urljoin(str(raw_response.url), location)
+                except (TypeError, ValueError):
+                    raw_response.close()
+                    raise cls._douyin_redirect_rejection(
+                        "",
+                        "malformed-url",
+                    )
+                try:
+                    reason = redirect_rejection_reason(target_url)
+                except BaseException:
+                    raw_response.close()
+                    raise
+                if reason is not None:
+                    raw_response.close()
+                    raise cls._douyin_redirect_rejection(target_url, reason)
+                if redirect_count >= DOUYIN_MAX_MEDIA_REDIRECTS:
+                    raw_response.close()
+                    raise cls._douyin_redirect_rejection(
+                        target_url,
+                        "too-many-redirects",
+                    )
+                raw_response.close()
+                if urlsplit(current_url).netloc.lower() != (
+                    urlsplit(target_url).netloc.lower()
+                ):
+                    current_headers = {
+                        key: value
+                        for key, value in current_headers.items()
+                        if key.lower()
+                        not in {"authorization", "cookie", "proxy-authorization"}
+                    }
+                current_url = target_url
+                continue
+
+            response = RequestsResponseAdapter(raw_response)
+            if not 200 <= response.status < 300:
+                raise HTTPError(response)
+            return response
+        raise AssertionError("unreachable Douyin redirect loop state")
 
     @classmethod
     def _is_trusted_douyin_asset_url(
@@ -2040,22 +2459,33 @@ class MediaDownloader:
             **DOUYIN_MEDIA_HEADERS,
             "Range": f"bytes=0-{DOUYIN_PROBE_BYTES - 1}",
         }
-        response = ydl.urlopen(
+        response = self._open_douyin_media_response(
+            ydl,
             Request(
                 candidate_url,
                 headers=headers,
                 extensions={"timeout": DOUYIN_PROBE_HTTP_TIMEOUT_SECONDS},
-            )
+            ),
+            redirect_rejection_reason=lambda value: (
+                self._douyin_media_redirect_rejection_reason(
+                    value,
+                    MediaType.VIDEO,
+                    allow_verified_regional=True,
+                )
+            ),
+            should_cancel=should_cancel,
         )
         try:
             final_url = str(response.url)
-            if not self._is_verified_douyin_media_redirect(
-                candidate_url,
+            redirect_reason = self._douyin_media_redirect_rejection_reason(
                 final_url,
-            ):
-                raise _DouyinRedirectRejected(
-                    "media endpoint redirected to an unrecognized Douyin CDN host "
-                    f"(host: {self._douyin_redirect_host_label(final_url)})"
+                MediaType.VIDEO,
+                allow_verified_regional=True,
+            )
+            if redirect_reason is not None:
+                raise self._douyin_redirect_rejection(
+                    final_url,
+                    redirect_reason,
                 )
             content_type = (
                 str(response.headers.get("Content-Type") or "").split(";", 1)[0].lower()
@@ -2185,24 +2615,35 @@ class MediaDownloader:
             raise _DouyinProbeRejected(
                 "media file exceeded the safe probe size limit"
             )
-        response = ydl.urlopen(
+        response = self._open_douyin_media_response(
+            ydl,
             Request(
                 candidate_url,
                 headers=dict(DOUYIN_MEDIA_HEADERS),
                 extensions={"timeout": DOUYIN_PROBE_HTTP_TIMEOUT_SECONDS},
-            )
+            ),
+            redirect_rejection_reason=lambda value: (
+                self._douyin_media_redirect_rejection_reason(
+                    value,
+                    MediaType.VIDEO,
+                    allow_verified_regional=True,
+                )
+            ),
+            should_cancel=should_cancel,
         )
         downloaded = 0
         prefix = bytearray()
         try:
             final_url = str(response.url)
-            if not self._is_verified_douyin_media_redirect(
-                candidate_url,
+            redirect_reason = self._douyin_media_redirect_rejection_reason(
                 final_url,
-            ):
-                raise _DouyinRedirectRejected(
-                    "media endpoint redirected to an unrecognized Douyin CDN host "
-                    f"(host: {self._douyin_redirect_host_label(final_url)})"
+                MediaType.VIDEO,
+                allow_verified_regional=True,
+            )
+            if redirect_reason is not None:
+                raise self._douyin_redirect_rejection(
+                    final_url,
+                    redirect_reason,
                 )
             content_type = (
                 str(response.headers.get("Content-Type") or "")
@@ -2775,6 +3216,7 @@ class MediaDownloader:
                         title,
                         expected_douyin_id,
                         item.source_url,
+                        platform=Platform.DOUYIN,
                         media_type=MediaType.VIDEO,
                         callback=callback,
                         should_cancel=should_cancel,
@@ -3002,6 +3444,7 @@ class MediaDownloader:
                             title,
                             media_id,
                             profile_url,
+                            platform=Platform.DOUYIN,
                             media_type=MediaType.IMAGE,
                             callback=callback,
                             should_cancel=should_cancel,
@@ -3048,6 +3491,7 @@ class MediaDownloader:
                         title,
                         media_id,
                         profile_url,
+                        platform=Platform.DOUYIN,
                         media_type=MediaType.VIDEO,
                         callback=callback,
                         should_cancel=should_cancel,
@@ -3661,6 +4105,7 @@ class MediaDownloader:
                             note.title,
                             note.note_id,
                             item.source_url,
+                            platform=Platform.XIAOHONGSHU,
                             media_type=MediaType.VIDEO,
                             callback=callback,
                             should_cancel=should_cancel,
@@ -3694,6 +4139,7 @@ class MediaDownloader:
                                 note.title,
                                 note.note_id,
                                 item.source_url,
+                                platform=Platform.XIAOHONGSHU,
                                 media_type=MediaType.IMAGE,
                                 callback=callback,
                                 should_cancel=should_cancel,
@@ -3727,6 +4173,7 @@ class MediaDownloader:
                                 note.title,
                                 note.note_id,
                                 item.source_url,
+                                platform=Platform.XIAOHONGSHU,
                                 media_type=MediaType.VIDEO,
                                 callback=callback,
                                 should_cancel=should_cancel,
@@ -3802,6 +4249,7 @@ class MediaDownloader:
         media_id: str,
         source_url: str,
         *,
+        platform: Platform,
         media_type: MediaType,
         callback: EventCallback | None,
         should_cancel: CancelCallback,
@@ -3814,13 +4262,8 @@ class MediaDownloader:
     ) -> tuple[Path, RemoteAsset]:
         errors: list[str] = []
         douyin_transient_errors: list[str] = []
-        source_host = (urlsplit(source_url).hostname or "").lower()
-        is_xiaohongshu_source = source_host == "xiaohongshu.com" or (
-            source_host.endswith(".xiaohongshu.com")
-        )
-        is_douyin_source = source_host == "douyin.com" or (
-            source_host.endswith(".douyin.com")
-        )
+        is_xiaohongshu_source = platform == Platform.XIAOHONGSHU
+        is_douyin_source = platform == Platform.DOUYIN
         for asset in assets:
             allow_verified_douyin_redirect = bool(
                 is_douyin_source
@@ -3868,26 +4311,49 @@ class MediaDownloader:
                     referer = source_url
                     if is_xiaohongshu_source:
                         referer = "https://www.xiaohongshu.com/"
-                    elif source_host == "douyin.com" or source_host.endswith(
-                        ".douyin.com"
-                    ):
+                    elif is_douyin_source:
                         referer = DOUYIN_MEDIA_HEADERS["Referer"]
                     request_headers = {
                         "Referer": referer,
                         "Accept": "*/*",
                     }
-                    if (urlsplit(source_url).hostname or "").lower().endswith(
-                        "douyin.com"
-                    ):
+                    if is_douyin_source:
                         request_headers["User-Agent"] = DOUYIN_MEDIA_HEADERS[
                             "User-Agent"
                         ]
-                    response = ydl.urlopen(
-                        Request(
-                            candidate,
-                            headers=request_headers,
-                        )
+                    media_request = Request(
+                        candidate,
+                        headers=request_headers,
                     )
+                    if is_douyin_source:
+                        try:
+                            response = self._open_douyin_media_response(
+                                ydl,
+                                media_request,
+                                redirect_rejection_reason=lambda value: (
+                                    self._douyin_media_redirect_rejection_reason(
+                                        value,
+                                        media_type,
+                                        allow_verified_regional=(
+                                            allow_verified_douyin_redirect
+                                        ),
+                                    )
+                                ),
+                                should_cancel=should_cancel,
+                            )
+                        except DownloadCancelled as exc:
+                            raise DownloadCancelledError("Task cancelled") from exc
+                        except _DouyinRedirectRejected as exc:
+                            raise TemporaryAccessError(
+                                "Douyin media redirect could not be trusted. The task "
+                                "was paused before downloading later items. Redirect "
+                                f"host: {exc.redirect_host or 'unavailable'}; Redirect "
+                                "host fingerprint: "
+                                f"{exc.redirect_host_fingerprint or 'unavailable'}; "
+                                f"reason: {exc.redirect_reason or 'unrecognized-host'}"
+                            ) from exc
+                    else:
+                        response = ydl.urlopen(media_request)
                     final_url = str(getattr(response, "url", None) or candidate)
                     if is_xiaohongshu_source and not (
                         is_trusted_xiaohongshu_asset_url(final_url)
@@ -3895,19 +4361,30 @@ class MediaDownloader:
                         raise MediaDownloadError(
                             "Xiaohongshu media request redirected to an untrusted URL"
                         )
-                    if is_douyin_source and not (
-                        self._is_trusted_douyin_asset_url(final_url, media_type)
-                        or (
-                            allow_verified_douyin_redirect
-                            and self._is_douyin_regional_media_host(
-                                self._strict_https_hostname(final_url)
-                            )
+                    redirect_reason = (
+                        self._douyin_media_redirect_rejection_reason(
+                            final_url,
+                            media_type,
+                            allow_verified_regional=(
+                                allow_verified_douyin_redirect
+                            ),
                         )
-                    ):
+                        if is_douyin_source
+                        else None
+                    )
+                    if is_douyin_source and redirect_reason is not None:
+                        redirect_error = self._douyin_redirect_rejection(
+                            final_url,
+                            redirect_reason,
+                        )
                         raise TemporaryAccessError(
                             "Douyin media redirect could not be trusted. The task was "
                             "paused before downloading later items. Redirect host: "
-                            f"{self._douyin_redirect_host_label(final_url)}"
+                            f"{redirect_error.redirect_host or 'unavailable'}; "
+                            "Redirect host fingerprint: "
+                            f"{redirect_error.redirect_host_fingerprint or 'unavailable'}; "
+                            "Redirect reason: "
+                            f"{redirect_error.redirect_reason}"
                         )
                     content_type = (
                         (response.headers.get("Content-Type") or "")
@@ -3919,7 +4396,8 @@ class MediaDownloader:
                         "application/problem+json",
                     }:
                         raise MediaDownloadError(
-                            f"Media server returned {content_type} instead of a media file"
+                            "Media server returned a text or metadata response "
+                            "instead of a media file"
                         )
                     first_chunk = response.read(1024 * 1024)
                     if not first_chunk:
@@ -4136,6 +4614,7 @@ class MediaDownloader:
                     title,
                     media_id,
                     source_url,
+                    platform=platform,
                     media_type=media_type,
                     callback=callback,
                     should_cancel=should_cancel,

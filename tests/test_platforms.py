@@ -88,6 +88,18 @@ def test_extract_url_accepts_share_text_and_removes_fragment() -> None:
     )
 
 
+def test_douyin_trailing_dot_hostname_is_normalized_before_platform_routing() -> None:
+    value = "https://www.douyin.com./video/7664225419386607205"
+
+    assert extract_url(value) == (
+        "https://www.douyin.com/video/7664225419386607205"
+    )
+    info = identify_url(value)
+    assert info.platform == Platform.DOUYIN
+    assert info.kind == SourceKind.ITEM
+    assert info.url == "https://www.douyin.com/video/7664225419386607205"
+
+
 def test_extract_url_accepts_markdown_link_without_joining_label_and_target() -> None:
     value = (
         "[https://www.douyin.com/video/7664225419386607205]"

@@ -114,6 +114,11 @@ LEGACY_DOUYIN_GENERIC_SIGNING_MESSAGE = (
 LEGACY_DOUYIN_MEDIA_REDIRECT_MARKER = (
     "Douyin media request redirected to an untrusted URL"
 )
+LEGACY_DOUYIN_MEDIA_REDIRECT_MARKERS = (
+    LEGACY_DOUYIN_MEDIA_REDIRECT_MARKER,
+    "media endpoint redirected to an unrecognized Douyin CDN host",
+    "Douyin media redirect could not be trusted",
+)
 LEGACY_DOUYIN_MEDIA_REDIRECT_MESSAGE = (
     "This task contains a Douyin media redirect failure recorded by an older "
     "version, which did not preserve the redirect hostname. Retry the original "
@@ -2075,8 +2080,20 @@ class DownloadManager:
 
     @staticmethod
     def _message_has_legacy_douyin_media_redirect(value: str | None) -> bool:
-        return bool(
-            value and LEGACY_DOUYIN_MEDIA_REDIRECT_MARKER in value
+        if not value:
+            return False
+        if LEGACY_DOUYIN_MEDIA_REDIRECT_MARKER in value:
+            return True
+        has_reason = bool(
+            re.search(
+                r"(?:Redirect reason:\s*|reason:\s*)[a-z0-9-]+",
+                value,
+                re.IGNORECASE,
+            )
+        )
+        return not has_reason and any(
+            marker in value
+            for marker in LEGACY_DOUYIN_MEDIA_REDIRECT_MARKERS[1:]
         )
 
     @classmethod

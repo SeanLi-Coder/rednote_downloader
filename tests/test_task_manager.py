@@ -5,7 +5,12 @@ from pathlib import Path
 
 import pytest
 
-from app.downloader import DiscoveryResult, DownloadOutcome, EngineEvent
+from app.downloader import (
+    DiscoveryResult,
+    DownloadOutcome,
+    EngineEvent,
+    safe_external_error_message,
+)
 from app.errors import (
     AuthenticationRequiredError,
     DiscoveryError,
@@ -2082,14 +2087,29 @@ def test_restore_migrates_legacy_douyin_profile_redirect_for_rediscovery(
         restarted_manager.shutdown()
 
 
+@pytest.mark.parametrize(
+    "legacy_message",
+    [
+        LEGACY_DOUYIN_MEDIA_REDIRECT_MARKER,
+        (
+            "media endpoint redirected to an unrecognized Douyin CDN host "
+            "(host: secret-token.edge.vendor-cdn.net)"
+        ),
+        (
+            "Douyin media redirect could not be trusted. The task was paused "
+            "before downloading later items. Redirect host: "
+            "secret-token.edge.vendor-cdn.net"
+        ),
+    ],
+)
 def test_restore_migrates_legacy_douyin_item_redirect_for_rediscovery(
+    legacy_message,
     tmp_path,
 ) -> None:
     state_dir = tmp_path / "state"
     output_root = tmp_path / "downloads"
     media_id = "7664225419386607205"
     source_url = f"https://www.douyin.com/video/{media_id}"
-    legacy_message = LEGACY_DOUYIN_MEDIA_REDIRECT_MARKER
     job = DownloadJob(
         id="legacy-item-media-redirect",
         source_url=source_url,
@@ -2151,6 +2171,15 @@ def test_restore_migrates_legacy_douyin_item_redirect_for_rediscovery(
         assert "item_identity_verified" not in restored.items[0].metadata
         assert DownloadManager._should_rediscover_on_retry(restored) is True
         assert LEGACY_DOUYIN_MEDIA_REDIRECT_MARKER not in restored.model_dump_json()
+        assert "secret-token" not in restored.model_dump_json()
+        assert (
+            "media endpoint redirected to an unrecognized Douyin CDN host"
+            not in restored.model_dump_json()
+        )
+        assert (
+            "Douyin media redirect could not be trusted"
+            not in restored.model_dump_json()
+        )
     finally:
         manager.shutdown()
 
@@ -4379,10 +4408,14 @@ def test_douyin_profile_redirect_interrupts_queue_and_rediscovery_resumes(
         "7677923079457231738",
         "7677554129950241521",
     ]
-    redirect_error = (
+    raw_redirect_error = (
         "Douyin media redirect could not be trusted. The task was paused before "
-        "downloading later items. Redirect host: new-region-cdn.example"
+        "downloading later items. Redirect host: secret-token.vendor-cdn.net; "
+        "Redirect host "
+        "fingerprint: 0123456789ab; "
+        "Redirect reason: unrecognized-host"
     )
+    redirect_error = safe_external_error_message(raw_redirect_error)
 
     class RedirectOnceEngine:
         def __init__(self) -> None:
@@ -4424,7 +4457,7 @@ def test_douyin_profile_redirect_interrupts_queue_and_rediscovery_resumes(
             self.download_calls.append(item.media_id)
             if item.media_id == media_ids[1] and self.fail_first:
                 self.fail_first = False
-                raise TemporaryAccessError(redirect_error)
+                raise TemporaryAccessError(raw_redirect_error)
             output_path = Path(output_dir) / f"{item.media_id}.mp4"
             output_path.write_bytes(item.media_id.encode())
             return DownloadOutcome(
@@ -4469,6 +4502,17 @@ def test_douyin_profile_redirect_interrupts_queue_and_rediscovery_resumes(
         assert persisted.error == redirect_error
         assert persisted.items[0].status == ItemStatus.COMPLETED
         assert persisted.items[2].status == ItemStatus.QUEUED
+        persisted_json = persisted.model_dump_json()
+        assert "Redirect reason: unrecognized-host" in persisted_json
+        for secret in (
+            "must-not-persist",
+            "private.mp4",
+            "127.0.0.1",
+            "token=",
+            "secret-token",
+            "user:",
+        ):
+            assert secret not in persisted_json
 
         manager.retry_failed(created.id)
         completed = wait_for_job(manager, created.id)

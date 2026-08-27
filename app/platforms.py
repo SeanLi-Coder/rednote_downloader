@@ -39,7 +39,7 @@ def extract_url(value: str) -> str:
         raise UnsupportedUrlError("URLs containing credentials are not accepted")
     normalized = parsed._replace(
         scheme=parsed.scheme.lower(),
-        netloc=(parsed.hostname or "").lower()
+        netloc=(parsed.hostname or "").lower().rstrip(".")
         + (f":{parsed.port}" if parsed.port else ""),
         fragment="",
     )

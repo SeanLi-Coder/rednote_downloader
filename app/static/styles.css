@@ -967,7 +967,13 @@ svg {
 }
 
 .item-error {
+  overflow: visible;
   color: #e88796;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  text-overflow: clip;
+  white-space: normal;
+  word-break: break-word;
 }
 
 .item-error:empty {
