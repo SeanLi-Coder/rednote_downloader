@@ -87,6 +87,7 @@ def test_douyin_redirect_messages_execute_with_safe_legacy_and_reason_parsing() 
         [node],
         input=harness + source + trailer,
         text=True,
+        encoding="utf-8",
         capture_output=True,
         check=False,
         timeout=10,
