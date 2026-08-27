@@ -131,8 +131,14 @@ def test_index_injects_build_identity_and_disables_html_cache() -> None:
         "这是旧版本留下的不完整抖音主页队列",
         "已保留的旧抖音文件",
         "FFprobe 未返回码率或完整媒体大小",
+        "抖音画质探测跳转到了当前版本尚未识别的 CDN 主机",
     ):
         assert classification_marker in static_response.text
+    assert static_response.text.index(
+        'text.includes("media endpoint redirected to an unrecognized Douyin CDN host")'
+    ) < static_response.text.index(
+        'text.includes("Douyin Live Photo authoritative quality source was temporarily unavailable")'
+    )
     assert (
         "discoveryFailureMessage || localizeRuntimeMessage(job?.warning, job)"
         in static_response.text

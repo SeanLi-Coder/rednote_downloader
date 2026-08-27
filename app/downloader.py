@@ -58,9 +58,22 @@ DOUYIN_PROBE_ATTEMPTS = 3
 DOUYIN_PROBE_RETRY_BASE_SECONDS = 1.0
 DOUYIN_TRANSFER_ATTEMPTS = 3
 DOUYIN_FFPROBE_PIPE_TIMEOUT_SECONDS = 3.0
-DOUYIN_FFPROBE_REMOTE_TIMEOUT_SECONDS = 15.0
+DOUYIN_FFPROBE_FILE_TIMEOUT_SECONDS = 15.0
+DOUYIN_MAX_PROBE_FILE_BYTES = 8 * 1024 * 1024 * 1024
 DOUYIN_PROCESS_POLL_SECONDS = 0.1
 DOUYIN_MEDIA_PROBE_LOCK = threading.Lock()
+DOUYIN_DIRECT_MEDIA_DOMAINS = (
+    "douyin.com",
+    "douyinvod.com",
+    "amemv.com",
+    "zjcdn.com",
+)
+DOUYIN_REGIONAL_MEDIA_DOMAINS = (
+    *DOUYIN_DIRECT_MEDIA_DOMAINS,
+    "douyincdn.com",
+    "idouyinvod.com",
+    "pstatp.com",
+)
 FFPROBE_FALLBACK_PATHS = (
     "/opt/homebrew/bin/ffprobe",
     "/usr/local/bin/ffprobe",
@@ -187,6 +200,14 @@ FFPROBE_START_MESSAGE = (
 
 
 class _DouyinProbeRejected(RuntimeError):
+    pass
+
+
+class _DouyinRedirectRejected(_DouyinProbeRejected):
+    pass
+
+
+class _DouyinProbeIntegrityChanged(_DouyinProbeRejected):
     pass
 
 
@@ -1066,20 +1087,19 @@ class MediaDownloader:
         normalized = (hostname or "").lower().rstrip(".")
         return any(
             normalized == domain or normalized.endswith(f".{domain}")
-            for domain in (
-                "douyin.com",
-                "douyinvod.com",
-                "amemv.com",
-                "zjcdn.com",
-            )
+            for domain in DOUYIN_DIRECT_MEDIA_DOMAINS
         )
 
-    @classmethod
-    def _is_trusted_douyin_asset_url(
-        cls,
-        value: str,
-        media_type: MediaType,
-    ) -> bool:
+    @staticmethod
+    def _is_douyin_regional_media_host(hostname: str | None) -> bool:
+        normalized = (hostname or "").lower().rstrip(".")
+        return any(
+            normalized == domain or normalized.endswith(f".{domain}")
+            for domain in DOUYIN_REGIONAL_MEDIA_DOMAINS
+        )
+
+    @staticmethod
+    def _strict_https_hostname(value: str) -> str | None:
         try:
             parsed = urlsplit(value)
             hostname = (parsed.hostname or "").lower().rstrip(".")
@@ -1088,9 +1108,47 @@ class MediaDownloader:
                 or parsed.username is not None
                 or parsed.password is not None
                 or parsed.port not in {None, 443}
+                or not hostname
+                or len(hostname) > 253
             ):
-                return False
+                return None
         except (TypeError, ValueError):
+            return None
+        try:
+            hostname.encode("ascii")
+        except UnicodeEncodeError:
+            return None
+        labels = hostname.split(".")
+        if len(labels) < 2 or any(
+            not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+            for label in labels
+        ):
+            return None
+        return hostname
+
+    @classmethod
+    def _is_verified_douyin_media_redirect(
+        cls,
+        source_url: str,
+        final_url: str,
+    ) -> bool:
+        if not cls._is_trusted_douyin_asset_url(source_url, MediaType.VIDEO):
+            return False
+        hostname = cls._strict_https_hostname(final_url)
+        return cls._is_douyin_regional_media_host(hostname)
+
+    @classmethod
+    def _douyin_redirect_host_label(cls, value: str) -> str:
+        return cls._strict_https_hostname(value) or "invalid-host"
+
+    @classmethod
+    def _is_trusted_douyin_asset_url(
+        cls,
+        value: str,
+        media_type: MediaType,
+    ) -> bool:
+        hostname = cls._strict_https_hostname(value)
+        if not hostname:
             return False
         if media_type == MediaType.IMAGE:
             return hostname == "douyinpic.com" or hostname.endswith(
@@ -1601,7 +1659,7 @@ class MediaDownloader:
                     errors.append(
                         (
                             self._safe_douyin_probe_failure(exc),
-                            self._is_retryable_douyin_probe_error(exc),
+                            self._should_pause_douyin_probe_error(exc),
                         )
                     )
                     continue
@@ -1665,7 +1723,7 @@ class MediaDownloader:
             raise
         except Exception as exc:
             reason = self._safe_douyin_probe_failure(exc)
-            if self._is_retryable_douyin_probe_error(exc):
+            if self._should_pause_douyin_probe_error(exc):
                 raise TemporaryAccessError(
                     "Douyin authoritative default quality source was temporarily "
                     "unavailable after automatic retries. The task was paused before "
@@ -1804,6 +1862,7 @@ class MediaDownloader:
                     "_douyin_probe_prefix_sha256": probe.get(
                         "probe_prefix_sha256"
                     ),
+                    "_douyin_probe_source_url": probe.get("source_url"),
                     "preference": -1,
                     "http_headers": dict(DOUYIN_MEDIA_HEADERS),
                 }
@@ -1893,6 +1952,15 @@ class MediaDownloader:
             return True
         return False
 
+    @classmethod
+    def _should_pause_douyin_probe_error(cls, exc: Exception) -> bool:
+        return isinstance(
+            exc,
+            (_DouyinRedirectRejected, _DouyinProbeIntegrityChanged),
+        ) or (
+            cls._is_retryable_douyin_probe_error(exc)
+        )
+
     @staticmethod
     def _close_douyin_probe_error(exc: Exception) -> None:
         if isinstance(exc, HTTPError):
@@ -1961,6 +2029,13 @@ class MediaDownloader:
     ) -> dict[str, Any] | None:
         if should_cancel():
             raise DownloadCancelled("Task cancelled")
+        if not self._is_trusted_douyin_asset_url(
+            candidate_url,
+            MediaType.VIDEO,
+        ):
+            raise _DouyinProbeRejected(
+                "untrusted initial Douyin media endpoint was blocked"
+            )
         headers = {
             **DOUYIN_MEDIA_HEADERS,
             "Range": f"bytes=0-{DOUYIN_PROBE_BYTES - 1}",
@@ -1974,12 +2049,13 @@ class MediaDownloader:
         )
         try:
             final_url = str(response.url)
-            if not self._is_trusted_douyin_asset_url(
+            if not self._is_verified_douyin_media_redirect(
+                candidate_url,
                 final_url,
-                MediaType.VIDEO,
             ):
-                raise _DouyinProbeRejected(
-                    "media endpoint redirected outside trusted Douyin media hosts"
+                raise _DouyinRedirectRejected(
+                    "media endpoint redirected to an unrecognized Douyin CDN host "
+                    f"(host: {self._douyin_redirect_host_label(final_url)})"
                 )
             content_type = (
                 str(response.headers.get("Content-Type") or "").split(";", 1)[0].lower()
@@ -2027,9 +2103,26 @@ class MediaDownloader:
             raise DownloadCancelled("Task cancelled")
         media = self._ffprobe_douyin_media(
             bytes(payload),
-            final_url,
             should_cancel=should_cancel,
         )
+        if not self._douyin_probe_metadata_complete(media, filesize=filesize):
+            with tempfile.TemporaryDirectory(
+                prefix="original-media-douyin-probe-"
+            ) as temporary_directory:
+                local_path = Path(temporary_directory) / "candidate.mp4"
+                self._download_douyin_probe_file(
+                    ydl,
+                    candidate_url,
+                    local_path,
+                    expected_prefix=bytes(payload),
+                    expected_filesize=filesize,
+                    should_cancel=should_cancel,
+                )
+                media = self._ffprobe_douyin_media(
+                    bytes(payload),
+                    local_path=local_path,
+                    should_cancel=should_cancel,
+                )
         if not media:
             raise _DouyinProbeRejected("FFprobe could not parse the media stream")
         width = int(media.get("width") or 0)
@@ -2059,17 +2152,127 @@ class MediaDownloader:
             "bit_rate": bit_rate,
             "probe_prefix_size": len(payload),
             "probe_prefix_sha256": hashlib.sha256(payload).hexdigest(),
+            "source_url": candidate_url,
         }
 
     @staticmethod
     def _douyin_duration_tolerance(duration: float) -> float:
         return max(0.5, min(2.0, duration * 0.01))
 
+    def _download_douyin_probe_file(
+        self,
+        ydl: YoutubeDL,
+        candidate_url: str,
+        path: Path,
+        *,
+        expected_prefix: bytes,
+        expected_filesize: int | None,
+        should_cancel: CancelCallback,
+    ) -> None:
+        if should_cancel():
+            raise DownloadCancelled("Task cancelled")
+        if not self._is_trusted_douyin_asset_url(
+            candidate_url,
+            MediaType.VIDEO,
+        ):
+            raise _DouyinProbeRejected(
+                "untrusted initial Douyin media endpoint was blocked"
+            )
+        if (
+            expected_filesize is not None
+            and expected_filesize > DOUYIN_MAX_PROBE_FILE_BYTES
+        ):
+            raise _DouyinProbeRejected(
+                "media file exceeded the safe probe size limit"
+            )
+        response = ydl.urlopen(
+            Request(
+                candidate_url,
+                headers=dict(DOUYIN_MEDIA_HEADERS),
+                extensions={"timeout": DOUYIN_PROBE_HTTP_TIMEOUT_SECONDS},
+            )
+        )
+        downloaded = 0
+        prefix = bytearray()
+        try:
+            final_url = str(response.url)
+            if not self._is_verified_douyin_media_redirect(
+                candidate_url,
+                final_url,
+            ):
+                raise _DouyinRedirectRejected(
+                    "media endpoint redirected to an unrecognized Douyin CDN host "
+                    f"(host: {self._douyin_redirect_host_label(final_url)})"
+                )
+            content_type = (
+                str(response.headers.get("Content-Type") or "")
+                .split(";", 1)[0]
+                .lower()
+            )
+            if content_type and not (
+                content_type.startswith("video/")
+                or content_type
+                in {
+                    "application/mp4",
+                    "application/octet-stream",
+                    "binary/octet-stream",
+                }
+            ):
+                raise _DouyinProbeRejected(
+                    "media endpoint did not return video data"
+                )
+            declared_length = str(
+                response.headers.get("Content-Length") or ""
+            )
+            if declared_length.isdigit():
+                declared_size = int(declared_length)
+                if declared_size > DOUYIN_MAX_PROBE_FILE_BYTES:
+                    raise _DouyinProbeRejected(
+                        "media file exceeded the safe probe size limit"
+                    )
+                if expected_filesize is not None and declared_size != expected_filesize:
+                    raise _DouyinProbeIntegrityChanged(
+                        "media size changed between the range probe and local probe"
+                    )
+            with path.open("wb") as output:
+                while True:
+                    if should_cancel():
+                        raise DownloadCancelled("Task cancelled")
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    downloaded += len(chunk)
+                    if downloaded > DOUYIN_MAX_PROBE_FILE_BYTES:
+                        raise _DouyinProbeRejected(
+                            "media file exceeded the safe probe size limit"
+                        )
+                    if expected_filesize is not None and downloaded > expected_filesize:
+                        raise _DouyinProbeIntegrityChanged(
+                            "media size changed between the range probe and local probe"
+                        )
+                    if len(prefix) < len(expected_prefix):
+                        remaining = len(expected_prefix) - len(prefix)
+                        prefix.extend(chunk[:remaining])
+                    output.write(chunk)
+        finally:
+            with contextlib.suppress(Exception):
+                response.close()
+        if downloaded <= 0:
+            raise _DouyinProbeRejected("media endpoint returned an empty file")
+        if expected_filesize is not None and downloaded != expected_filesize:
+            raise _DouyinProbeIntegrityChanged(
+                "media size changed between the range probe and local probe"
+            )
+        if bytes(prefix) != expected_prefix:
+            raise _DouyinProbeIntegrityChanged(
+                "media content changed between the range probe and local probe"
+            )
+
     def _ffprobe_douyin_media(
         self,
         initial_bytes: bytes,
-        candidate_url: str,
         *,
+        local_path: Path | None = None,
         should_cancel: CancelCallback,
     ) -> dict[str, Any] | None:
         executable = self._find_ffprobe_executable()
@@ -2088,6 +2291,13 @@ class MediaDownloader:
             "-of",
             "json",
         ]
+        if local_path is not None:
+            payload = self._run_ffprobe(
+                [*base_command, "-i", str(local_path)],
+                timeout_seconds=DOUYIN_FFPROBE_FILE_TIMEOUT_SECONDS,
+                should_cancel=should_cancel,
+            )
+            return self._parse_ffprobe_payload(payload)
         try:
             payload = self._run_ffprobe(
                 [*base_command, "-i", "pipe:0"],
@@ -2097,61 +2307,23 @@ class MediaDownloader:
             )
         except TimeoutError:
             payload = None
-        prefix_media = self._parse_ffprobe_payload(payload)
-        if self._douyin_probe_metadata_complete(prefix_media):
-            return prefix_media
-
-        header_blob = "".join(
-            f"{key}: {value}\r\n" for key, value in DOUYIN_MEDIA_HEADERS.items()
-        )
-        payload = self._run_ffprobe(
-            [
-                *base_command,
-                "-rw_timeout",
-                str(int(DOUYIN_FFPROBE_REMOTE_TIMEOUT_SECONDS * 1_000_000)),
-                "-headers",
-                header_blob,
-                "-i",
-                candidate_url,
-            ],
-            timeout_seconds=DOUYIN_FFPROBE_REMOTE_TIMEOUT_SECONDS,
-            should_cancel=should_cancel,
-        )
-        remote_media = self._parse_ffprobe_payload(payload)
-        return self._merge_douyin_probe_metadata(prefix_media, remote_media)
+        return self._parse_ffprobe_payload(payload)
 
     @classmethod
-    def _douyin_probe_metadata_complete(cls, media: dict[str, Any] | None) -> bool:
+    def _douyin_probe_metadata_complete(
+        cls,
+        media: dict[str, Any] | None,
+        *,
+        filesize: int | None = None,
+    ) -> bool:
         if not media:
             return False
         return (
             int(media.get("width") or 0) > 0
             and int(media.get("height") or 0) > 0
             and (cls._float_or_none(media.get("duration")) or 0) > 0
-            and int(media.get("bit_rate") or 0) > 0
+            and (int(media.get("bit_rate") or 0) > 0 or (filesize or 0) > 0)
         )
-
-    @classmethod
-    def _merge_douyin_probe_metadata(
-        cls,
-        prefix_media: dict[str, Any] | None,
-        remote_media: dict[str, Any] | None,
-    ) -> dict[str, Any] | None:
-        if not prefix_media:
-            return remote_media
-        if not remote_media:
-            return prefix_media
-        merged = dict(prefix_media)
-        for key, value in remote_media.items():
-            if key in {"width", "height", "bit_rate"}:
-                if int(value or 0) > 0:
-                    merged[key] = value
-            elif key == "duration":
-                if (cls._float_or_none(value) or 0) > 0:
-                    merged[key] = value
-            elif value not in {None, "", "none"}:
-                merged[key] = value
-        return merged
 
     @staticmethod
     def _find_ffprobe_executable() -> str | None:
@@ -2580,6 +2752,10 @@ class MediaDownloader:
                             selected.get("_douyin_probe_prefix_sha256") or ""
                         )
                         or None,
+                        redirect_source_url=str(
+                            selected.get("_douyin_probe_source_url") or ""
+                        )
+                        or None,
                     )
                     path, chosen = self._download_first_available_asset(
                         ydl,
@@ -2983,7 +3159,7 @@ class MediaDownloader:
                     errors.append(
                         (
                             self._safe_douyin_probe_failure(exc),
-                            self._is_retryable_douyin_probe_error(exc),
+                            self._should_pause_douyin_probe_error(exc),
                         )
                     )
                     continue
@@ -3058,7 +3234,7 @@ class MediaDownloader:
             raise
         except Exception as exc:
             reason = self._safe_douyin_probe_failure(exc)
-            if self._is_retryable_douyin_probe_error(exc):
+            if self._should_pause_douyin_probe_error(exc):
                 raise TemporaryAccessError(
                     "Douyin Live Photo authoritative quality source was temporarily "
                     "unavailable after automatic retries. The task was paused before "
@@ -3167,6 +3343,7 @@ class MediaDownloader:
             audio_codec=str(best.get("acodec") or "").lower() or None,
             probe_prefix_size=int(best.get("probe_prefix_size") or 0) or None,
             probe_prefix_sha256=str(best.get("probe_prefix_sha256") or "") or None,
+            redirect_source_url=str(best.get("source_url") or "") or None,
         )
 
     @staticmethod
@@ -3630,6 +3807,26 @@ class MediaDownloader:
             source_host.endswith(".douyin.com")
         )
         for asset in assets:
+            allow_verified_douyin_redirect = bool(
+                is_douyin_source
+                and media_type == MediaType.VIDEO
+                and require_quality_fingerprint
+                and (asset.size is not None or asset.bit_rate is not None)
+                and asset.duration is not None
+                and asset.duration > 0
+                and asset.video_codec
+                and asset.probe_prefix_size is not None
+                and 12 <= asset.probe_prefix_size <= DOUYIN_PROBE_BYTES
+                and re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    str(asset.probe_prefix_sha256 or ""),
+                )
+                and asset.redirect_source_url is not None
+                and self._is_trusted_douyin_asset_url(
+                    asset.redirect_source_url,
+                    MediaType.VIDEO,
+                )
+            )
             for candidate_index, candidate in enumerate(asset.candidates, start=1):
                 if should_cancel():
                     raise DownloadCancelledError("Task cancelled")
@@ -3641,9 +3838,14 @@ class MediaDownloader:
                         raise MediaDownloadError(
                             "Untrusted Xiaohongshu media URL was blocked"
                         )
-                    if is_douyin_source and not self._is_trusted_douyin_asset_url(
-                        candidate,
-                        media_type,
+                    if is_douyin_source and not (
+                        self._is_trusted_douyin_asset_url(candidate, media_type)
+                        or (
+                            allow_verified_douyin_redirect
+                            and self._is_douyin_regional_media_host(
+                                self._strict_https_hostname(candidate)
+                            )
+                        )
                     ):
                         raise MediaDownloadError(
                             "Untrusted Douyin media URL was blocked"
@@ -3678,12 +3880,19 @@ class MediaDownloader:
                         raise MediaDownloadError(
                             "Xiaohongshu media request redirected to an untrusted URL"
                         )
-                    if is_douyin_source and not self._is_trusted_douyin_asset_url(
-                        final_url,
-                        media_type,
+                    if is_douyin_source and not (
+                        self._is_trusted_douyin_asset_url(final_url, media_type)
+                        or (
+                            allow_verified_douyin_redirect
+                            and self._is_douyin_regional_media_host(
+                                self._strict_https_hostname(final_url)
+                            )
+                        )
                     ):
-                        raise MediaDownloadError(
-                            "Douyin media request redirected to an untrusted URL"
+                        raise TemporaryAccessError(
+                            "Douyin media redirect could not be trusted. The task was "
+                            "paused before downloading later items. Redirect host: "
+                            f"{self._douyin_redirect_host_label(final_url)}"
                         )
                     content_type = (
                         (response.headers.get("Content-Type") or "")
@@ -4040,7 +4249,7 @@ class MediaDownloader:
                     "-i",
                     str(path),
                 ],
-                timeout_seconds=DOUYIN_FFPROBE_REMOTE_TIMEOUT_SECONDS,
+                timeout_seconds=DOUYIN_FFPROBE_FILE_TIMEOUT_SECONDS,
                 should_cancel=should_cancel,
             )
         except DownloadCancelled as exc:
@@ -4111,6 +4320,7 @@ class MediaDownloader:
             audio_codec=asset.audio_codec,
             probe_prefix_size=asset.probe_prefix_size,
             probe_prefix_sha256=asset.probe_prefix_sha256,
+            redirect_source_url=asset.redirect_source_url,
         )
 
     @staticmethod

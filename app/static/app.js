@@ -517,10 +517,14 @@
       .replaceAll("default", "原始档")
       .replaceAll("media request or FFprobe timed out", "媒体请求或 FFprobe 超时")
       .replaceAll("media endpoint network request failed", "媒体端点网络请求失败")
+      .replaceAll("media endpoint redirected to an unrecognized Douyin CDN host", "媒体端点跳转到尚未识别的抖音地域 CDN 主机")
       .replaceAll("media endpoint returned HTTP", "媒体端点返回 HTTP")
       .replaceAll("media metadata could not be parsed", "无法解析媒体信息")
       .replaceAll("media endpoint did not return video data", "媒体端点没有返回视频")
       .replaceAll("media endpoint did not return an MP4 file", "媒体端点没有返回 MP4")
+      .replaceAll("media size changed between the range probe and local probe", "媒体文件大小在两次校验之间发生变化")
+      .replaceAll("media content changed between the range probe and local probe", "媒体文件内容在两次校验之间发生变化")
+      .replaceAll("media file exceeded the safe probe size limit", "媒体文件超过安全探测大小上限")
       .replaceAll("FFprobe could not parse the media stream", "FFprobe 无法解析媒体流");
   }
 
@@ -587,6 +591,16 @@
     if (text.includes("Douyin media transfer was temporarily unavailable")) {
       return "抖音原文件传输遇到临时网络错误或限流。程序已保留完成的文件并暂停后续队列，避免整页连续失败；请稍等后点击继续任务，不需要打开其他作品或作者主页验证。";
     }
+    if (text.includes("Douyin media redirect could not be trusted")) {
+      const hostMatch = text.match(/Redirect host:\s*([a-z0-9.-]+)/i);
+      const host = hostMatch?.[1] || "未知主机";
+      return `抖音原文件跳转到了尚未识别或不受信任的 CDN 主机（${host}）。程序没有保存该媒体文件，并已暂停后续队列；请检查网络代理后重试，不需要打开 Chrome 验证。`;
+    }
+    if (text.includes("media endpoint redirected to an unrecognized Douyin CDN host")) {
+      const hostMatch = text.match(/\(host:\s*([a-z0-9.-]+)\)/i);
+      const host = hostMatch?.[1] || "未知主机";
+      return `抖音画质探测跳转到了当前版本尚未识别的 CDN 主机（${host}）。程序没有保存该媒体文件，并已暂停后续队列，不会让余下作品连续失败；请检查代理，或把这个主机名反馈给开发者，不需要打开 Chrome 验证。`;
+    }
     if (text.includes("The site temporarily rate-limited the request")) {
       return "网站正在短时限流。请等待一两分钟后直接重试；没有明确验证码或登录页面时，不需要打开 Chrome 验证。";
     }
@@ -641,11 +655,11 @@
       text.includes("Douyin authoritative default quality source was temporarily unavailable")
     ) {
       const details = localizedProbeDetails(text);
-      return `抖音视频的作者直连或原始档遇到临时网络/限流问题。程序已暂停后续队列，避免把全部作品连续标失败，也没有改下低清版本；请稍等后点击继续任务${details ? `。本次原因：${details}` : ""}。`;
+      return `抖音视频的作者直连或原始档遇到临时网络、限流或未知 CDN。程序已暂停后续队列，避免把全部作品连续标失败，也没有改下低清版本；请稍等后点击继续任务${details ? `。本次原因：${details}` : ""}。`;
     }
     if (text.includes("Douyin Live Photo authoritative quality source was temporarily unavailable")) {
       const details = localizedProbeDetails(text);
-      return `抖音 Live Photo 的作者直连或原始档遇到临时网络/限流问题。程序已暂停后续队列，避免把全部作品连续标失败，也没有改下低清版本；请稍等后点击继续任务${details ? `。本次原因：${details}` : ""}。`;
+      return `抖音 Live Photo 的作者直连或原始档遇到临时网络、限流或未知 CDN。程序已暂停后续队列，避免把全部作品连续标失败，也没有改下低清版本；请稍等后点击继续任务${details ? `。本次原因：${details}` : ""}。`;
     }
     if (
       text.includes("Douyin Live Photo author-feed quality source could not be verified") ||

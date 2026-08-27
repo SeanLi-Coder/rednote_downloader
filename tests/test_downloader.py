@@ -16,10 +16,15 @@ from yt_dlp.networking.exceptions import HTTPError, TransportError
 from yt_dlp.utils import DownloadCancelled, DownloadError
 
 from app.downloader import (
+    DOUYIN_MAX_PROBE_FILE_BYTES,
+    DOUYIN_REGIONAL_MEDIA_DOMAINS,
     DOUYIN_TRANSFER_ATTEMPTS,
     OUTPUT_TEMPLATE,
     DownloaderConfig,
     MediaDownloader,
+    _DouyinProbeIntegrityChanged,
+    _DouyinProbeRejected,
+    _DouyinRedirectRejected,
     _SafeFilenamePostProcessor,
     _item_key,
     safe_component,
@@ -2468,10 +2473,10 @@ def test_douyin_probe_caps_range_omits_cookie_and_validates_duration(
 
     ydl = ProbeYoutubeDL()
     engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
-    probed_urls = []
+    ffprobe_calls = []
 
-    def ffprobe(data, url, *, should_cancel):
-        probed_urls.append(url)
+    def ffprobe(data, *, local_path=None, should_cancel):
+        ffprobe_calls.append((data, local_path))
         return {
             "width": 1080,
             "height": 1920,
@@ -2503,7 +2508,7 @@ def test_douyin_probe_caps_range_omits_cookie_and_validates_duration(
     assert result["probe_prefix_sha256"] == hashlib.sha256(
         payload[: 256 * 1024]
     ).hexdigest()
-    assert probed_urls == ["https://v26-web.douyinvod.com/verified-video.mp4"]
+    assert ffprobe_calls == [(payload[: 256 * 1024], None)]
     assert "cookie" not in request_headers
     assert request_headers["range"] == "bytes=0-262143"
     assert ydl.request.extensions["timeout"] == 10.0
@@ -2513,10 +2518,11 @@ def test_douyin_probe_caps_range_omits_cookie_and_validates_duration(
     monkeypatch.setattr(
         engine,
         "_ffprobe_douyin_media",
-        lambda data, url, *, should_cancel: {
+        lambda data, *, local_path=None, should_cancel: {
             "width": 1080,
             "height": 1920,
             "duration": 200,
+            "bit_rate": 1_000_000,
         },
     )
     with pytest.raises(RuntimeError, match="duration did not match"):
@@ -2528,7 +2534,7 @@ def test_douyin_probe_caps_range_omits_cookie_and_validates_duration(
         )
 
 
-def test_douyin_probe_rejects_untrusted_final_redirect_before_ffprobe(
+def test_douyin_probe_rejects_unrecognized_final_redirect_before_ffprobe(
     monkeypatch,
 ) -> None:
     class Headers:
@@ -2567,7 +2573,10 @@ def test_douyin_probe_rejects_untrusted_final_redirect_before_ffprobe(
         ),
     )
 
-    with pytest.raises(RuntimeError, match="trusted Douyin media hosts"):
+    with pytest.raises(
+        _DouyinRedirectRejected,
+        match="unrecognized Douyin CDN host.*invalid-host",
+    ):
         engine._probe_douyin_candidate(
             ydl,
             (
@@ -2580,6 +2589,602 @@ def test_douyin_probe_rejects_untrusted_final_redirect_before_ffprobe(
 
     assert ydl.response.read_calls == 0
     assert ydl.response.closed is True
+
+
+def test_douyin_regional_media_allowlist_covers_every_verified_domain_family() -> None:
+    expected_domains = (
+        "douyin.com",
+        "douyinvod.com",
+        "amemv.com",
+        "zjcdn.com",
+        "douyincdn.com",
+        "idouyinvod.com",
+        "pstatp.com",
+    )
+    source_url = (
+        "https://api-play.amemv.com/aweme/v1/play/?video_id=verified-fixture"
+    )
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+
+    assert DOUYIN_REGIONAL_MEDIA_DOMAINS == expected_domains
+    for domain in expected_domains:
+        assert engine._is_verified_douyin_media_redirect(
+            source_url,
+            f"https://{domain}/original.mp4",
+        )
+        assert engine._is_verified_douyin_media_redirect(
+            source_url,
+            f"https://edge.video.{domain}/original.mp4",
+        )
+
+
+def test_douyin_regional_media_allowlist_rejects_lookalikes_and_invalid_urls() -> None:
+    source_url = (
+        "https://api-play.amemv.com/aweme/v1/play/?video_id=verified-fixture"
+    )
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+
+    assert engine._is_verified_douyin_media_redirect(
+        source_url,
+        "https://EDGE.VIDEO.PSTATP.COM.:443/original.mp4",
+    )
+    for domain in DOUYIN_REGIONAL_MEDIA_DOMAINS:
+        assert not engine._is_verified_douyin_media_redirect(
+            source_url,
+            f"https://{domain}.evil.example/original.mp4",
+        )
+        assert not engine._is_verified_douyin_media_redirect(
+            source_url,
+            f"https://evil{domain}/original.mp4",
+        )
+
+    for value in (
+        "http://v5.pstatp.com/original.mp4",
+        "https://user:password@v5.pstatp.com/original.mp4",
+        "https://v5.pstatp.com:8443/original.mp4",
+        "https://v5.pstatp.com:invalid/original.mp4",
+        "https://127.0.0.1/original.mp4",
+        "https://[::1]/original.mp4",
+        "https://localhost/original.mp4",
+        "https://例子.pstatp.com/original.mp4",
+        "https://edge.video.pstatp.com\\@evil.example/original.mp4",
+        "https://edge.video.pstatp.com%0d.evil.example/original.mp4",
+    ):
+        assert not engine._is_verified_douyin_media_redirect(source_url, value)
+
+
+def test_douyin_probe_accepts_regional_redirect_and_skips_full_complete_prefix(
+    monkeypatch,
+) -> None:
+    payload = b"\x00\x00\x00\x18ftypisom" + b"verified-regional-cdn"
+    final_url = "https://edge.video.pstatp.com/original.mp4"
+
+    class Headers:
+        def get(self, name: str, default=None):
+            values = {
+                "Content-Type": "video/mp4",
+                "Content-Range": f"bytes 0-{len(payload) - 1}/{len(payload)}",
+            }
+            return values.get(name, default)
+
+    class Response:
+        headers = Headers()
+        url = final_url
+        status = 206
+
+        def __init__(self) -> None:
+            self.offset = 0
+            self.closed = False
+
+        def read(self, size: int) -> bytes:
+            chunk = payload[self.offset : self.offset + size]
+            self.offset += len(chunk)
+            return chunk
+
+        def close(self) -> None:
+            self.closed = True
+
+    class ProbeYoutubeDL:
+        def __init__(self) -> None:
+            self.response = Response()
+            self.calls = 0
+
+        def urlopen(self, request):
+            self.calls += 1
+            if self.calls > 1:
+                raise AssertionError("A complete prefix must not trigger a full download")
+            self.request = request
+            return self.response
+
+    ydl = ProbeYoutubeDL()
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    ffprobe_calls = []
+
+    def ffprobe(data, *, local_path=None, should_cancel):
+        ffprobe_calls.append((data, local_path))
+        return {
+            "width": 1080,
+            "height": 1920,
+            "vcodec": "h264",
+            "acodec": "aac",
+            "bit_rate": 2_000_000,
+            "duration": 2.0,
+        }
+
+    monkeypatch.setattr(engine, "_ffprobe_douyin_media", ffprobe)
+
+    result = engine._probe_douyin_candidate(
+        ydl,
+        "https://api-play.amemv.com/aweme/v1/play/?video_id=fixture",
+        expected_duration=2.0,
+        should_cancel=lambda: False,
+    )
+
+    assert result is not None
+    assert result["url"] == final_url
+    assert result["source_url"] == (
+        "https://api-play.amemv.com/aweme/v1/play/?video_id=fixture"
+    )
+    assert result["filesize"] == len(payload)
+    assert result["probe_prefix_sha256"] == hashlib.sha256(payload).hexdigest()
+    assert ffprobe_calls == [(payload, None)]
+    assert ydl.calls == 1
+    assert ydl.response.offset == len(payload)
+    assert ydl.response.closed is True
+
+
+def test_douyin_incomplete_prefix_downloads_identical_full_file_and_cleans_temp(
+    monkeypatch,
+) -> None:
+    prefix = b"\x00\x00\x00\x18ftypisom-prefix"
+    full_payload = prefix + b"-middle-moov-tail"
+    candidate_url = (
+        "https://api-play.amemv.com/aweme/v1/play/?video_id=full-probe-fixture"
+    )
+    final_url = "https://edge.video.pstatp.com/original.mp4"
+
+    class Response:
+        def __init__(self, payload: bytes, headers: dict[str, str]) -> None:
+            self.url = final_url
+            self.headers = headers
+            self.status = 206 if "Content-Range" in headers else 200
+            self.payload = payload
+            self.offset = 0
+            self.closed = False
+
+        def read(self, size: int) -> bytes:
+            chunk_size = min(size, 3)
+            chunk = self.payload[self.offset : self.offset + chunk_size]
+            self.offset += len(chunk)
+            return chunk
+
+        def close(self) -> None:
+            self.closed = True
+
+    class ProbeYoutubeDL:
+        def __init__(self) -> None:
+            self.requests = []
+            self.responses = []
+
+        def urlopen(self, request):
+            self.requests.append(request)
+            request_headers = {
+                key.lower(): value for key, value in request.headers.items()
+            }
+            if "range" in request_headers:
+                response = Response(
+                    prefix,
+                    {
+                        "Content-Type": "video/mp4",
+                        "Content-Range": (
+                            f"bytes 0-{len(prefix) - 1}/{len(full_payload)}"
+                        ),
+                    },
+                )
+            else:
+                response = Response(
+                    full_payload,
+                    {
+                        "Content-Type": "video/mp4",
+                        "Content-Length": str(len(full_payload)),
+                    },
+                )
+            self.responses.append(response)
+            return response
+
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    ffprobe_calls = []
+    temporary_paths = []
+
+    def ffprobe(data, *, local_path=None, should_cancel):
+        snapshot = local_path.read_bytes() if local_path is not None else None
+        ffprobe_calls.append((data, local_path, snapshot))
+        if local_path is None:
+            return {
+                "width": 0,
+                "height": 0,
+                "duration": None,
+                "bit_rate": 0,
+            }
+        temporary_paths.append(local_path)
+        return {
+            "width": 1440,
+            "height": 2560,
+            "vcodec": "hevc",
+            "acodec": "aac",
+            "bit_rate": 20_000_000,
+            "duration": 2.0,
+        }
+
+    monkeypatch.setattr(engine, "_ffprobe_douyin_media", ffprobe)
+    ydl = ProbeYoutubeDL()
+    result = engine._probe_douyin_candidate(
+        ydl,
+        candidate_url,
+        expected_duration=2.0,
+        should_cancel=lambda: False,
+    )
+
+    assert result is not None
+    assert result["url"] == final_url
+    assert result["filesize"] == len(full_payload)
+    assert result["probe_prefix_size"] == len(prefix)
+    assert result["probe_prefix_sha256"] == hashlib.sha256(prefix).hexdigest()
+    assert len(ydl.requests) == 2
+    assert [response.offset for response in ydl.responses] == [
+        len(prefix),
+        len(full_payload),
+    ]
+    assert all(response.closed for response in ydl.responses)
+    assert ffprobe_calls[0] == (prefix, None, None)
+    assert ffprobe_calls[1][0] == prefix
+    assert ffprobe_calls[1][2] == full_payload
+    assert len(temporary_paths) == 1
+    assert not temporary_paths[0].exists()
+    assert not temporary_paths[0].parent.exists()
+
+
+@pytest.mark.parametrize(
+    ("failure_mode", "exception_type", "message"),
+    [
+        (
+            "prefix_changed",
+            _DouyinProbeIntegrityChanged,
+            "media content changed",
+        ),
+        ("size_changed", _DouyinProbeIntegrityChanged, "media size changed"),
+        ("unknown_host", _DouyinRedirectRejected, "unrecognized Douyin CDN host"),
+        ("oversized", _DouyinProbeRejected, "safe probe size limit"),
+        ("cancelled", DownloadCancelled, "Task cancelled"),
+    ],
+)
+def test_douyin_full_probe_rejects_changed_or_unsafe_media_and_cleans_temp(
+    monkeypatch,
+    failure_mode,
+    exception_type,
+    message,
+) -> None:
+    prefix = b"\x00\x00\x00\x18ftypisom-PREFIX"
+    changed_prefix = b"\x00\x00\x00\x18ftypisom-BROKEN"
+    full_payload = prefix + b"-complete-tail"
+    candidate_url = (
+        "https://api-play.amemv.com/aweme/v1/play/?video_id=failure-fixture"
+    )
+    trusted_final_url = "https://edge.video.pstatp.com/original.mp4"
+    cancellation = {"active": False}
+
+    class Response:
+        def __init__(
+            self,
+            payload: bytes,
+            headers: dict[str, str],
+            final_url: str,
+        ) -> None:
+            self.url = final_url
+            self.headers = headers
+            self.status = 206 if "Content-Range" in headers else 200
+            self.payload = payload
+            self.offset = 0
+            self.closed = False
+
+        def read(self, size: int) -> bytes:
+            chunk = self.payload[self.offset : self.offset + min(size, 5)]
+            self.offset += len(chunk)
+            return chunk
+
+        def close(self) -> None:
+            self.closed = True
+
+    class ProbeYoutubeDL:
+        def __init__(self) -> None:
+            self.responses = []
+
+        def urlopen(self, request):
+            if not self.responses:
+                expected_size = (
+                    DOUYIN_MAX_PROBE_FILE_BYTES + 1
+                    if failure_mode == "oversized"
+                    else len(full_payload)
+                )
+                response = Response(
+                    prefix,
+                    {
+                        "Content-Type": "video/mp4",
+                        "Content-Range": (
+                            f"bytes 0-{len(prefix) - 1}/{expected_size}"
+                        ),
+                    },
+                    trusted_final_url,
+                )
+            else:
+                response_payload = (
+                    changed_prefix + full_payload[len(prefix) :]
+                    if failure_mode == "prefix_changed"
+                    else full_payload
+                )
+                declared_size = (
+                    DOUYIN_MAX_PROBE_FILE_BYTES + 1
+                    if failure_mode == "oversized"
+                    else len(full_payload)
+                    + (1 if failure_mode == "size_changed" else 0)
+                )
+                response = Response(
+                    response_payload,
+                    {
+                        "Content-Type": "video/mp4",
+                        "Content-Length": str(declared_size),
+                    },
+                    (
+                        "https://unrecognized-cdn.example/original.mp4"
+                        if failure_mode == "unknown_host"
+                        else trusted_final_url
+                    ),
+                )
+                if failure_mode == "cancelled":
+                    cancellation["active"] = True
+            self.responses.append(response)
+            return response
+
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    monkeypatch.setattr(
+        engine,
+        "_ffprobe_douyin_media",
+        lambda data, *, local_path=None, should_cancel: None,
+    )
+    original_download = engine._download_douyin_probe_file
+    temporary_paths = []
+
+    def track_download(ydl, candidate, path, **kwargs):
+        temporary_paths.append(path)
+        return original_download(ydl, candidate, path, **kwargs)
+
+    monkeypatch.setattr(engine, "_download_douyin_probe_file", track_download)
+    ydl = ProbeYoutubeDL()
+    with pytest.raises(exception_type, match=message):
+        engine._probe_douyin_candidate(
+            ydl,
+            candidate_url,
+            expected_duration=2.0,
+            should_cancel=lambda: cancellation["active"],
+        )
+
+    expected_response_count = 1 if failure_mode == "oversized" else 2
+    assert len(ydl.responses) == expected_response_count
+    assert all(response.closed for response in ydl.responses)
+    assert len(temporary_paths) == 1
+    assert not temporary_paths[0].exists()
+    assert not temporary_paths[0].parent.exists()
+    if failure_mode in {"prefix_changed", "size_changed"}:
+        assert engine._should_pause_douyin_probe_error(
+            exception_type(message)
+        )
+    if failure_mode in {"unknown_host", "size_changed", "cancelled"}:
+        assert ydl.responses[1].offset == 0
+
+
+@pytest.mark.parametrize(
+    "initial_url",
+    [
+        "https://edge.video.pstatp.com/original.mp4",
+        "https://regional-video.cdn.example/original.mp4",
+        "http://v26-web.douyinvod.com/original.mp4",
+        "https://user:password@v26-web.douyinvod.com/original.mp4",
+        "https://v26-web.douyinvod.com:8443/original.mp4",
+        "https://127.0.0.1/original.mp4",
+        "https://[::1]/original.mp4",
+    ],
+)
+def test_douyin_probe_rejects_non_allowlisted_initial_url_before_network(
+    initial_url,
+) -> None:
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+
+    class ProbeYoutubeDL:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def urlopen(self, request):
+            self.calls += 1
+            raise AssertionError("A non-allowlisted initial URL must not be opened")
+
+    ydl = ProbeYoutubeDL()
+    with pytest.raises(RuntimeError, match="untrusted initial Douyin"):
+        engine._probe_douyin_candidate(
+            ydl,
+            initial_url,
+            expected_duration=2.0,
+            should_cancel=lambda: False,
+        )
+
+    assert ydl.calls == 0
+
+
+def test_douyin_redirect_rejection_skips_internal_retries_and_pauses_upstream(
+    monkeypatch,
+) -> None:
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    attempts = []
+    delays = []
+
+    def reject(ydl, url, *, expected_duration, should_cancel):
+        attempts.append(url)
+        raise _DouyinRedirectRejected(
+            "media endpoint redirected to an unrecognized Douyin CDN host"
+        )
+
+    monkeypatch.setattr(engine, "_probe_douyin_candidate", reject)
+    monkeypatch.setattr(
+        engine,
+        "_wait_for_douyin_probe_retry",
+        lambda delay, should_cancel: delays.append(delay),
+    )
+    asset = RemoteAsset(
+        candidates=["https://v26-web.douyinvod.com/direct.mp4"],
+        index=1,
+        width=1080,
+        height=1920,
+        video_uri="v0200fg10000redirectfixture",
+        duration=2.0,
+        quality_candidates=[
+            {
+                "width": 1080,
+                "height": 1920,
+                "bit_rate": 2_000_000,
+                "urls": ["https://v26-web.douyinvod.com/direct.mp4"],
+            }
+        ],
+    )
+
+    assert not engine._is_retryable_douyin_probe_error(
+        _DouyinRedirectRejected("rejected")
+    )
+    assert engine._should_pause_douyin_probe_error(
+        _DouyinRedirectRejected("rejected")
+    )
+    with pytest.raises(TemporaryAccessError, match="task was paused"):
+        engine._select_highest_douyin_live_photo_asset(
+            object(),
+            asset,
+            callback=None,
+            should_cancel=lambda: False,
+        )
+
+    assert len(attempts) == 2
+    assert attempts[0] == "https://v26-web.douyinvod.com/direct.mp4"
+    assert "api-play-hl.amemv.com" in attempts[1]
+    assert delays == []
+
+
+def test_douyin_live_photo_tries_later_mirror_after_unrecognized_redirect(
+    monkeypatch,
+) -> None:
+    payload = b"\x00\x00\x00\x18ftypisom" + b"verified-live-photo"
+    first_mirror = "https://v26-web.douyinvod.com/mirror-1.mp4"
+    second_mirror = "https://v26-web.douyinvod.com/mirror-2.mp4"
+    regional_final = "https://edge.video.pstatp.com/original.mp4"
+
+    class Headers:
+        def get(self, name: str, default=None):
+            values = {
+                "Content-Type": "video/mp4",
+                "Content-Range": f"bytes 0-{len(payload) - 1}/{len(payload)}",
+            }
+            return values.get(name, default)
+
+    class Response:
+        headers = Headers()
+        status = 206
+
+        def __init__(self, url: str) -> None:
+            self.url = url
+            self.offset = 0
+            self.closed = False
+
+        def read(self, size: int) -> bytes:
+            chunk = payload[self.offset : self.offset + size]
+            self.offset += len(chunk)
+            return chunk
+
+        def close(self) -> None:
+            self.closed = True
+
+    class ProbeYoutubeDL:
+        def __init__(self) -> None:
+            self.requests = []
+            self.responses = []
+
+        def urlopen(self, request):
+            self.requests.append(request.url)
+            if request.url == first_mirror:
+                final_url = "https://unrecognized-cdn.example/original.mp4"
+            elif request.url == second_mirror:
+                final_url = regional_final
+            else:
+                final_url = "https://v5-dy-ov-experiment.zjcdn.com/default.mp4"
+            response = Response(final_url)
+            self.responses.append(response)
+            return response
+
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+
+    ffprobe_count = 0
+
+    def ffprobe(data, *, local_path=None, should_cancel):
+        nonlocal ffprobe_count
+        ffprobe_count += 1
+        assert data == payload
+        assert local_path is None
+        if ffprobe_count == 1:
+            return {
+                "width": 1080,
+                "height": 1920,
+                "vcodec": "h264",
+                "acodec": "aac",
+                "bit_rate": 2_000_000,
+                "duration": 2.0,
+            }
+        return {
+            "width": 720,
+            "height": 1280,
+            "vcodec": "h264",
+            "acodec": "aac",
+            "bit_rate": 1_000_000,
+            "duration": 2.0,
+        }
+
+    monkeypatch.setattr(engine, "_ffprobe_douyin_media", ffprobe)
+    ydl = ProbeYoutubeDL()
+    selected = engine._select_highest_douyin_live_photo_asset(
+        ydl,
+        RemoteAsset(
+            candidates=[first_mirror, second_mirror],
+            index=1,
+            width=1080,
+            height=1920,
+            video_uri="v0200fg10000redirectfixture",
+            duration=2.0,
+            quality_candidates=[
+                {
+                    "width": 1080,
+                    "height": 1920,
+                    "bit_rate": 2_000_000,
+                    "urls": [first_mirror, second_mirror],
+                }
+            ],
+        ),
+        callback=None,
+        should_cancel=lambda: False,
+    )
+
+    assert ydl.requests[:2] == [first_mirror, second_mirror]
+    assert "api-play-hl.amemv.com" in ydl.requests[2]
+    assert ydl.responses[0].offset == 0
+    assert ydl.responses[0].closed is True
+    assert all(response.closed for response in ydl.responses)
+    assert ffprobe_count == 2
+    assert selected.candidates[0] == regional_final
+    assert selected.redirect_source_url == second_mirror
+    assert (selected.width, selected.height) == (1080, 1920)
 
 
 def test_douyin_probe_rejects_candidate_without_size_or_bitrate(
@@ -2683,6 +3288,12 @@ def test_douyin_probe_derives_bitrate_from_complete_content_length(
             "acodec": "aac",
         },
     )
+    full_probe_calls = []
+    monkeypatch.setattr(
+        engine,
+        "_download_douyin_probe_file",
+        lambda *args, **kwargs: full_probe_calls.append((args, kwargs)),
+    )
 
     result = engine._probe_douyin_candidate(
         ProbeYoutubeDL(),
@@ -2694,6 +3305,7 @@ def test_douyin_probe_derives_bitrate_from_complete_content_length(
     assert result is not None
     assert result["filesize"] == complete_size
     assert result["bit_rate"] == 8_000_000
+    assert full_probe_calls == []
 
 
 def test_douyin_probe_requires_duration_even_without_item_duration(
@@ -2742,6 +3354,11 @@ def test_douyin_probe_requires_duration_even_without_item_duration(
             "vcodec": "hevc",
             "acodec": "aac",
         },
+    )
+    monkeypatch.setattr(
+        engine,
+        "_download_douyin_probe_file",
+        lambda *args, **kwargs: None,
     )
 
     with pytest.raises(RuntimeError, match="no media duration"):
@@ -3408,7 +4025,6 @@ def test_douyin_ffprobe_missing_is_explicit(monkeypatch) -> None:
     with pytest.raises(MediaDownloadError, match="FFprobe was not found"):
         engine._ffprobe_douyin_media(
             b"fixture",
-            "https://cdn.example.com/video.mp4",
             should_cancel=lambda: False,
         )
 
@@ -3540,9 +4156,14 @@ def test_douyin_ffprobe_process_can_be_cancelled_promptly() -> None:
     assert cancellation_checks >= 2
 
 
-def test_douyin_ffprobe_uses_short_independent_timeouts(monkeypatch) -> None:
+def test_douyin_ffprobe_uses_short_timeouts_and_never_passes_a_url(
+    monkeypatch,
+    tmp_path,
+) -> None:
     engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
     calls = []
+    local_path = tmp_path / "candidate.mp4"
+    local_path.write_bytes(b"complete-local-file")
     monkeypatch.setattr("app.downloader.shutil.which", lambda name: "/bin/ffprobe")
 
     def run(command, *, input_data=None, timeout_seconds, should_cancel):
@@ -3551,21 +4172,37 @@ def test_douyin_ffprobe_uses_short_independent_timeouts(monkeypatch) -> None:
 
     monkeypatch.setattr(engine, "_run_ffprobe", run)
 
-    assert (
-        engine._ffprobe_douyin_media(
-            b"fixture",
-            "https://cdn.example.com/video.mp4",
-            should_cancel=lambda: False,
-        )
-        is None
-    )
+    assert engine._ffprobe_douyin_media(
+        b"fixture",
+        should_cancel=lambda: False,
+    ) is None
+    assert engine._ffprobe_douyin_media(
+        b"fixture",
+        local_path=local_path,
+        should_cancel=lambda: False,
+    ) is None
     assert [call[2] for call in calls] == [3.0, 15.0]
-    assert "15000000" in calls[1][0]
+    assert [call[0][call[0].index("-i") + 1] for call in calls] == [
+        "pipe:0",
+        str(local_path),
+    ]
+    assert calls[0][1] == b"fixture"
+    assert calls[1][1] is None
+    assert all(
+        not argument.startswith(("http://", "https://"))
+        for command, _, _ in calls
+        for argument in command
+    )
 
 
-def test_douyin_ffprobe_prefix_timeout_continues_to_remote(monkeypatch) -> None:
+def test_douyin_ffprobe_prefix_timeout_continues_to_local_file(
+    monkeypatch,
+    tmp_path,
+) -> None:
     engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
     calls = []
+    local_path = tmp_path / "candidate.mp4"
+    local_path.write_bytes(b"complete-local-file")
     monkeypatch.setattr("app.downloader.shutil.which", lambda name: "/bin/ffprobe")
 
     def run(command, *, input_data=None, timeout_seconds, should_cancel):
@@ -3588,22 +4225,31 @@ def test_douyin_ffprobe_prefix_timeout_continues_to_remote(monkeypatch) -> None:
 
     monkeypatch.setattr(engine, "_run_ffprobe", run)
 
+    prefix_result = engine._ffprobe_douyin_media(
+        b"fixture",
+        should_cancel=lambda: False,
+    )
     result = engine._ffprobe_douyin_media(
         b"fixture",
-        "https://cdn.example.com/video.mp4",
+        local_path=local_path,
         should_cancel=lambda: False,
     )
 
+    assert prefix_result is None
     assert result is not None
     assert (result["width"], result["height"]) == (1080, 1920)
     assert [call[2] for call in calls] == [3.0, 15.0]
+    assert calls[1][0][calls[1][0].index("-i") + 1] == str(local_path)
 
 
-def test_douyin_ffprobe_uses_remote_range_seek_when_moov_is_at_tail(
+def test_douyin_ffprobe_uses_local_file_when_moov_is_at_tail(
     monkeypatch,
+    tmp_path,
 ) -> None:
     engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
     calls = []
+    local_path = tmp_path / "candidate.mp4"
+    local_path.write_bytes(b"complete-local-file-with-tail-moov")
     monkeypatch.setattr("app.downloader.shutil.which", lambda name: "/bin/ffprobe")
 
     def run(command, *, input_data=None, timeout_seconds, should_cancel):
@@ -3648,26 +4294,40 @@ def test_douyin_ffprobe_uses_remote_range_seek_when_moov_is_at_tail(
 
     monkeypatch.setattr(engine, "_run_ffprobe", run)
 
+    prefix_result = engine._ffprobe_douyin_media(
+        b"prefix-without-tail-moov",
+        should_cancel=lambda: False,
+    )
     result = engine._ffprobe_douyin_media(
         b"prefix-without-tail-moov",
-        "https://cdn.example.com/default-master.mp4",
+        local_path=local_path,
         should_cancel=lambda: False,
     )
 
+    assert prefix_result is not None
+    assert prefix_result["duration"] is None
     assert result is not None
     assert (result["width"], result["height"]) == (1440, 2560)
     assert result["vcodec"] == "hevc"
     assert [call[2] for call in calls] == [3.0, 15.0]
     assert calls[0][1] == b"prefix-without-tail-moov"
     assert calls[1][1] is None
-    assert "https://cdn.example.com/default-master.mp4" in calls[1][0]
+    assert calls[1][0][calls[1][0].index("-i") + 1] == str(local_path)
+    assert all(
+        not argument.startswith(("http://", "https://"))
+        for command, _, _ in calls
+        for argument in command
+    )
 
 
-def test_douyin_ffprobe_uses_remote_when_prefix_has_no_dimensions(
+def test_douyin_ffprobe_uses_local_file_when_prefix_has_no_dimensions(
     monkeypatch,
+    tmp_path,
 ) -> None:
     engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
     calls = []
+    local_path = tmp_path / "candidate.mp4"
+    local_path.write_bytes(b"complete-local-file")
     monkeypatch.setattr("app.downloader.shutil.which", lambda name: "/bin/ffprobe")
 
     def run(command, *, input_data=None, timeout_seconds, should_cancel):
@@ -3702,15 +4362,22 @@ def test_douyin_ffprobe_uses_remote_when_prefix_has_no_dimensions(
 
     monkeypatch.setattr(engine, "_run_ffprobe", run)
 
+    prefix_result = engine._ffprobe_douyin_media(
+        b"prefix-without-dimensions",
+        should_cancel=lambda: False,
+    )
     result = engine._ffprobe_douyin_media(
         b"prefix-without-dimensions",
-        "https://cdn.example.com/default-master.mp4",
+        local_path=local_path,
         should_cancel=lambda: False,
     )
 
+    assert prefix_result is not None
+    assert (prefix_result["width"], prefix_result["height"]) == (0, 0)
     assert result is not None
     assert (result["width"], result["height"]) == (1440, 2560)
     assert [call[2] for call in calls] == [3.0, 15.0]
+    assert calls[1][0][calls[1][0].index("-i") + 1] == str(local_path)
 
 
 def test_bilibili_profile_probes_first_video_when_playlist_has_no_author(
@@ -3890,6 +4557,7 @@ def _configure_verified_douyin_transfer(
     ffprobe_width: int = 1440,
     ffprobe_height: int = 2560,
     ffprobe_bit_rate: int = 10_000_000,
+    selected_url: str = "https://v26-web.douyinvod.com/verified.mp4",
     final_url: str = "https://v26-web.douyinvod.com/final.mp4",
 ):
     class Headers:
@@ -3944,7 +4612,7 @@ def _configure_verified_douyin_transfer(
         info["formats"].append(
             {
                 "format_id": "douyin-api-1440x2560-1",
-                "url": "https://v26-web.douyinvod.com/verified.mp4",
+                "url": selected_url,
                 "width": 1440,
                 "height": 2560,
                 "tbr": 10_000,
@@ -3953,6 +4621,10 @@ def _configure_verified_douyin_transfer(
                 "acodec": "none",
                 "_douyin_probe_prefix_size": len(payload),
                 "_douyin_probe_prefix_sha256": hashlib.sha256(payload).hexdigest(),
+                "_douyin_probe_source_url": (
+                    "https://api-play.amemv.com/aweme/v1/play/"
+                    "?video_id=fixture"
+                ),
             }
         )
         return True
@@ -4075,6 +4747,42 @@ def test_douyin_verified_transfer_preserves_exact_bytes_and_reports_resolution(
     assert not (tmp_path / ".parts").exists()
 
 
+def test_douyin_verified_transfer_accepts_bound_regional_cdn_and_preserves_bytes(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    media_id = "7664225419386607205"
+    payload = b"\x00\x00\x00\x18ftypisom" + b"regional-original-bytes"
+    final_url = "https://edge.video.pstatp.com/original.mp4"
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    direct_ydl = _configure_verified_douyin_transfer(
+        monkeypatch,
+        engine,
+        media_id=media_id,
+        payload=payload,
+        selected_url=final_url,
+        final_url=final_url,
+    )
+    item = DownloadItem(
+        id="douyin-item",
+        media_id=media_id,
+        source_url=f"https://www.douyin.com/video/{media_id}",
+        title="Douyin video",
+        media_type=MediaType.VIDEO,
+        metadata={"_job_id": "douyin-job"},
+    )
+
+    outcome = engine.download_item(item, Platform.DOUYIN, tmp_path)
+
+    path = Path(outcome.output_paths[0])
+    assert path.read_bytes() == payload
+    assert outcome.resolution == "1440x2560"
+    assert direct_ydl.requests[0].url == final_url
+    assert direct_ydl.responses[0].offset == len(payload)
+    assert direct_ydl.responses[0].closed is True
+    assert not list(tmp_path.glob("*.part"))
+
+
 def test_douyin_verified_transfer_blocks_untrusted_final_redirect(
     monkeypatch,
     tmp_path,
@@ -4098,11 +4806,102 @@ def test_douyin_verified_transfer_blocks_untrusted_final_redirect(
         metadata={"_job_id": "douyin-job"},
     )
 
-    with pytest.raises(MediaDownloadError, match="untrusted URL"):
+    with pytest.raises(TemporaryAccessError, match="redirect could not be trusted"):
         engine.download_item(item, Platform.DOUYIN, tmp_path)
 
     assert direct_ydl.responses[0].offset == 0
     assert direct_ydl.responses[0].closed is True
+    assert not list(tmp_path.iterdir())
+
+
+def test_douyin_verified_transfer_pauses_on_unknown_redirect_without_read_or_file(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    media_id = "7664225419386607205"
+    payload = b"\x00\x00\x00\x18ftypisom" + b"unknown-cdn-response"
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    direct_ydl = _configure_verified_douyin_transfer(
+        monkeypatch,
+        engine,
+        media_id=media_id,
+        payload=payload,
+        final_url="https://unrecognized-cdn.example/original.mp4",
+    )
+    item = DownloadItem(
+        id="douyin-item",
+        media_id=media_id,
+        source_url=f"https://www.douyin.com/video/{media_id}",
+        title="Douyin video",
+        media_type=MediaType.VIDEO,
+        metadata={"_job_id": "douyin-job"},
+    )
+
+    with pytest.raises(TemporaryAccessError, match="redirect could not be trusted"):
+        engine.download_item(item, Platform.DOUYIN, tmp_path)
+
+    assert len(direct_ydl.responses) == 1
+    assert direct_ydl.responses[0].offset == 0
+    assert direct_ydl.responses[0].closed is True
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize(
+    "redirect_source_url",
+    [
+        None,
+        "https://edge.video.pstatp.com/untrusted-source.mp4",
+    ],
+)
+def test_douyin_regional_transfer_requires_strict_probe_source_binding(
+    tmp_path,
+    redirect_source_url,
+) -> None:
+    payload = b"\x00\x00\x00\x18ftypisom" + b"bound-original"
+    public_url = "https://edge.video.pstatp.com/original.mp4"
+
+    class AssetYoutubeDL:
+        calls = 0
+
+        def urlopen(self, request):
+            self.calls += 1
+            raise AssertionError("Unbound regional CDN candidate must not be opened")
+
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    ydl = AssetYoutubeDL()
+    with pytest.raises(MediaDownloadError, match="Untrusted Douyin media URL"):
+        engine._download_first_available_asset(
+            ydl,
+            [
+                RemoteAsset(
+                    candidates=[public_url],
+                    index=1,
+                    width=1080,
+                    height=1920,
+                    size=len(payload),
+                    duration=2.0,
+                    bit_rate=2_000_000,
+                    video_codec="h264",
+                    audio_codec="none",
+                    probe_prefix_size=len(payload),
+                    probe_prefix_sha256=hashlib.sha256(payload).hexdigest(),
+                    redirect_source_url=redirect_source_url,
+                )
+            ],
+            tmp_path,
+            "2025-09-01",
+            "Live Photo",
+            "1111111111111111111",
+            "https://www.douyin.com/user/verified-profile",
+            media_type=MediaType.VIDEO,
+            callback=None,
+            should_cancel=lambda: False,
+            asset_index=1,
+            verify_declared_dimensions=True,
+            require_quality_fingerprint=True,
+        )
+
+    assert ydl.calls == 0
     assert not list(tmp_path.iterdir())
 
 

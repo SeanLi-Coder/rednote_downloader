@@ -5,7 +5,7 @@ from pathlib import Path
 
 
 APP_ID = "original-media-downloader"
-APP_VERSION = "1.2.2"
+APP_VERSION = "1.2.3"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
