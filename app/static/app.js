@@ -15,6 +15,7 @@
     emptyState: document.querySelector("#empty-state"),
     failureCount: document.querySelector("#failure-count"),
     activeCount: document.querySelector("#active-count"),
+    buildInfo: document.querySelector("#build-info"),
     filterTabs: document.querySelector("#filter-tabs"),
     formError: document.querySelector("#form-error"),
     historyList: document.querySelector("#history-list"),
@@ -43,6 +44,8 @@
     toastRegion: document.querySelector("#toast-region"),
     totalCount: document.querySelector("#total-count"),
     urlInput: document.querySelector("#url-input"),
+    versionAlert: document.querySelector("#version-alert"),
+    versionAlertDetail: document.querySelector("#version-alert-detail"),
     warningAlert: document.querySelector("#warning-alert"),
     warningMessage: document.querySelector("#warning-message"),
     warningTitle: document.querySelector("#warning-title")
@@ -56,7 +59,8 @@
     polling: false,
     pollingTick: 0,
     refreshTimer: null,
-    selectedJobId: null
+    selectedJobId: null,
+    versionBlocked: false
   };
 
   const statusLabels = {
@@ -483,6 +487,12 @@
 
   function localizeRuntimeMessage(value) {
     let text = asText(value);
+    if (text.includes("legacy Douyin task contains an unverified numeric queue")) {
+      return "这是旧版本留下的未验证数字队列，原视频身份已经无法安全恢复。程序已停止继续下载，也不会再打开错误的博主主页。请重新粘贴原始主页或视频链接创建新任务；已有文件不会被删除。";
+    }
+    if (text.includes("legacy Douyin item task must be rediscovered")) {
+      return "这是旧版本错误展开的抖音单视频任务。程序已移除未下载的数字条目；请点击继续任务，从原视频链接重新解析。已有文件不会被删除。";
+    }
     if (text.includes("Douyin returned an uploader profile instead of the requested video")) {
       return "抖音把目标视频错误返回成了博主主页，程序已拦截这些非目标作品。请在 Chrome 打开原视频完成验证后重试。";
     }
@@ -633,9 +643,81 @@
   }
 
   function setConnection(mode, text) {
+    if (!elements.connectionStatus) return;
     elements.connectionStatus.classList.remove("connected", "disconnected");
     if (mode) elements.connectionStatus.classList.add(mode);
-    elements.connectionStatus.querySelector("span:last-child").textContent = text;
+    const label = elements.connectionStatus.querySelector("span:last-child");
+    if (label) label.textContent = text;
+  }
+
+  function metaContent(name) {
+    return document.querySelector(`meta[name="${name}"]`)?.content || "";
+  }
+
+  async function verifyBackendBuild() {
+    if (state.versionBlocked) return false;
+    const expectedAppId = metaContent("app-id");
+    const expectedVersion = metaContent("app-version");
+    const expectedBuild = metaContent("app-build");
+    let health = null;
+    try {
+      const response = await fetch("/api/health", {
+        cache: "no-store",
+        headers: { Accept: "application/json", "Cache-Control": "no-cache" }
+      });
+      if (response.ok) health = await response.json();
+    } catch {
+      health = null;
+    }
+
+    const rendered = expectedBuild && !expectedBuild.startsWith("__");
+    const compatible = Boolean(
+      rendered
+      && health?.status === "ok"
+      && health?.app_id === expectedAppId
+      && health?.version === expectedVersion
+      && health?.build_id === expectedBuild
+      && health?.source_build_id === expectedBuild
+      && health?.restart_required === false
+    );
+    if (compatible) {
+      elements.buildInfo.textContent = `v${health.version} · ${health.build_id}`;
+      return true;
+    }
+
+    state.versionBlocked = true;
+    document.body.classList.add("version-blocked");
+    if (state.eventSource) {
+      state.eventSource.close();
+      state.eventSource = null;
+    }
+    document.querySelectorAll("button, input").forEach((control) => {
+      control.disabled = true;
+    });
+    if (!elements.versionAlert) {
+      const alert = document.createElement("section");
+      const heading = document.createElement("strong");
+      const detail = document.createElement("p");
+      alert.id = "version-alert";
+      alert.className = "version-alert";
+      alert.setAttribute("role", "alert");
+      heading.textContent = "当前页面连接的还是旧后台，已停止创建和重试任务";
+      detail.id = "version-alert-detail";
+      alert.append(heading, detail);
+      (document.querySelector("#main-content") || document.body).prepend(alert);
+      elements.versionAlert = alert;
+      elements.versionAlertDetail = detail;
+    }
+    elements.versionAlert.hidden = false;
+    const mismatchDetail = health?.app_id
+      ? `页面版本 ${expectedVersion || "未知"} / ${expectedBuild || "未知"}，后台加载版本 ${health.version || "未知"} / ${health.build_id || "未知"}，磁盘源码版本 ${health.source_build_id || "未知"}。请关闭旧 Terminal 后重新运行 start.command，再按 Command+Shift+R 强制刷新。`
+      : "旧 Python 后台没有返回版本标识。请关闭之前启动下载器的 Terminal，重新运行 start.command，再按 Command+Shift+R 强制刷新。";
+    if (elements.versionAlertDetail) {
+      elements.versionAlertDetail.textContent = mismatchDetail;
+    }
+    if (elements.buildInfo) elements.buildInfo.textContent = "版本冲突";
+    setConnection("disconnected", "后台未重启");
+    return false;
   }
 
   function progressDescription(job, counts) {
@@ -954,7 +1036,7 @@
   }
 
   async function retryJob(jobId, itemId, button) {
-    if (!jobId || button?.disabled) return;
+    if (state.versionBlocked || !jobId || button?.disabled) return;
     if (button) {
       button.disabled = true;
       button.setAttribute("aria-busy", "true");
@@ -981,7 +1063,7 @@
 
   async function openVerification() {
     const id = state.selectedJobId;
-    if (!id || elements.authOpenButton.disabled) return;
+    if (state.versionBlocked || !id || elements.authOpenButton.disabled) return;
     elements.authOpenButton.disabled = true;
     try {
       await api(`/api/jobs/${encodeURIComponent(id)}/verify`, { method: "POST" });
@@ -995,7 +1077,7 @@
 
   async function cancelSelectedJob() {
     const id = state.selectedJobId;
-    if (!id) return;
+    if (state.versionBlocked || !id) return;
     const confirmed = window.confirm("确定要取消这个下载任务吗？已经下载完成的文件会保留。");
     if (!confirmed) return;
     elements.cancelButton.disabled = true;
@@ -1019,6 +1101,7 @@
 
   async function createJob(event) {
     event.preventDefault();
+    if (state.versionBlocked) return;
     elements.formError.textContent = "";
     const url = elements.urlInput.value.trim();
     if (!url || !/https?:\/\//i.test(url)) {
@@ -1070,6 +1153,7 @@
 
   async function saveConfig(event) {
     event.preventDefault();
+    if (state.versionBlocked) return;
     const directory = elements.downloadDir.value.trim();
     if (!directory) {
       showToast("请填写下载目录", "error");
@@ -1102,10 +1186,11 @@
   }
 
   async function poll() {
-    if (state.polling || document.hidden) return;
+    if (state.polling || state.versionBlocked || document.hidden) return;
     state.polling = true;
     state.pollingTick += 1;
     try {
+      if (!(await verifyBackendBuild())) return;
       if (state.selectedJobId) await fetchJob(state.selectedJobId, true);
       if (state.pollingTick % 3 === 0) await fetchJobs(true);
     } finally {
@@ -1145,6 +1230,7 @@
 
   async function initialize() {
     bindEvents();
+    if (!(await verifyBackendBuild())) return;
     connectEvents();
     await Promise.all([loadConfig(), fetchJobs(true)]);
     window.setInterval(poll, 4000);

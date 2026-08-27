@@ -3,6 +3,7 @@ from __future__ import annotations
 from fastapi.testclient import TestClient
 
 from app import main as main_module
+from app.build_info import APP_ID, APP_VERSION, BUILD_ID, calculate_build_id
 from app.main import app
 from app.models import DownloadItem, DownloadJob, Platform, SourceKind
 
@@ -10,13 +11,40 @@ from app.models import DownloadItem, DownloadJob, Platform, SourceKind
 def test_health_endpoint_accepts_local_host_and_rejects_dns_rebinding() -> None:
     client = TestClient(app, base_url="http://localhost")
     try:
-        assert client.get("/api/health").json() == {"status": "ok"}
+        assert client.get("/api/health").json() == {
+            "status": "ok",
+            "app_id": APP_ID,
+            "version": APP_VERSION,
+            "build_id": BUILD_ID,
+            "source_build_id": calculate_build_id(),
+            "restart_required": False,
+        }
         assert (
             client.get("/api/health", headers={"host": "attacker.example"}).status_code
             == 400
         )
     finally:
         client.close()
+
+
+def test_index_injects_build_identity_and_disables_html_cache() -> None:
+    client = TestClient(app, base_url="http://localhost")
+    try:
+        response = client.get("/")
+        static_response = client.get(f"/static/app.js?v={BUILD_ID}")
+    finally:
+        client.close()
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store, max-age=0"
+    assert "__APP_ID__" not in response.text
+    assert "__APP_VERSION__" not in response.text
+    assert "__BUILD_ID__" not in response.text
+    assert f'<meta name="app-build" content="{BUILD_ID}">' in response.text
+    assert f'/static/app.js?v={BUILD_ID}' in response.text
+
+    assert static_response.status_code == 200
+    assert static_response.headers["cache-control"] == "no-store, max-age=0"
 
 
 def test_douyin_item_verification_always_opens_original_video(

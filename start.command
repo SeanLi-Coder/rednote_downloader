@@ -46,4 +46,12 @@ echo "Checking dependencies..."
 .venv/bin/python -m pip install --disable-pip-version-check -q -r requirements.txt
 
 echo "Starting Original Media Downloader at http://127.0.0.1:8765"
-exec .venv/bin/python run.py
+set +e
+.venv/bin/python run.py
+task_exit_code=$?
+set -e
+if [ "$task_exit_code" -ne 0 ]; then
+  echo ""
+  read -r -p "Startup stopped. Review the message above, then press Enter to close..."
+fi
+exit "$task_exit_code"

@@ -65,6 +65,11 @@ DOUYIN_ITEM_MIGRATION_MESSAGE = (
     "This legacy Douyin item task must be rediscovered from its original video "
     "link before downloading. Existing files were preserved."
 )
+DOUYIN_UNVERIFIABLE_QUEUE_ERROR = (
+    "This legacy Douyin task contains an unverified numeric queue and no longer "
+    "has enough source metadata to continue safely. Create a new task from the "
+    "original profile or video link. Existing files were preserved."
+)
 _LEGACY_DOUYIN_MARKDOWN_ITEM_RE = re.compile(
     r"(https://www\.douyin\.com/video/(\d+))\]\("
     r"(https://www\.douyin\.com/video/(\d+))"
@@ -165,6 +170,27 @@ class DownloadManager:
                     item.auth_message = None
                     item.retryable = True
                     item.updated_at = now
+                changed = True
+            if self._is_unverifiable_legacy_douyin_queue(job):
+                now = utc_now()
+                preserved_items = [item for item in job.items if item.output_paths]
+                for item in preserved_items:
+                    item.status = ItemStatus.FAILED
+                    item.error = DOUYIN_UNVERIFIABLE_QUEUE_ERROR
+                    item.auth_message = None
+                    item.retryable = False
+                    item.updated_at = now
+                job.items = preserved_items
+                job.status = JobStatus.FAILED
+                job.error = DOUYIN_UNVERIFIABLE_QUEUE_ERROR
+                job.warning = DOUYIN_UNVERIFIABLE_QUEUE_ERROR
+                job.auth_message = None
+                job.verification_url = None
+                job.active_item_id = None
+                job.cancel_requested = False
+                job.retryable = False
+                job.discovery_complete = False
+                job.finished_at = now
                 changed = True
             if (
                 job.platform == Platform.DOUYIN
@@ -268,6 +294,29 @@ class DownloadManager:
             if self._douyin_item_has_invalid_expansion(job):
                 target = self._douyin_item_target(job)
                 now = utc_now()
+                if target:
+                    canonical_url, expected_id = target
+                    target_items = [
+                        item
+                        for item in job.items
+                        if item.media_id == expected_id
+                        and self._is_bound_douyin_item_url(
+                            item.source_url,
+                            canonical_url,
+                            expected_id,
+                        )
+                        and (
+                            item.output_paths
+                            or not self._is_numeric_legacy_item(item)
+                        )
+                    ]
+                    target_item_ids = {item.id for item in target_items}
+                    preserved_files = [
+                        item
+                        for item in job.items
+                        if item.output_paths and item.id not in target_item_ids
+                    ]
+                    job.items = target_items[:1] + preserved_files
                 for item in job.items:
                     item.status = ItemStatus.FAILED
                     item.error = DOUYIN_ITEM_EXPANSION_MESSAGE
@@ -339,6 +388,8 @@ class DownloadManager:
         with self._lock:
             job = self._require_job(job_id)
             self._ensure_not_running(job_id)
+            if not job.retryable:
+                raise ItemNotRetryableError(job.error or "This task cannot be retried")
             if self._prepare_douyin_item_rediscovery_locked(job):
                 targets = None
                 rediscover = True
@@ -401,6 +452,8 @@ class DownloadManager:
         with self._lock:
             job = self._require_job(job_id)
             self._ensure_not_running(job_id)
+            if not job.retryable:
+                raise ItemNotRetryableError(job.error or "This task cannot be retried")
             if self._prepare_douyin_item_rediscovery_locked(job):
                 self._submit_locked(job, None, rediscover=True)
                 return self.get_job(job_id)
@@ -422,6 +475,8 @@ class DownloadManager:
         with self._lock:
             job = self._require_job(job_id)
             self._ensure_not_running(job_id)
+            if not job.retryable:
+                raise ItemNotRetryableError(job.error or "This task cannot be retried")
             if self._prepare_douyin_item_rediscovery_locked(job):
                 self._submit_locked(job, None, rediscover=True)
                 return self.get_job(job_id)
@@ -1091,6 +1146,38 @@ class DownloadManager:
             )
         ]
         return len(job.items) != 1 or len(valid_items) != 1
+
+    @staticmethod
+    def _is_numeric_legacy_item(item: DownloadItem) -> bool:
+        media_id = item.media_id or item.id
+        if not media_id.isdigit():
+            return False
+        title = item.title.strip()
+        return title in {"", "Untitled", media_id, item.id}
+
+    @classmethod
+    def _is_unverifiable_legacy_douyin_queue(cls, job: DownloadJob) -> bool:
+        if (
+            job.retryable is False
+            and job.error == DOUYIN_UNVERIFIABLE_QUEUE_ERROR
+        ):
+            return False
+        if (
+            job.platform != Platform.DOUYIN
+            or job.source_kind != SourceKind.PROFILE
+            or len(job.items) < 2
+        ):
+            return False
+        unverified_numeric_items = [
+            item
+            for item in job.items
+            if cls._is_numeric_legacy_item(item)
+            and item.metadata.get("profile_owner_verified") is not True
+        ]
+        return (
+            len(unverified_numeric_items) >= 2
+            and len(unverified_numeric_items) * 2 >= len(job.items)
+        )
 
     @classmethod
     def _validate_discovery_result(

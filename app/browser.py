@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import os
+import shutil
+import subprocess
 import sys
+from pathlib import Path
 
 
 def chrome_user_agent(
@@ -18,3 +22,55 @@ def chrome_user_agent(
         f"Mozilla/5.0 ({platform_token}) AppleWebKit/537.36 "
         f"(KHTML, like Gecko) Chrome/{chrome_version} Safari/537.36"
     )
+
+
+def open_chrome(url: str) -> None:
+    if sys.platform == "darwin":
+        subprocess.Popen(
+            ["/usr/bin/open", "-a", "Google Chrome", url],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return
+    if sys.platform.startswith("win"):
+        candidates = [
+            shutil.which("chrome.exe"),
+            shutil.which("chrome"),
+            str(
+                Path(os.environ.get("LOCALAPPDATA", ""))
+                / "Google/Chrome/Application/chrome.exe"
+            ),
+            str(
+                Path(os.environ.get("PROGRAMFILES", ""))
+                / "Google/Chrome/Application/chrome.exe"
+            ),
+            str(
+                Path(os.environ.get("PROGRAMFILES(X86)", ""))
+                / "Google/Chrome/Application/chrome.exe"
+            ),
+        ]
+        for candidate in candidates:
+            if candidate and Path(candidate).is_file():
+                subprocess.Popen(
+                    [candidate, url],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                return
+        raise RuntimeError("Google Chrome was not found")
+    for executable in (
+        "google-chrome",
+        "google-chrome-stable",
+        "chromium",
+        "chromium-browser",
+    ):
+        try:
+            subprocess.Popen(
+                [executable, url],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return
+        except FileNotFoundError:
+            continue
+    raise RuntimeError("Google Chrome was not found")

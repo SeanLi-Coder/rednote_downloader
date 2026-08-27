@@ -46,7 +46,13 @@ if errorlevel 1 goto :error
 
 echo Starting Original Media Downloader at http://127.0.0.1:8765
 .venv\Scripts\python.exe run.py
-exit /b %errorlevel%
+if errorlevel 1 goto :run_error
+exit /b 0
+
+:run_error
+echo Startup stopped. Review the message above, then try again.
+pause
+exit /b 1
 
 :error
 echo Setup failed. Review the error above and try again.

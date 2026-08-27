@@ -845,6 +845,378 @@ def test_restore_marks_corrupted_douyin_item_expansion_for_rediscovery(
         manager.shutdown()
 
 
+def test_restore_removes_unsaved_numeric_items_from_direct_video_expansion(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    target_id = "7664225419386607205"
+    source_url = f"https://www.douyin.com/video/{target_id}"
+    state_dir = tmp_path / "state"
+    media_ids = [target_id] + [
+        str(7670000000000000000 + index) for index in range(150)
+    ]
+    job = DownloadJob(
+        id="legacy-151-direct-items",
+        source_url=source_url,
+        platform=Platform.DOUYIN,
+        source_kind=SourceKind.ITEM,
+        output_root=str(tmp_path / "downloads"),
+        status=JobStatus.NEEDS_AUTH,
+        auth_message="Complete verification",
+        verification_url="https://www.douyin.com/user/wrong-profile",
+        items=[
+            DownloadItem(
+                id=media_id,
+                media_id=media_id,
+                source_url=f"https://www.douyin.com/video/{media_id}",
+                title=media_id,
+                status=(ItemStatus.NEEDS_AUTH if index == 0 else ItemStatus.QUEUED),
+            )
+            for index, media_id in enumerate(media_ids)
+        ],
+    )
+    job.refresh_counts()
+    JsonJobStore(state_dir).save(job)
+
+    manager = DownloadManager(
+        state_dir=state_dir,
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+
+    class RediscoveredItemEngine:
+        def discover(self, url, platform, kind, *, should_cancel):
+            assert url == source_url
+            assert kind == SourceKind.ITEM
+            return DiscoveryResult(
+                author="Correct author",
+                items=[
+                    DownloadItem(
+                        id=target_id,
+                        media_id=target_id,
+                        source_url=source_url,
+                        title="Correct rediscovered title",
+                        media_type=MediaType.VIDEO,
+                        metadata={
+                            "verification_url": source_url,
+                            "item_identity_verified": True,
+                            "douyin_item_media": {
+                                "media_id": target_id,
+                                "video_uri": "verified-video-uri",
+                            },
+                        },
+                    )
+                ],
+            )
+
+        def download_item(
+            self,
+            item,
+            platform,
+            output_dir,
+            *,
+            callback,
+            should_cancel,
+        ):
+            assert item.media_id == target_id
+            return DownloadOutcome(
+                output_paths=[str(Path(output_dir) / "correct.mp4")],
+                title=item.title,
+                author="Correct author",
+                media_type=MediaType.VIDEO,
+                resolution="1440x2560",
+            )
+
+    monkeypatch.setattr(
+        manager,
+        "_engine_for_job",
+        lambda restored_job: RediscoveredItemEngine(),
+    )
+    try:
+        restored = manager.get_job(job.id)
+
+        assert restored.status == JobStatus.INTERRUPTED
+        assert restored.total_items == 0
+        assert restored.items == []
+        assert restored.auth_message is None
+        assert restored.verification_url == source_url
+        assert restored.discovery_complete is False
+        assert restored.retryable is True
+
+        manager.retry_failed(job.id)
+        completed = wait_for_job(manager, job.id)
+
+        assert completed.status == JobStatus.COMPLETED
+        assert completed.total_items == 1
+        assert completed.items[0].media_id == target_id
+        assert completed.items[0].source_url == source_url
+        assert completed.items[0].title == "Correct rediscovered title"
+        assert completed.items[0].resolution == "1440x2560"
+    finally:
+        manager.shutdown()
+
+
+def test_restore_quarantines_unverifiable_numeric_profile_queue(tmp_path) -> None:
+    state_dir = tmp_path / "state"
+    profile_url = "https://www.douyin.com/user/wrong-profile"
+    media_ids = [str(7670000000000000000 + index) for index in range(151)]
+    job = DownloadJob(
+        id="legacy-151-lost-source",
+        source_url=profile_url,
+        platform=Platform.DOUYIN,
+        source_kind=SourceKind.PROFILE,
+        output_root=str(tmp_path / "downloads"),
+        status=JobStatus.NEEDS_AUTH,
+        auth_message="Complete verification",
+        verification_url=profile_url,
+        items=[
+            DownloadItem(
+                id=media_id,
+                media_id=media_id,
+                source_url=f"https://www.douyin.com/video/{media_id}",
+                title=media_id,
+                status=(ItemStatus.NEEDS_AUTH if index == 0 else ItemStatus.QUEUED),
+            )
+            for index, media_id in enumerate(media_ids)
+        ],
+    )
+    job.refresh_counts()
+    JsonJobStore(state_dir).save(job)
+
+    manager = DownloadManager(
+        state_dir=state_dir,
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    try:
+        restored = manager.get_job(job.id)
+
+        assert restored.status == JobStatus.FAILED
+        assert restored.total_items == 0
+        assert restored.items == []
+        assert restored.auth_message is None
+        assert restored.verification_url is None
+        assert restored.discovery_complete is False
+        assert restored.retryable is False
+        assert "unverified numeric queue" in (restored.error or "")
+        with pytest.raises(ItemNotRetryableError):
+            manager.retry_failed(job.id)
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("job_status", "item_status"),
+    [
+        (JobStatus.FAILED, ItemStatus.FAILED),
+        (JobStatus.CANCELLED, ItemStatus.CANCELLED),
+    ],
+)
+def test_restore_quarantines_terminal_numeric_profile_queue(
+    job_status,
+    item_status,
+    tmp_path,
+) -> None:
+    state_dir = tmp_path / "state"
+    job = DownloadJob(
+        id=f"legacy-terminal-{job_status.value}",
+        source_url="https://www.douyin.com/user/legacy-profile",
+        platform=Platform.DOUYIN,
+        source_kind=SourceKind.PROFILE,
+        output_root=str(tmp_path / "downloads"),
+        status=job_status,
+        items=[
+            DownloadItem(
+                id=media_id,
+                media_id=media_id,
+                source_url=f"https://www.douyin.com/video/{media_id}",
+                title=media_id,
+                status=item_status,
+                metadata={"profile_owner_verified": "true"},
+            )
+            for media_id in ("7670000000000000001", "7670000000000000002")
+        ],
+    )
+    job.refresh_counts()
+    JsonJobStore(state_dir).save(job)
+
+    manager = DownloadManager(
+        state_dir=state_dir,
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    try:
+        restored = manager.get_job(job.id)
+
+        assert restored.status == JobStatus.FAILED
+        assert restored.items == []
+        assert restored.retryable is False
+        assert "unverified numeric queue" in (restored.error or "")
+    finally:
+        manager.shutdown()
+
+
+def test_restore_quarantines_mixed_verified_and_unverified_numeric_queue(
+    tmp_path,
+) -> None:
+    state_dir = tmp_path / "state"
+    output_path = tmp_path / "downloads" / "verified.mp4"
+    output_path.parent.mkdir(parents=True)
+    output_path.write_bytes(b"preserved")
+    verified_id = "7664225419386607205"
+    unverified_ids = [str(7670000000000000000 + index) for index in range(150)]
+    job = DownloadJob(
+        id="legacy-mixed-profile-queue",
+        source_url="https://www.douyin.com/user/legacy-profile",
+        platform=Platform.DOUYIN,
+        source_kind=SourceKind.PROFILE,
+        output_root=str(tmp_path / "downloads"),
+        status=JobStatus.NEEDS_AUTH,
+        items=[
+            DownloadItem(
+                id=verified_id,
+                media_id=verified_id,
+                source_url=f"https://www.douyin.com/video/{verified_id}",
+                title="Verified title",
+                status=ItemStatus.COMPLETED,
+                output_paths=[str(output_path)],
+                metadata={"profile_owner_verified": True},
+            ),
+            *[
+                DownloadItem(
+                    id=media_id,
+                    media_id=media_id,
+                    source_url=f"https://www.douyin.com/video/{media_id}",
+                    title=media_id,
+                    status=ItemStatus.QUEUED,
+                )
+                for media_id in unverified_ids
+            ],
+        ],
+    )
+    job.refresh_counts()
+    JsonJobStore(state_dir).save(job)
+
+    manager = DownloadManager(
+        state_dir=state_dir,
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    try:
+        restored = manager.get_job(job.id)
+
+        assert restored.status == JobStatus.FAILED
+        assert restored.total_items == 1
+        assert restored.items[0].output_paths == [str(output_path)]
+        assert restored.items[0].retryable is False
+        assert output_path.exists()
+    finally:
+        manager.shutdown()
+
+
+def test_restore_keeps_fully_verified_numeric_profile_queue(tmp_path) -> None:
+    state_dir = tmp_path / "state"
+    media_ids = ("7670000000000000001", "7670000000000000002")
+    job = DownloadJob(
+        id="verified-numeric-profile",
+        source_url="https://www.douyin.com/user/verified-profile",
+        platform=Platform.DOUYIN,
+        source_kind=SourceKind.PROFILE,
+        output_root=str(tmp_path / "downloads"),
+        status=JobStatus.NEEDS_AUTH,
+        items=[
+            DownloadItem(
+                id=media_id,
+                media_id=media_id,
+                source_url=f"https://www.douyin.com/video/{media_id}",
+                title=media_id,
+                status=ItemStatus.NEEDS_AUTH,
+                metadata={"profile_owner_verified": True},
+            )
+            for media_id in media_ids
+        ],
+    )
+    job.refresh_counts()
+    JsonJobStore(state_dir).save(job)
+
+    manager = DownloadManager(
+        state_dir=state_dir,
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    try:
+        restored = manager.get_job(job.id)
+
+        assert restored.status == JobStatus.NEEDS_AUTH
+        assert restored.total_items == 2
+        assert restored.retryable is True
+    finally:
+        manager.shutdown()
+
+
+def test_numeric_profile_quarantine_migration_is_idempotent(tmp_path) -> None:
+    state_dir = tmp_path / "state"
+    output_dir = tmp_path / "downloads"
+    output_dir.mkdir(parents=True)
+    media_ids = ("7670000000000000001", "7670000000000000002")
+    output_paths = []
+    items = []
+    for media_id in media_ids:
+        output_path = output_dir / f"{media_id}.mp4"
+        output_path.write_bytes(b"preserved")
+        output_paths.append(str(output_path))
+        items.append(
+            DownloadItem(
+                id=media_id,
+                media_id=media_id,
+                source_url=f"https://www.douyin.com/video/{media_id}",
+                title=media_id,
+                status=ItemStatus.COMPLETED,
+                output_paths=[str(output_path)],
+            )
+        )
+    job = DownloadJob(
+        id="idempotent-legacy-profile",
+        source_url="https://www.douyin.com/user/legacy-profile",
+        platform=Platform.DOUYIN,
+        source_kind=SourceKind.PROFILE,
+        output_root=str(output_dir),
+        status=JobStatus.COMPLETED,
+        items=items,
+    )
+    job.refresh_counts()
+    JsonJobStore(state_dir).save(job)
+
+    first_manager = DownloadManager(
+        state_dir=state_dir,
+        default_output_root=output_dir,
+        max_workers=1,
+    )
+    try:
+        first = first_manager.get_job(job.id)
+    finally:
+        first_manager.shutdown()
+
+    second_manager = DownloadManager(
+        state_dir=state_dir,
+        default_output_root=output_dir,
+        max_workers=1,
+    )
+    try:
+        second = second_manager.get_job(job.id)
+
+        assert first.status == JobStatus.FAILED
+        assert first.retryable is False
+        assert first.revision == second.revision
+        assert first.finished_at == second.finished_at
+        assert [item.output_paths for item in second.items] == [
+            [output_paths[0]],
+            [output_paths[1]],
+        ]
+    finally:
+        second_manager.shutdown()
+
+
 def test_restore_rebinds_douyin_item_verification_to_canonical_video(
     tmp_path,
 ) -> None:

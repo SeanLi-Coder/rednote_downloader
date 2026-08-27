@@ -67,6 +67,12 @@ input:disabled {
   opacity: 0.58;
 }
 
+body.version-blocked button,
+body.version-blocked input {
+  pointer-events: none;
+  opacity: 0.58;
+}
+
 svg {
   display: block;
   fill: none;
@@ -212,10 +218,43 @@ svg {
   box-shadow: 0 0 0 4px rgba(255, 104, 125, 0.1);
 }
 
+.header-status {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.build-info {
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 10px;
+}
+
 .page-shell {
   width: min(1240px, calc(100% - 48px));
   margin: 0 auto;
   padding: 48px 0 72px;
+}
+
+.version-alert {
+  max-width: 970px;
+  margin: 0 auto 28px;
+  padding: 16px 18px;
+  color: #ffd7de;
+  background: rgba(255, 67, 101, 0.12);
+  border: 1px solid rgba(255, 104, 125, 0.38);
+  border-radius: var(--radius-md);
+}
+
+.version-alert strong {
+  display: block;
+  font-size: 14px;
+}
+
+.version-alert p {
+  margin: 5px 0 0;
+  color: #eeb8c2;
+  font-size: 12px;
 }
 
 .hero {
@@ -1364,6 +1403,7 @@ svg {
   }
 
   .brand small,
+  .build-info,
   .connection > span:last-child {
     display: none;
   }

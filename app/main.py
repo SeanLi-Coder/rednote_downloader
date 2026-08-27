@@ -1,21 +1,19 @@
 from __future__ import annotations
 
 import json
-import os
 import queue
-import shutil
-import subprocess
-import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Iterator
 
-from fastapi import Body, FastAPI, HTTPException
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi import Body, FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
+from .browser import open_chrome
+from .build_info import APP_ID, APP_VERSION, BUILD_ID, calculate_build_id
 from .downloader import DownloaderConfig
 from .models import DownloadJob
 from .platforms import UnsupportedUrlError, identify_url
@@ -98,7 +96,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Original Media Downloader",
-    version="1.0.0",
+    version=APP_VERSION,
     docs_url="/api/docs",
     redoc_url=None,
     lifespan=lifespan,
@@ -107,6 +105,15 @@ app.add_middleware(
     TrustedHostMiddleware,
     allowed_hosts=["127.0.0.1", "localhost", "testserver"],
 )
+
+
+@app.middleware("http")
+async def disable_runtime_asset_cache(request: Request, call_next):
+    response = await call_next(request)
+    if request.url.path == "/" or request.url.path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+    return response
 
 
 def _http_error(exc: Exception) -> HTTPException:
@@ -131,8 +138,16 @@ def _public_job(job: DownloadJob) -> DownloadJob:
 
 
 @app.get("/api/health")
-def health() -> dict[str, str]:
-    return {"status": "ok"}
+def health() -> dict[str, str | bool]:
+    source_build_id = calculate_build_id()
+    return {
+        "status": "ok",
+        "app_id": APP_ID,
+        "version": APP_VERSION,
+        "build_id": BUILD_ID,
+        "source_build_id": source_build_id,
+        "restart_required": source_build_id != BUILD_ID,
+    }
 
 
 @app.get("/api/config", response_model=AppConfig)
@@ -207,56 +222,7 @@ def cancel_job(job_id: str):
         raise _http_error(exc) from exc
 
 
-def _open_chrome(url: str) -> None:
-    if sys.platform == "darwin":
-        subprocess.Popen(
-            ["/usr/bin/open", "-a", "Google Chrome", url],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        return
-    if sys.platform.startswith("win"):
-        candidates = [
-            shutil.which("chrome.exe"),
-            shutil.which("chrome"),
-            str(
-                Path(os.environ.get("LOCALAPPDATA", ""))
-                / "Google/Chrome/Application/chrome.exe"
-            ),
-            str(
-                Path(os.environ.get("PROGRAMFILES", ""))
-                / "Google/Chrome/Application/chrome.exe"
-            ),
-            str(
-                Path(os.environ.get("PROGRAMFILES(X86)", ""))
-                / "Google/Chrome/Application/chrome.exe"
-            ),
-        ]
-        for candidate in candidates:
-            if candidate and Path(candidate).is_file():
-                subprocess.Popen(
-                    [candidate, url],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-                return
-        raise RuntimeError("Google Chrome was not found")
-    for executable in (
-        "google-chrome",
-        "google-chrome-stable",
-        "chromium",
-        "chromium-browser",
-    ):
-        try:
-            subprocess.Popen(
-                [executable, url],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            return
-        except FileNotFoundError:
-            continue
-    raise RuntimeError("Google Chrome was not found")
+_open_chrome = open_chrome
 
 
 @app.post("/api/jobs/{job_id}/verify")
@@ -315,8 +281,20 @@ def events() -> StreamingResponse:
 
 
 @app.get("/", include_in_schema=False)
-def index() -> FileResponse:
-    return FileResponse(STATIC_DIR / "index.html")
+def index() -> HTMLResponse:
+    content = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    content = (
+        content.replace("__APP_ID__", APP_ID)
+        .replace("__APP_VERSION__", APP_VERSION)
+        .replace("__BUILD_ID__", BUILD_ID)
+    )
+    return HTMLResponse(
+        content,
+        headers={
+            "Cache-Control": "no-store, max-age=0",
+            "Pragma": "no-cache",
+        },
+    )
 
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
