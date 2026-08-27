@@ -19,7 +19,7 @@ if ! python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 10))'; then
 fi
 
 if ! command -v ffprobe >/dev/null 2>&1; then
-  echo "Warning: FFprobe was not found. Douyin quality verification will fail."
+  echo "Warning: FFprobe was not found. Douyin and Xiaohongshu video quality verification will fail."
   echo "On macOS with Homebrew, run: brew install ffmpeg"
 fi
 if ! command -v ffmpeg >/dev/null 2>&1; then

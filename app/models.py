@@ -115,6 +115,8 @@ class DownloadJob(BaseModel):
     platform: Platform
     source_kind: SourceKind
     output_root: str
+    resolved_source_kind: SourceKind | None = None
+    resolved_source_id: str | None = None
     status: JobStatus = JobStatus.QUEUED
     author: str | None = None
     output_dir: str | None = None

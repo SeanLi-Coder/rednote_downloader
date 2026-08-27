@@ -406,6 +406,18 @@
     return { key, ...metadata[key] };
   }
 
+  function isProfileJob(job) {
+    const kind = String(firstDefined(job?.source_kind, job?.sourceKind, job?.kind, "")).toLowerCase();
+    if (["profile", "channel", "user"].includes(kind)) return true;
+    if (["item", "video", "note"].includes(kind)) return false;
+    const url = String(firstDefined(job?.source_url, job?.url, job?.profile_url, ""));
+    return /\/user\/[^/?#]+(?:[/?#]|$)/i.test(url);
+  }
+
+  function verificationTarget(job) {
+    return isProfileJob(job) ? "原主页" : "原视频";
+  }
+
   function getAuthor(job) {
     const author = firstDefined(job?.author_name, job?.author, job?.creator, job?.uploader, job?.username);
     if (author && typeof author === "object") {
@@ -437,7 +449,16 @@
   function itemTitle(item, index) {
     const path = firstDefined(item?.filename, item?.file_name, item?.output_path, item?.path, item?.output_paths?.[0]);
     const pathName = typeof path === "string" ? path.split(/[\\/]/).pop() : "";
-    return firstDefined(item?.title, item?.name, pathName, item?.description, `作品 ${String(index + 1).padStart(2, "0")}`);
+    const title = firstDefined(item?.title, item?.name, pathName, item?.description, `作品 ${String(index + 1).padStart(2, "0")}`);
+    const untitledLabels = {
+      "Untitled Douyin video": "无标题抖音视频",
+      "Untitled Douyin image": "无标题抖音图文",
+      "Untitled Xiaohongshu note": "小红书作品（标题解析中）"
+    };
+    if (typeof title === "string" && title.startsWith("Recovered Douyin files ")) {
+      return `已保留的旧抖音文件 ${title.slice("Recovered Douyin files ".length)}`;
+    }
+    return untitledLabels[title] || title;
   }
 
   function itemOutputPaths(item) {
@@ -479,43 +500,158 @@
     return parts.join(" · ");
   }
 
-  function itemError(item) {
+  function itemError(item, job) {
     if (!isRetryableItem(item)) return "";
     const fallback = canonicalStatus(item) === "cancelled" ? "下载已取消，可以重新尝试" : "下载失败，请重试";
-    return localizeRuntimeMessage(firstDefined(item?.error_message, item?.error, item?.reason, item?.message, fallback));
+    return localizeRuntimeMessage(firstDefined(item?.error_message, item?.error, item?.reason, item?.message, fallback), job);
   }
 
-  function localizeRuntimeMessage(value) {
+  function localizeRuntimeMessage(value, job = null) {
     let text = asText(value);
+    if (text.includes("Chrome cookies could not be read") && text.includes("Fully quit Chrome")) {
+      return "无法读取 Chrome Cookie。请完全退出 Chrome（包括所有窗口）后直接重试，或关闭“自动读取 Chrome Cookie”后重新创建任务；这不是验证码，不需要打开验证页面。";
+    }
+    if (text.includes("Chrome cookies could not be read, so anonymous access was used")) {
+      return "无法读取 Chrome Cookie，本次已明确回退到未登录模式；作品列表或受限的最高画质可能不完整。请检查 Chrome 登录状态后重新创建任务。";
+    }
     if (text.includes("legacy Douyin task contains an unverified numeric queue")) {
       return "这是旧版本留下的未验证数字队列，原视频身份已经无法安全恢复。程序已停止继续下载，也不会再打开错误的博主主页。请重新粘贴原始主页或视频链接创建新任务；已有文件不会被删除。";
     }
     if (text.includes("legacy Douyin item task must be rediscovered")) {
       return "这是旧版本错误展开的抖音单视频任务。程序已移除未下载的数字条目；请点击继续任务，从原视频链接重新解析。已有文件不会被删除。";
     }
+    if (text.includes("preserved legacy entry was not returned by the refreshed Douyin profile")) {
+      return "这条旧记录在重新解析主页时已不存在或不可见，程序已跳过且不会反复下载；以前保存的文件仍保留在磁盘中。";
+    }
+    if (text.includes("Douyin profile task contains legacy entries without complete verified author and media metadata")) {
+      return "这是旧版本留下的不完整抖音主页队列。程序已移除未保存的数字占位项；点击继续任务会从原主页重新解析，已有文件不会被删除。";
+    }
+    if (text.includes("This task was paused by an older version after a generic Douyin signing failure")) {
+      return "旧版本把普通抖音签名失败暂停成了验证码状态。请直接从原链接继续任务；只有抖音明确显示验证码或登录页面时才需要打开 Chrome。";
+    }
+    if (text.includes("legacy Douyin profile result must be manually reviewed")) {
+      return "这个旧版抖音主页结果缺少可靠的作者归属证据，已停止自动重试。请人工检查已有文件，并用原主页链接创建新任务。";
+    }
+    if (text.includes("legacy Douyin item task no longer has a verifiable original video URL")) {
+      return "这个旧版抖音单作品任务已经丢失可验证的原视频地址，程序不会猜测目标或继续下载。请重新粘贴原视频链接创建任务。";
+    }
+    if (
+      text.includes("Douyin profile discovery temporarily returned incomplete verified media metadata") ||
+      text.includes("Douyin returned profile media without complete verified metadata") ||
+      text.includes("Douyin returned the requested profile item without complete, verified media metadata") ||
+      text.includes("Douyin browser discovery returned media without complete verified metadata") ||
+      text.includes("Douyin returned incomplete profile media metadata") ||
+      text.includes("Douyin profile media metadata is incomplete") ||
+      text.includes("Douyin returned incomplete profile titles or ownership metadata") ||
+      text.includes("Douyin profile discovery temporarily returned no verified media items") ||
+      text.includes("Douyin profile discovery temporarily timed out or was rate-limited") ||
+      text.includes("Douyin profile discovery temporarily returned no verified profile-owned media") ||
+      text.includes("Douyin profile discovery temporarily returned a blank browser response") ||
+      text.includes("Douyin profile discovery was temporarily rate-limited")
+    ) {
+      return "抖音主页本次临时没有返回完整、可验证的作品信息。程序没有生成数字占位项，也没有下载低清文件；请稍等一两分钟后直接重试，这种临时响应不需要打开 Chrome 验证。";
+    }
+    if (text.includes("Douyin stopped returning new videos before the profile reported completion") || text.includes("Douyin reached the discovery safety limit before confirming the end of the profile")) {
+      return "抖音主页在确认列表结束前停止返回新作品。当前结果可能不完整，请稍后点击继续发现；已有成功记录不会重复下载。";
+    }
     if (text.includes("Douyin returned an uploader profile instead of the requested video")) {
-      return "抖音把目标视频错误返回成了博主主页，程序已拦截这些非目标作品。请在 Chrome 打开原视频完成验证后重试。";
+      return "抖音把目标视频错误返回成了博主主页，程序已拦截这些非目标作品。请直接从原视频链接重试；没有出现明确验证码或登录页面时，不需要打开 Chrome 验证。";
     }
     if (text.includes("Douyin could not create a verified signed request")) {
-      return "抖音暂时无法创建经过验证的请求。请在 Chrome 打开原视频，完成验证码或登录后再重试。";
+      return "这是旧版本把通用签名失败误标成了验证码。请直接从原链接重试；只有抖音明确显示验证码或登录页面时才需要打开 Chrome。";
+    }
+    if (text.includes("Douyin requires current Chrome cookies or an explicit verification")) {
+      return `抖音明确要求最新 Chrome Cookie、登录或验证码。请在 Chrome 打开${verificationTarget(job)}完成验证后再重试。`;
     }
     if (text.includes("Douyin temporarily limited the verified author-feed request") || text.includes("Douyin temporarily limited a signed request")) {
       return "抖音作者接口正在短时限流，程序已自动退避重试，仍未恢复。请等待一两分钟后重试；程序没有改下低清版本，也不需要先打开作者主页验证。";
+    }
+    if (text.includes("The site temporarily rate-limited the request")) {
+      return "网站正在短时限流。请等待一两分钟后直接重试；没有明确验证码或登录页面时，不需要打开 Chrome 验证。";
+    }
+    if (text.includes("Douyin signed discovery temporarily failed before a verified response")) {
+      return "抖音签名解析在拿到可验证响应前遇到临时网络或超时错误。请稍等后从原链接重试，不需要打开 Chrome 验证。";
+    }
+    if (text.includes("Douyin signed discovery failed before a verified response") || text.includes("Douyin signed data failed identity or integrity validation") || text.includes("Douyin author-feed data failed identity or integrity validation")) {
+      return "抖音响应未通过作品身份或完整性校验，程序已停止处理。请从原链接重试；没有明确验证码或登录页面时，不需要打开 Chrome 验证。";
+    }
+    if (text.includes("Douyin returned data for a different video while requesting") || text.includes("Douyin returned data from a different author while requesting") || text.includes("Douyin author-feed enrichment returned a different media identity")) {
+      return "抖音返回了其他视频或其他作者的数据，程序已拦截，未下载串号内容。请从原链接直接重试，不需要打开 Chrome 验证。";
+    }
+    if (text.includes("Douyin profile discovery redirected outside the trusted Douyin origin")) {
+      return "抖音主页意外跳转到了非抖音地址，程序已停止处理。请检查原链接后重试，不要在该跳转页面输入账号或验证码。";
+    }
+    if (text.includes("Douyin redirected to an explicit login or verification page")) {
+      return `抖音已明确跳转到登录或验证页面。请在 Chrome 打开${verificationTarget(job)}完成登录或验证码后重试。`;
     }
     if (text.includes("The site requires login, fresh browser cookies, or a CAPTCHA")) {
       return "该网站需要登录、最新的 Chrome Cookie 或验证码。请在 Chrome 完成验证后重试。";
     }
     if (text.includes("Douyin did not return a verified media identity")) {
-      return "抖音没有返回可验证的目标视频身份。请在 Chrome 打开原视频完成验证后重试。";
+      return "抖音没有返回可验证的目标视频身份。请稍等一两分钟后从原视频链接重试；没有出现明确验证码或登录页面时，不需要打开 Chrome 验证。";
     }
-    if (text.includes("Douyin could not verify the author's highest-quality renditions") || text.includes("Douyin could not find the requested video in its verified author feed")) {
+    if (text.includes("Douyin could not find the requested video in its verified author feed")) {
+      return "抖音作者接口本次没有返回目标视频，因此无法确认最高画质。请稍等一两分钟后直接重试；程序没有改下低清版本，也不需要先打开作者主页验证。";
+    }
+    if (text.includes("Douyin could not verify the author's highest-quality renditions")) {
       return "抖音暂时无法从该作者的已验证作品数据中确认最高画质。请在 Chrome 打开原视频完成验证码或登录后重试。";
+    }
+    if (text.includes("Douyin Live Photo highest quality could not be verified")) {
+      return "抖音 Live Photo 的全部清晰度档位本次未能验证完成。为避免误下低清版本，程序没有下载；请稍后重试。";
+    }
+    if (
+      text.includes("Xiaohongshu profile discovery temporarily returned a blank browser response") ||
+      text.includes("Xiaohongshu profile discovery was temporarily rate-limited") ||
+      text.includes("Xiaohongshu profile discovery temporarily timed out or was rate-limited") ||
+      text.includes("Xiaohongshu temporarily rate-limited the note request") ||
+      text.includes("Xiaohongshu returned no note data for the saved access token")
+    ) {
+      return "小红书本次遇到临时限流、超时或作品访问令牌失效。请稍等后直接重试；主页任务会重新解析令牌，没有明确验证码或登录页面时不需要打开 Chrome。";
+    }
+    if (text.includes("Xiaohongshu stopped returning new notes before the profile reported completion") || text.includes("Xiaohongshu reached the discovery safety limit before confirming the end of the profile")) {
+      return "小红书主页在确认列表结束前停止返回新作品。当前结果可能不完整，请稍后点击继续发现；已有成功记录不会重复下载。";
+    }
+    if (text.includes("Xiaohongshu profile discovery redirected outside the trusted Xiaohongshu origin")) {
+      return "小红书主页意外跳转到了非小红书地址，程序已停止处理。请检查原链接后重试，不要在该跳转页面输入账号或验证码。";
+    }
+    if (text.includes("Xiaohongshu item identity or profile membership could not be verified")) {
+      return "小红书任务中的作品身份或主页归属无法验证，疑似串号内容已在下载前拦截。请点击重试，程序会从你最初粘贴的链接重新解析；这不是验证码，不需要打开 Chrome。";
+    }
+    if (text.includes("Xiaohongshu discovery temporarily returned no trusted notes")) {
+      return "小红书本次没有返回可信作品，程序没有创建占位队列。请稍等后从原链接直接重试；没有明确验证码或登录页面时不需要打开 Chrome。";
+    }
+    if (text.includes("Xiaohongshu short-link retry could not verify the original resolved target")) {
+      return "这个小红书短链接的旧任务没有保存可验证的原目标。为防止短链变化后串号，程序已停止下载；请用最初的短链接创建新任务。";
+    }
+    if (text.includes("Xiaohongshu short-link retry resolved to a different note or profile")) {
+      return "小红书短链接这次跳到了与首次解析不同的作品或主页，程序已在下载前拦截。请检查原链接，不要重试这个已变化的目标。";
+    }
+    if (text.includes("Xiaohongshu discovery returned an untrusted, duplicate, or cross-wired note URL")) {
+      return "小红书解析结果包含不可信、重复或串号的作品地址，程序已在下载前全部拦截。请稍后从原链接重新解析。";
+    }
+    if (text.includes("Xiaohongshu returned a different note from the requested item") || text.includes("Xiaohongshu profile note belongs to a different or unverifiable author")) {
+      return "小红书返回了其他作品或其他作者的数据，程序已在请求媒体文件前拦截，没有下载串号内容。请从原链接直接重试，不需要打开 Chrome 验证。";
+    }
+    if (text.includes("Xiaohongshu note request redirected outside the trusted note origin") || text.includes("Untrusted Xiaohongshu media URL was blocked") || text.includes("Xiaohongshu media request redirected to an untrusted URL")) {
+      return "小红书页面或媒体地址跳转到了非可信站点，程序已在读取内容前拦截。请检查原链接后重试，不要在异常页面输入账号或验证码。";
+    }
+    if (text.includes("Xiaohongshu redirected to an explicit login or verification page") || text.includes("Xiaohongshu requires verification") || text.includes("Xiaohongshu requires a CAPTCHA or login") || text.includes("Xiaohongshu interrupted discovery with a verification challenge")) {
+      return `小红书已明确显示登录或验证码。请在 Chrome 打开${verificationTarget(job)}完成验证后重试。`;
+    }
+    if (text.includes("Highest-available image dimensions could not be verified") || text.includes("image below its declared")) {
+      return "小红书图片的实际分辨率低于作品声明值或无法验证。程序已拒绝保存低清占位图，并会尝试下一条原图地址；全部候选失败时请稍后重试。";
     }
     if (text.includes("FFprobe was found but could not be started")) {
       return "已找到 FFprobe，但程序无法启动它。请重新安装包含 FFprobe 的 FFmpeg，然后完全停止并重启程序。";
     }
     if (text.includes("FFprobe was not found")) {
-      return "未找到 FFprobe，无法验证抖音最高画质。请安装包含 FFprobe 的 FFmpeg，将其 bin 目录加入 PATH，然后完全停止并重启程序；macOS Homebrew 可运行 brew install ffmpeg。";
+      return "未找到 FFprobe，无法验证抖音或小红书视频的最高画质。请安装包含 FFprobe 的 FFmpeg，将其 bin 目录加入 PATH，然后完全停止并重启程序；macOS Homebrew 可运行 brew install ffmpeg。";
+    }
+    if (text.includes("Douyin media request redirected to an untrusted URL")) {
+      return "抖音最高画质媒体地址跳转到了非可信站点，程序已在读取文件前拦截，本次没有下载。请稍后从原视频链接重试。";
+    }
+    if (text.includes("Media server returned a video below its declared") || text.includes("Downloaded video bitrate was below its verified highest-quality media endpoint") || text.includes("Downloaded video size did not match its verified highest-quality media endpoint") || text.includes("Downloaded video duration did not match its verified media metadata") || text.includes("verified highest-quality video has no duration fingerprint") || text.includes("verified highest-quality video has no bitrate or complete size fingerprint") || text.includes("Media response changed after quality verification")) {
+      return "最终下载文件与已验证的最高画质不一致，可能被替换成低清流。程序已删除临时文件且不会覆盖已有文件；请稍后重试。";
     }
     if (!text.includes("Douyin media was discovered") && !text.includes("Douyin profile media was discovered")) return text;
 
@@ -533,6 +669,7 @@
       .replaceAll("FFprobe could not parse the media stream", "FFprobe 无法解析媒体流")
       .replaceAll("FFprobe returned no video dimensions", "FFprobe 未返回视频分辨率")
       .replaceAll("FFprobe returned no media duration", "FFprobe 未返回媒体时长")
+      .replaceAll("FFprobe returned no bitrate or complete media size", "FFprobe 未返回码率或完整媒体大小")
       .replaceAll("media duration did not match the requested Douyin item", "媒体时长与目标抖音作品不匹配")
       .replaceAll("no verified media identity was available", "没有可验证的媒体身份")
       .replaceAll("no playable candidate was returned", "未返回可播放的候选媒体")
@@ -730,10 +867,26 @@
     });
     if (activeItem) {
       const phaseMessage = activeItem?.progress?.filename;
-      if (typeof phaseMessage === "string" && phaseMessage.startsWith("Checking Douyin quality")) {
-        return phaseMessage
-          .replace("Checking Douyin quality", "正在检测抖音最高画质")
-          .replace(": default", ": 原始档");
+      if (typeof phaseMessage === "string") {
+        const retryMatch = phaseMessage.match(
+          /^Retrying Douyin quality (\S+) after a temporary network error \((\d+\/\d+)\)$/
+        );
+        if (retryMatch) {
+          const ratio = retryMatch[1] === "default" ? "原始档" : retryMatch[1];
+          return `抖音 ${ratio} 画质探测遇到临时网络错误，正在重试（${retryMatch[2]}）`;
+        }
+        const phasePrefixes = [
+          ["Checking Douyin Live Photo quality", "正在检测抖音 Live Photo 最高画质"],
+          ["Checking Douyin direct quality", "正在检测抖音直连候选画质"],
+          ["Checking Douyin quality", "正在检测抖音最高画质"]
+        ];
+        const phasePrefix = phasePrefixes.find(([prefix]) => phaseMessage.startsWith(prefix));
+        if (phasePrefix) {
+          return phaseMessage
+            .replace(phasePrefix[0], phasePrefix[1])
+            .replace(": default", ": 原始档")
+            .replaceAll("x", "×");
+        }
       }
       const index = Math.max(0, getItems(job).indexOf(activeItem));
       return `正在处理：${itemTitle(activeItem, index)}`;
@@ -783,7 +936,7 @@
       status.classList.add(tone);
       status.textContent = statusLabel(item);
       node.querySelector(".item-progress span").style.width = `${percent}%`;
-      node.querySelector(".item-error").textContent = itemError(item);
+      node.querySelector(".item-error").textContent = itemError(item, job);
 
       const outputPaths = itemOutputPaths(item);
       const files = node.querySelector(".item-files");
@@ -897,15 +1050,18 @@
         job?.error_message,
         job?.error,
         "请打开对应网站，完成登录或验证码后回到这里继续。"
-      ));
+      ), job);
+      elements.authOpenButton.textContent = isProfileJob(job)
+        ? "打开 Chrome 验证主页"
+        : "打开 Chrome 验证视频";
     }
     const items = getItems(job);
     const discoveryFailureMessage = canonicalStatus(job) === "failed" && (items.length === 0 || job?.discovery_complete === false)
-      ? localizeRuntimeMessage(firstDefined(job?.error_message, job?.error, job?.message))
+      ? localizeRuntimeMessage(firstDefined(job?.error_message, job?.error, job?.message), job)
       : "";
     const discoveryIncomplete = job?.discovery_complete === false;
     const cookieFallback = Boolean(job?.cookie_fallback_used);
-    const warningMessage = discoveryFailureMessage || asText(job?.warning);
+    const warningMessage = discoveryFailureMessage || localizeRuntimeMessage(job?.warning, job);
     const hasWarning = (discoveryIncomplete && (!isRunning(job) || Boolean(warningMessage))) || cookieFallback || Boolean(warningMessage);
     elements.warningAlert.hidden = !hasWarning;
     if (hasWarning) {
@@ -1064,10 +1220,11 @@
   async function openVerification() {
     const id = state.selectedJobId;
     if (state.versionBlocked || !id || elements.authOpenButton.disabled) return;
+    const job = state.jobs.get(String(id));
     elements.authOpenButton.disabled = true;
     try {
       await api(`/api/jobs/${encodeURIComponent(id)}/verify`, { method: "POST" });
-      showToast("已在 Chrome 打开验证页面；完成后回到这里继续重试");
+      showToast(`已在 Chrome 打开${verificationTarget(job)}；完成后回到这里继续重试`);
     } catch (error) {
       showToast(`无法打开 Chrome：${error.message}`, "error");
     } finally {

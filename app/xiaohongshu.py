@@ -5,10 +5,11 @@ import json
 import re
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from html.parser import HTMLParser
 from http.cookiejar import CookieJar
 from typing import Any, Callable, Iterable
-from urllib.parse import urlencode, urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlsplit, urlunsplit
 
 from yt_dlp import YoutubeDL
 from yt_dlp.cookies import extract_cookies_from_browser
@@ -16,7 +17,12 @@ from yt_dlp.networking import Request
 from yt_dlp.utils import DownloadError, js_to_json
 
 from .browser import chrome_user_agent
-from .errors import AuthenticationRequiredError, DiscoveryError, DownloadCancelledError
+from .errors import (
+    AuthenticationRequiredError,
+    DiscoveryError,
+    DownloadCancelledError,
+    TemporaryAccessError,
+)
 
 
 AUTH_TEXT_PATTERNS = (
@@ -26,16 +32,25 @@ AUTH_TEXT_PATTERNS = (
     "安全验证",
     "验证码",
     "请完成验证",
-    "访问频繁",
-    "网络环境存在风险",
     "登录后查看",
+    "请登录",
+    "登录后继续",
 )
+TRANSIENT_TEXT_PATTERNS = (
+    "访问频繁",
+    "请求频繁",
+    "too many requests",
+    "try again later",
+    "网络环境存在风险",
+)
+EXPLICIT_AUTH_PATH_MARKERS = ("/captcha", "/login", "/passport/", "/verify")
 
 
 @dataclass(slots=True)
 class XiaohongshuProfile:
     author: str
     note_urls: list[str]
+    profile_id: str
     cookie_fallback_used: bool = False
     warning: str | None = None
     discovery_complete: bool = True
@@ -53,6 +68,9 @@ class RemoteAsset:
     height: int | None = None
     size: int | None = None
     format_id: str | None = None
+    video_uri: str | None = None
+    duration: float | None = None
+    bit_rate: int | None = None
 
 
 @dataclass(slots=True)
@@ -61,6 +79,7 @@ class XiaohongshuNote:
     title: str
     author: str | None
     upload_date: str | None
+    author_id: str | None = None
     images: list[RemoteAsset] = field(default_factory=list)
     videos: list[RemoteAsset] = field(default_factory=list)
     live_photos: list[RemoteAsset] = field(default_factory=list)
@@ -81,9 +100,162 @@ class _QuietCookieLogger:
         pass
 
 
+class _VisibleTextParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._hidden_depth = 0
+        self.values: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        del attrs
+        if tag.lower() in {"script", "style", "template", "noscript"}:
+            self._hidden_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if (
+            tag.lower() in {"script", "style", "template", "noscript"}
+            and self._hidden_depth
+        ):
+            self._hidden_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if not self._hidden_depth and data.strip():
+            self.values.append(data)
+
+
+def _visible_text(value: str) -> str:
+    parser = _VisibleTextParser()
+    try:
+        parser.feed(value)
+        parser.close()
+    except Exception:
+        return ""
+    return re.sub(r"\s+", " ", " ".join(parser.values)).lower()
+
+
 def _looks_like_auth_page(text: str) -> bool:
-    lowered = text.lower()
+    lowered = _visible_text(text)
     return any(pattern in lowered for pattern in AUTH_TEXT_PATTERNS)
+
+
+def _looks_like_transient_limit(text: str) -> bool:
+    lowered = _visible_text(text)
+    return any(pattern in lowered for pattern in TRANSIENT_TEXT_PATTERNS)
+
+
+def _is_trusted_xiaohongshu_page_url(value: str) -> bool:
+    try:
+        parsed = urlsplit(value)
+        hostname = (parsed.hostname or "").lower()
+        return (
+            parsed.scheme == "https"
+            and parsed.username is None
+            and parsed.password is None
+            and (
+                hostname == "xiaohongshu.com"
+                or hostname.endswith(".xiaohongshu.com")
+            )
+            and parsed.port in {None, 443}
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_explicit_xiaohongshu_auth_url(value: str) -> bool:
+    if not _is_trusted_xiaohongshu_page_url(value):
+        return False
+    try:
+        path = unquote(urlsplit(value).path).lower()
+    except (TypeError, ValueError):
+        return False
+    return any(marker in path for marker in EXPLICIT_AUTH_PATH_MARKERS)
+
+
+def is_trusted_xiaohongshu_note_url(value: str) -> bool:
+    if not _is_trusted_xiaohongshu_page_url(value):
+        return False
+    try:
+        path = urlsplit(value).path.rstrip("/")
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        re.fullmatch(
+            r"/(?:explore|discovery/item)/[0-9a-f]+",
+            path,
+            re.IGNORECASE,
+        )
+    )
+
+
+def xiaohongshu_note_id(value: str) -> str | None:
+    if not is_trusted_xiaohongshu_note_url(value):
+        return None
+    try:
+        match = re.fullmatch(
+            r"/(?:explore|discovery/item)/([0-9a-f]+)",
+            urlsplit(value).path.rstrip("/"),
+            re.IGNORECASE,
+        )
+    except (TypeError, ValueError):
+        return None
+    return match.group(1).lower() if match else None
+
+
+def is_trusted_xiaohongshu_profile_url(value: str) -> bool:
+    if not _is_trusted_xiaohongshu_page_url(value):
+        return False
+    try:
+        path = urlsplit(value).path.rstrip("/")
+    except (TypeError, ValueError):
+        return False
+    return bool(re.fullmatch(r"/user/profile/[^/]+", path))
+
+
+def xiaohongshu_profile_id(value: str) -> str | None:
+    if not is_trusted_xiaohongshu_profile_url(value):
+        return None
+    try:
+        match = re.fullmatch(
+            r"/user/profile/([^/]+)",
+            urlsplit(value).path.rstrip("/"),
+        )
+    except (TypeError, ValueError):
+        return None
+    return unquote(match.group(1)).strip() if match else None
+
+
+def is_trusted_xiaohongshu_asset_url(value: str) -> bool:
+    if not isinstance(value, str) or not value or len(value) > 8_192:
+        return False
+    try:
+        parsed = urlsplit(value)
+        hostname = (parsed.hostname or "").lower().rstrip(".")
+        if (
+            parsed.scheme != "https"
+            or parsed.username is not None
+            or parsed.password is not None
+            or not hostname
+            or not (
+                hostname == "xhscdn.com"
+                or hostname.endswith(".xhscdn.com")
+                or hostname == "xiaohongshu.com"
+                or hostname.endswith(".xiaohongshu.com")
+            )
+        ):
+            return False
+        return parsed.port in {None, 443}
+    except (TypeError, ValueError):
+        return False
+
+
+def _without_xsec_query(value: str) -> str:
+    parsed = urlsplit(value)
+    filtered = [
+        (name, item)
+        for name, item in parse_qsl(parsed.query, keep_blank_values=True)
+        if name.lower() not in {"xsec_token", "xsec_source"}
+    ]
+    return urlunsplit(parsed._replace(query=urlencode(filtered, doseq=True)))
 
 
 def _cookie_jar_to_playwright(cookie_jar: CookieJar) -> list[dict[str, Any]]:
@@ -198,7 +370,10 @@ def _profile_note_tokens(page: Any) -> list[tuple[str, str | None]]:
             r"[0-9a-f]+", note_id, re.IGNORECASE
         ):
             result.append(
-                (note_id, token if isinstance(token, str) and token else None)
+                (
+                    note_id.lower(),
+                    token if isinstance(token, str) and token else None,
+                )
             )
     return result
 
@@ -232,6 +407,10 @@ def discover_profile(
 ) -> XiaohongshuProfile:
     """Discover all currently visible notes from a Xiaohongshu profile."""
 
+    profile_id = xiaohongshu_profile_id(url)
+    if not profile_id:
+        raise DiscoveryError("Invalid or untrusted Xiaohongshu profile URL")
+
     try:
         from playwright.sync_api import Error as PlaywrightError
         from playwright.sync_api import sync_playwright
@@ -249,11 +428,11 @@ def discover_profile(
             )
         except Exception as exc:
             if not allow_cookie_fallback:
-                raise AuthenticationRequiredError(
+                raise TemporaryAccessError(
                     "Chrome cookies could not be read. Fully quit Chrome and retry, "
                     "approve any system cookie-access prompt, or disable Chrome Cookie "
-                    "in settings to continue explicitly without login and create a new task.",
-                    verification_url=url,
+                    "in settings to continue explicitly without login and create a new "
+                    "task. Opening a verification page is not required.",
                 ) from exc
             cookie_fallback_used = True
 
@@ -275,17 +454,33 @@ def discover_profile(
                 )
                 page.wait_for_timeout(2_000)
 
-                if page.locator("body").count() == 0:
+                if _is_explicit_xiaohongshu_auth_url(page.url):
                     raise AuthenticationRequiredError(
-                        "Xiaohongshu returned a blank verification response. Open this "
-                        "profile in Chrome, finish any CAPTCHA or login, then retry.",
+                        "Xiaohongshu redirected to an explicit login or verification "
+                        "page. Complete it in Chrome and retry.",
                         verification_url=url,
+                    )
+                if not _is_trusted_xiaohongshu_page_url(page.url):
+                    raise DiscoveryError(
+                        "Xiaohongshu profile discovery redirected outside the trusted "
+                        "Xiaohongshu origin"
+                    )
+                if page.locator("body").count() == 0:
+                    raise TemporaryAccessError(
+                        "Xiaohongshu profile discovery temporarily returned a blank "
+                        "browser response. Retry after a short wait; Chrome "
+                        "verification is not required."
                     )
                 try:
                     body_text = page.locator("body").inner_text(timeout=5_000)
                 except Exception:
                     body_text = page.content()
-                if _looks_like_auth_page(body_text) or "captcha" in page.url.lower():
+                if _looks_like_transient_limit(body_text):
+                    raise TemporaryAccessError(
+                        "Xiaohongshu profile discovery was temporarily rate-limited. "
+                        "Retry after a short wait; Chrome verification is not required."
+                    )
+                if _looks_like_auth_page(body_text):
                     raise AuthenticationRequiredError(
                         "Xiaohongshu requires verification. Open this profile in Chrome, "
                         "finish the CAPTCHA or login, then retry the task.",
@@ -314,13 +509,15 @@ def discover_profile(
                             discovered.setdefault(note_id, note_url)
                     for href in hrefs:
                         absolute = urljoin(page.url, href)
+                        if not is_trusted_xiaohongshu_note_url(absolute):
+                            continue
                         match = re.search(
                             r"/(?:explore|discovery/item)/([0-9a-f]+)",
                             urlsplit(absolute).path,
                             re.IGNORECASE,
                         )
-                        if match:
-                            note_id = match.group(1)
+                        note_id = match.group(1).lower() if match else ""
+                        if note_id and note_id in discovered:
                             if "xsec_token=" in urlsplit(absolute).query:
                                 discovered[note_id] = absolute
                             else:
@@ -336,17 +533,34 @@ def discover_profile(
                         discovery_warning = (
                             "Xiaohongshu stopped returning new notes before the profile "
                             "reported completion. The discovered list may be incomplete; "
-                            "retry discovery after checking Chrome verification."
+                            "retry discovery after a short wait."
                         )
                         break
                     page.mouse.wheel(0, 5_000)
                     page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                     page.wait_for_timeout(1_000)
 
+                    if _is_explicit_xiaohongshu_auth_url(page.url):
+                        raise AuthenticationRequiredError(
+                            "Xiaohongshu redirected to an explicit login or verification "
+                            "page. Complete it in Chrome and retry.",
+                            verification_url=url,
+                        )
+                    if not _is_trusted_xiaohongshu_page_url(page.url):
+                        raise DiscoveryError(
+                            "Xiaohongshu profile discovery redirected outside the "
+                            "trusted Xiaohongshu origin"
+                        )
                     try:
                         updated_body = page.locator("body").inner_text(timeout=2_000)
                     except Exception:
                         updated_body = ""
+                    if _looks_like_transient_limit(updated_body):
+                        raise TemporaryAccessError(
+                            "Xiaohongshu profile discovery was temporarily rate-limited. "
+                            "Retry after a short wait; Chrome verification is not "
+                            "required."
+                        )
                     if _looks_like_auth_page(updated_body):
                         raise AuthenticationRequiredError(
                             "Xiaohongshu interrupted discovery with a verification "
@@ -367,20 +581,26 @@ def discover_profile(
                 return XiaohongshuProfile(
                     author=author,
                     note_urls=list(discovered.values()),
+                    profile_id=profile_id,
                     cookie_fallback_used=cookie_fallback_used,
                     warning=discovery_warning,
                     discovery_complete=discovery_complete,
                 )
             finally:
                 browser.close()
-    except (AuthenticationRequiredError, DownloadCancelledError):
+    except (
+        AuthenticationRequiredError,
+        DownloadCancelledError,
+        TemporaryAccessError,
+    ):
         raise
     except PlaywrightError as exc:
         message = str(exc)
-        if _looks_like_auth_page(message) or "timeout" in message.lower():
-            raise AuthenticationRequiredError(
-                "Xiaohongshu requires verification in Chrome before this task can continue.",
-                verification_url=url,
+        if "timeout" in message.lower() or _looks_like_transient_limit(message):
+            raise TemporaryAccessError(
+                "Xiaohongshu profile discovery temporarily timed out or was "
+                "rate-limited. Retry after a short wait; Chrome verification is not "
+                "required."
             ) from exc
         raise DiscoveryError(
             f"Xiaohongshu browser discovery failed: {message}"
@@ -426,6 +646,17 @@ def _read_page(ydl: YoutubeDL, url: str) -> str:
         )
     )
     try:
+        final_url = str(getattr(response, "url", None) or url)
+        if _is_explicit_xiaohongshu_auth_url(final_url):
+            raise AuthenticationRequiredError(
+                "Xiaohongshu redirected to an explicit login or verification page. "
+                "Complete it in Chrome and retry.",
+                verification_url=url,
+            )
+        if not is_trusted_xiaohongshu_note_url(final_url):
+            raise DiscoveryError(
+                "Xiaohongshu note request redirected outside the trusted note origin"
+            )
         data = response.read()
         content_type = response.headers.get("Content-Type") or ""
         encoding_match = re.search(r"charset=([^;\s]+)", content_type, re.IGNORECASE)
@@ -454,7 +685,7 @@ def _unique_urls(values: Iterable[Any]) -> list[str]:
     result: list[str] = []
     seen: set[str] = set()
     for value in values:
-        if not isinstance(value, str) or not value.startswith(("http://", "https://")):
+        if not is_trusted_xiaohongshu_asset_url(value):
             continue
         if value not in seen:
             seen.add(value)
@@ -472,7 +703,10 @@ def _untransformed_xhs_url(url: str) -> str | None:
 
 def _direct_xhs_image_urls(url: str) -> list[str]:
     parsed = urlsplit(url)
-    if not (parsed.hostname or "").lower().endswith("xhscdn.com"):
+    hostname = (parsed.hostname or "").lower().rstrip(".")
+    if not is_trusted_xiaohongshu_asset_url(url) or not (
+        hostname == "xhscdn.com" or hostname.endswith(".xhscdn.com")
+    ):
         return []
     parts = parsed.path.lstrip("/").split("/")
     if len(parts) < 3:
@@ -618,6 +852,7 @@ def _live_photo_asset(image: dict[str, Any], index: int) -> RemoteAsset | None:
 
 
 def _upload_date(note: dict[str, Any]) -> str | None:
+    china_time = timezone(timedelta(hours=8))
     for key in ("time", "createTime", "lastUpdateTime", "timestamp"):
         value = _as_int(note.get(key))
         if not value:
@@ -625,11 +860,6 @@ def _upload_date(note: dict[str, Any]) -> str | None:
         if value > 10_000_000_000:
             value //= 1000
         with contextlib.suppress(ValueError, OSError, OverflowError):
-            china_time = timezone.utc
-            with contextlib.suppress(ImportError):
-                from zoneinfo import ZoneInfo
-
-                china_time = ZoneInfo("Asia/Shanghai")
             return datetime.fromtimestamp(value, tz=china_time).strftime("%Y-%m-%d")
     return None
 
@@ -641,6 +871,8 @@ def parse_note(
     use_browser_cookies: bool = True,
     allow_cookie_fallback: bool = False,
 ) -> tuple[XiaohongshuNote, bool]:
+    if not is_trusted_xiaohongshu_note_url(url):
+        raise DiscoveryError("Invalid or untrusted Xiaohongshu note URL")
     match = re.search(
         r"/(?:explore|discovery/item)/([0-9a-f]+)", urlsplit(url).path, re.IGNORECASE
     )
@@ -674,17 +906,22 @@ def parse_note(
             )
         )
         if use_browser_cookies and cookie_error and not allow_cookie_fallback:
-            raise AuthenticationRequiredError(
+            raise TemporaryAccessError(
                 "Chrome cookies could not be read. Fully quit Chrome and retry, "
                 "approve any system cookie-access prompt, or disable Chrome Cookie "
-                "in settings to continue explicitly without login and create a new task.",
-                verification_url=url,
+                "in settings to continue explicitly without login and create a new "
+                "task. Opening a verification page is not required.",
             ) from exc
         if not use_browser_cookies or not cookie_error:
             raise
         html = load(False)
         cookie_fallback_used = True
 
+    if _looks_like_transient_limit(html):
+        raise TemporaryAccessError(
+            "Xiaohongshu temporarily rate-limited the note request. Retry after a "
+            "short wait; Chrome verification is not required."
+        )
     if _looks_like_auth_page(html):
         raise AuthenticationRequiredError(
             "Xiaohongshu requires a CAPTCHA or login. Complete it in Chrome and retry.",
@@ -699,19 +936,39 @@ def parse_note(
         raise DiscoveryError(f"Could not parse Xiaohongshu note data: {exc}") from exc
     if not isinstance(note, dict) or not note:
         if "xsec_token=" in urlsplit(url).query:
-            raise AuthenticationRequiredError(
-                "Xiaohongshu returned no note data. The saved access token may have "
-                "expired; refresh the profile after completing Chrome verification.",
-                verification_url=url,
-            )
+            canonical_url = _without_xsec_query(url)
+            if canonical_url != url:
+                try:
+                    refreshed_note, refreshed_fallback = parse_note(
+                        canonical_url,
+                        cookie_profile=cookie_profile,
+                        use_browser_cookies=use_browser_cookies,
+                        allow_cookie_fallback=allow_cookie_fallback,
+                    )
+                except DiscoveryError as exc:
+                    raise TemporaryAccessError(
+                        "Xiaohongshu returned no note data for the saved access token "
+                        "or the canonical note URL. Retry or create a new task from a "
+                        "fresh link; Chrome verification is not required unless "
+                        "Xiaohongshu explicitly shows a CAPTCHA or login page."
+                    ) from exc
+                return refreshed_note, cookie_fallback_used or refreshed_fallback
         raise DiscoveryError(
             "Xiaohongshu returned no note data. The note may be private, deleted, "
             "or require verification."
         )
 
     user = note.get("user") if isinstance(note.get("user"), dict) else {}
-    title = str(note.get("title") or note.get("desc") or note_id).strip()
-    title = re.sub(r"\s+", " ", title)[:240] or note_id
+    author_id = ""
+    for key in ("userId", "user_id", "userid", "id"):
+        value = user.get(key)
+        if isinstance(value, str) and value.strip():
+            author_id = value.strip()
+            break
+    title = str(note.get("title") or note.get("desc") or "").strip()
+    title = re.sub(r"\s+", " ", title)[:240]
+    if not title or title == note_id or title.isdigit():
+        title = "Untitled Xiaohongshu note"
     images: list[RemoteAsset] = []
     live_photos: list[RemoteAsset] = []
     for index, image in enumerate(note.get("imageList") or [], start=1):
@@ -739,6 +996,7 @@ def parse_note(
             author=str(user.get("nickname") or user.get("nickName") or "").strip()
             or None,
             upload_date=_upload_date(note),
+            author_id=author_id or None,
             images=images,
             videos=_video_assets(note),
             live_photos=live_photos,

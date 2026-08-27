@@ -8,6 +8,7 @@ import pytest
 from app.downloader import DiscoveryResult, DownloadOutcome, EngineEvent
 from app.errors import (
     AuthenticationRequiredError,
+    DiscoveryError,
     MediaDownloadError,
     TemporaryAccessError,
 )
@@ -22,7 +23,14 @@ from app.models import (
     TransferProgress,
 )
 from app.storage import JsonJobStore
-from app.task_manager import DownloadManager, ItemNotRetryableError
+from app.task_manager import (
+    DOUYIN_PROFILE_REDISCOVERY_ITEM_MARKER,
+    DOUYIN_PROFILE_REDISCOVERY_MESSAGE,
+    DOUYIN_UNVERIFIABLE_QUEUE_ERROR,
+    DownloadManager,
+    ItemNotRetryableError,
+    XIAOHONGSHU_BINDING_REDISCOVERY_MARKER,
+)
 
 
 class FakeEngine:
@@ -121,10 +129,17 @@ class PartialAssetEngine:
             items=[
                 DownloadItem(
                     id="note-1",
-                    media_id="note-1",
-                    source_url="https://www.xiaohongshu.com/explore/note1",
+                    media_id="6411cf99000000001300b6d9",
+                    source_url=(
+                        "https://www.xiaohongshu.com/explore/"
+                        "6411cf99000000001300b6d9"
+                    ),
                     title="Multi image note",
                     media_type=MediaType.IMAGE,
+                    metadata={
+                        "xiaohongshu_profile_id": "example",
+                        "profile_note_membership_verified": True,
+                    },
                 )
             ],
         )
@@ -153,13 +168,18 @@ class RefreshFailureEngine:
             items=[
                 DownloadItem(
                     id="stable-note",
-                    media_id="stable-note",
+                    media_id="6411cf99000000001300b6d9",
                     source_url=(
-                        "https://www.xiaohongshu.com/explore/stable-note"
+                        "https://www.xiaohongshu.com/explore/"
+                        "6411cf99000000001300b6d9"
                         f"?xsec_token=fresh-{self.discovery_calls}"
                     ),
                     title="Refreshable note",
                     media_type=MediaType.IMAGE,
+                    metadata={
+                        "xiaohongshu_profile_id": "example",
+                        "profile_note_membership_verified": True,
+                    },
                 )
             ],
         )
@@ -186,18 +206,27 @@ class SelectiveProfileRetryEngine:
         self.download_calls: list[str] = []
 
     def discover(self, url, platform, kind, *, should_cancel):
+        media_ids = {
+            "first-note": "6411cf99000000001300b6d9",
+            "second-note": "6411cf99000000001300b6da",
+        }
         return DiscoveryResult(
             author="Selective Author",
             items=[
                 DownloadItem(
                     id=item_id,
-                    media_id=item_id,
+                    media_id=media_ids[item_id],
                     source_url=(
-                        f"https://www.xiaohongshu.com/explore/{item_id}"
+                        "https://www.xiaohongshu.com/explore/"
+                        f"{media_ids[item_id]}"
                         "?xsec_token=fresh"
                     ),
                     title=item_id,
                     media_type=MediaType.IMAGE,
+                    metadata={
+                        "xiaohongshu_profile_id": "example",
+                        "profile_note_membership_verified": True,
+                    },
                 )
                 for item_id in ("first-note", "second-note")
             ],
@@ -223,6 +252,26 @@ class SelectiveProfileRetryEngine:
 def wait_for_job(manager: DownloadManager, job_id: str):
     manager._futures[job_id].result(timeout=5)
     return manager.get_job(job_id)
+
+
+def complete_douyin_profile_metadata(
+    profile_url: str,
+    media_id: str,
+    *,
+    title: str = "Verified profile video",
+) -> dict:
+    owner_id = profile_url.split("/user/", 1)[1].split("?", 1)[0]
+    return {
+        "profile_url": profile_url,
+        "profile_owner_verified": True,
+        "douyin_profile_media": {
+            "media_id": media_id,
+            "owner_id": owner_id,
+            "media_kind": "video",
+            "video_uri": f"verified-profile-video-{media_id}",
+            "title": title,
+        },
+    }
 
 
 def test_douyin_item_discovery_blocks_unexpected_profile_expansion(
@@ -264,11 +313,942 @@ def test_douyin_item_discovery_blocks_unexpected_profile_expansion(
         blocked = wait_for_job(manager, created.id)
 
         assert blocked.source_kind == SourceKind.ITEM
-        assert blocked.status == JobStatus.NEEDS_AUTH
+        assert blocked.status == JobStatus.FAILED
         assert blocked.items == []
         assert blocked.total_items == 0
-        assert blocked.verification_url == source_url
+        assert blocked.verification_url is None
+        assert blocked.auth_message is None
         assert "uploader profile" in (blocked.error or "")
+    finally:
+        manager.shutdown()
+
+
+def test_douyin_profile_discovery_rejects_numeric_placeholders_before_commit(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    profile_url = "https://www.douyin.com/user/verified-profile-owner"
+    media_ids = [str(7670000000000000000 + index) for index in range(151)]
+
+    class NumericPlaceholderEngine:
+        def __init__(self) -> None:
+            self.download_calls: list[str] = []
+
+        def discover(self, url, platform, kind, *, should_cancel):
+            assert url == profile_url
+            assert platform == Platform.DOUYIN
+            assert kind == SourceKind.PROFILE
+            return DiscoveryResult(
+                author="Verified author",
+                items=[
+                    DownloadItem(
+                        id=media_id,
+                        media_id=media_id,
+                        source_url=f"https://www.douyin.com/video/{media_id}",
+                        title=media_id,
+                        media_type=MediaType.VIDEO,
+                        metadata={
+                            "profile_url": profile_url,
+                            "profile_owner_verified": True,
+                        },
+                    )
+                    for media_id in media_ids
+                ],
+            )
+
+        def download_item(
+            self,
+            item,
+            platform,
+            output_dir,
+            *,
+            callback,
+            should_cancel,
+        ):
+            self.download_calls.append(item.id)
+            raise AssertionError("numeric placeholders must not reach download_item")
+
+    manager = DownloadManager(
+        state_dir=tmp_path / "state",
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    engine = NumericPlaceholderEngine()
+    events: list[str] = []
+    manager.add_listener(lambda event, job: events.append(event.event))
+    monkeypatch.setattr(manager, "_engine_for_job", lambda job: engine)
+
+    try:
+        created = manager.create_job(profile_url, auto_start=True)
+        blocked = wait_for_job(manager, created.id)
+
+        assert blocked.status == JobStatus.FAILED
+        assert blocked.items == []
+        assert blocked.total_items == 0
+        assert blocked.discovery_complete is False
+        assert blocked.verification_url is None
+        assert blocked.auth_message is None
+        assert blocked.retryable is True
+        assert "incomplete verified media metadata" in (blocked.error or "")
+        assert engine.download_calls == []
+        assert "discovered" not in events
+        persisted = JsonJobStore(tmp_path / "state").get(created.id)
+        assert persisted.items == []
+    finally:
+        manager.shutdown()
+
+
+def test_douyin_profile_discovery_rejects_empty_result_as_temporary() -> None:
+    profile_url = "https://www.douyin.com/user/verified-profile-owner"
+    job = DownloadJob(
+        id="empty-profile-result",
+        source_url=profile_url,
+        platform=Platform.DOUYIN,
+        source_kind=SourceKind.PROFILE,
+        output_root="/tmp/downloads",
+    )
+
+    with pytest.raises(TemporaryAccessError, match="no verified media items"):
+        DownloadManager._validate_discovery_result(
+            job,
+            DiscoveryResult(author="Verified author", items=[]),
+        )
+
+
+@pytest.mark.parametrize(
+    ("source_url", "media_id"),
+    [
+        (
+            "https://evil.example/explore/6411cf99000000001300b6d9",
+            "6411cf99000000001300b6d9",
+        ),
+        (
+            "http://www.xiaohongshu.com/explore/6411cf99000000001300b6d9",
+            "6411cf99000000001300b6d9",
+        ),
+        (
+            "https://www.xiaohongshu.com/explore/6411cf99000000001300b6d9",
+            "different-id",
+        ),
+    ],
+)
+def test_xiaohongshu_discovery_rejects_untrusted_or_cross_wired_items(
+    source_url: str,
+    media_id: str,
+) -> None:
+    job = DownloadJob(
+        id="xhs-profile-validation",
+        source_url="https://www.xiaohongshu.com/user/profile/expected",
+        platform=Platform.XIAOHONGSHU,
+        source_kind=SourceKind.PROFILE,
+        output_root="/tmp/downloads",
+    )
+
+    with pytest.raises(DiscoveryError, match="cross-wired"):
+        DownloadManager._validate_discovery_result(
+            job,
+            DiscoveryResult(
+                author="Test Author",
+                items=[
+                    DownloadItem(
+                        id="candidate",
+                        media_id=media_id,
+                        source_url=source_url,
+                    )
+                ],
+            ),
+        )
+
+
+def test_xiaohongshu_discovery_accepts_one_bound_tokenized_note() -> None:
+    note_id = "6411cf99000000001300b6d9"
+    job = DownloadJob(
+        id="xhs-item-validation",
+        source_url=f"https://www.xiaohongshu.com/explore/{note_id}",
+        platform=Platform.XIAOHONGSHU,
+        source_kind=SourceKind.ITEM,
+        output_root="/tmp/downloads",
+    )
+
+    DownloadManager._validate_discovery_result(
+        job,
+        DiscoveryResult(
+            author="Test Author",
+            items=[
+                DownloadItem(
+                    id="candidate",
+                    media_id=note_id,
+                    source_url=(
+                        f"https://www.xiaohongshu.com/explore/{note_id}"
+                        "?xsec_token=secret&xsec_source=pc_user"
+                    ),
+                )
+            ],
+        ),
+    )
+
+
+def test_xiaohongshu_direct_item_rejects_different_note_identity() -> None:
+    expected_id = "6411cf99000000001300b6d9"
+    different_id = "6411cf99000000001300b6da"
+    job = DownloadJob(
+        id="xhs-direct-crosswire",
+        source_url=f"https://www.xiaohongshu.com/explore/{expected_id}",
+        platform=Platform.XIAOHONGSHU,
+        source_kind=SourceKind.ITEM,
+        output_root="/tmp/downloads",
+    )
+    item = DownloadItem(
+        id="different-note",
+        media_id=different_id,
+        source_url=f"https://www.xiaohongshu.com/explore/{different_id}",
+    )
+
+    assert DownloadManager._is_bound_xiaohongshu_item(job, item) is False
+    with pytest.raises(DiscoveryError, match="cross-wired"):
+        DownloadManager._validate_discovery_result(
+            job,
+            DiscoveryResult(author="Different Author", items=[item]),
+        )
+
+
+def test_xiaohongshu_short_item_uses_resolved_identity_binding() -> None:
+    expected_id = "6411cf99000000001300b6d9"
+    job = DownloadJob(
+        id="xhs-short-binding",
+        source_url="https://xhslink.com/a/short-code",
+        platform=Platform.XIAOHONGSHU,
+        source_kind=SourceKind.SHORT_LINK,
+        output_root="/tmp/downloads",
+    )
+    item = DownloadItem(
+        id="short-note",
+        media_id=expected_id,
+        source_url=f"https://www.xiaohongshu.com/explore/{expected_id}",
+        metadata={
+            "xiaohongshu_resolved_source_url": (
+                f"https://www.xiaohongshu.com/explore/{expected_id}"
+            ),
+            "xiaohongshu_resolved_source_kind": SourceKind.ITEM.value,
+        },
+    )
+
+    assert DownloadManager._is_bound_xiaohongshu_item(job, item) is True
+    DownloadManager._validate_discovery_result(
+        job,
+        DiscoveryResult(author="Short Author", items=[item]),
+    )
+
+    item.metadata["xiaohongshu_resolved_source_url"] = (
+        "https://www.xiaohongshu.com/explore/6411cf99000000001300b6da"
+    )
+    assert DownloadManager._is_bound_xiaohongshu_item(job, item) is False
+
+
+def test_xiaohongshu_short_retry_blocks_changed_resolved_target() -> None:
+    original_id = "6411cf99000000001300b6d9"
+    changed_id = "6411cf99000000001300b6da"
+    job = DownloadJob(
+        id="xhs-short-anchor",
+        source_url="https://xhslink.com/a/stable-short-code",
+        platform=Platform.XIAOHONGSHU,
+        source_kind=SourceKind.SHORT_LINK,
+        resolved_source_kind=SourceKind.ITEM,
+        resolved_source_id=original_id,
+        output_root="/tmp/downloads",
+    )
+    changed_item = DownloadItem(
+        id="changed-short-note",
+        media_id=changed_id,
+        source_url=f"https://www.xiaohongshu.com/explore/{changed_id}",
+        metadata={
+            "xiaohongshu_resolved_source_url": (
+                f"https://www.xiaohongshu.com/explore/{changed_id}"
+            ),
+            "xiaohongshu_resolved_source_kind": SourceKind.ITEM.value,
+        },
+    )
+
+    with pytest.raises(DiscoveryError, match="different note or profile"):
+        DownloadManager._validate_discovery_result(
+            job,
+            DiscoveryResult(author="Changed Author", items=[changed_item]),
+        )
+
+
+def test_xiaohongshu_profile_discovery_requires_membership_binding() -> None:
+    note_id = "6411cf99000000001300b6d9"
+    job = DownloadJob(
+        id="xhs-profile-membership",
+        source_url="https://www.xiaohongshu.com/user/profile/expected",
+        platform=Platform.XIAOHONGSHU,
+        source_kind=SourceKind.PROFILE,
+        output_root="/tmp/downloads",
+    )
+    item = DownloadItem(
+        id="candidate",
+        media_id=note_id,
+        source_url=f"https://www.xiaohongshu.com/explore/{note_id}",
+    )
+
+    with pytest.raises(DiscoveryError, match="cross-wired"):
+        DownloadManager._validate_discovery_result(
+            job,
+            DiscoveryResult(author="Profile Author", items=[item]),
+        )
+
+    item.metadata = {
+        "xiaohongshu_profile_id": "expected",
+        "profile_note_membership_verified": True,
+    }
+    DownloadManager._validate_discovery_result(
+        job,
+        DiscoveryResult(author="Profile Author", items=[item]),
+    )
+
+
+@pytest.mark.parametrize("retry_method", ["retry_item", "retry_failed"])
+def test_xiaohongshu_direct_binding_failure_rediscovery_replaces_wrong_item(
+    monkeypatch,
+    tmp_path,
+    retry_method: str,
+) -> None:
+    expected_id = "6411cf99000000001300b6d9"
+    wrong_id = "6411cf99000000001300b6da"
+    source_url = f"https://www.xiaohongshu.com/explore/{expected_id}"
+
+    class RebindingEngine:
+        def __init__(self) -> None:
+            self.discovery_calls: list[tuple[str, Platform, SourceKind]] = []
+            self.download_calls: list[str] = []
+
+        def discover(self, url, platform, kind, *, should_cancel):
+            self.discovery_calls.append((url, platform, kind))
+            return DiscoveryResult(
+                author="Correct Author",
+                items=[
+                    DownloadItem(
+                        id="fresh-target",
+                        media_id=expected_id,
+                        source_url=f"{source_url}?xsec_token=fresh",
+                        title="Correct note",
+                        media_type=MediaType.IMAGE,
+                    )
+                ],
+            )
+
+        def download_item(
+            self,
+            item,
+            platform,
+            output_dir,
+            *,
+            callback,
+            should_cancel,
+        ):
+            self.download_calls.append(str(item.media_id))
+            return DownloadOutcome(
+                output_paths=[str(Path(output_dir) / "correct.webp")],
+                title=item.title,
+                author="Correct Author",
+                media_type=MediaType.IMAGE,
+            )
+
+    manager = DownloadManager(
+        state_dir=tmp_path / "state",
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    engine = RebindingEngine()
+    monkeypatch.setattr(manager, "_engine_for_job", lambda job: engine)
+
+    try:
+        created = manager.create_job(source_url, auto_start=False)
+        with manager._lock:
+            job = manager._require_job(created.id)
+            job.items = [
+                DownloadItem(
+                    id="wrong-note",
+                    media_id=wrong_id,
+                    source_url=f"https://www.xiaohongshu.com/explore/{wrong_id}",
+                    title="Wrong note",
+                    status=ItemStatus.QUEUED,
+                )
+            ]
+            job.discovery_complete = True
+            manager._commit_locked(job)
+
+        manager.start_job(created.id)
+        blocked = wait_for_job(manager, created.id)
+
+        assert blocked.status == JobStatus.FAILED
+        assert blocked.discovery_complete is False
+        assert blocked.items[0].metadata[
+            XIAOHONGSHU_BINDING_REDISCOVERY_MARKER
+        ] is True
+        assert engine.download_calls == []
+
+        if retry_method == "retry_item":
+            manager.retry_item(created.id, "wrong-note")
+        else:
+            manager.retry_failed(created.id)
+        completed = wait_for_job(manager, created.id)
+
+        assert completed.status == JobStatus.COMPLETED
+        assert engine.discovery_calls == [
+            (source_url, Platform.XIAOHONGSHU, SourceKind.ITEM)
+        ]
+        assert engine.download_calls == [expected_id]
+        assert len(completed.items) == 1
+        assert completed.items[0].id == "fresh-target"
+        assert completed.items[0].media_id == expected_id
+        assert completed.items[0].status == ItemStatus.COMPLETED
+        assert (
+            XIAOHONGSHU_BINDING_REDISCOVERY_MARKER
+            not in completed.items[0].metadata
+        )
+        assert all(item.media_id != wrong_id for item in completed.items)
+    finally:
+        manager.shutdown()
+
+
+def test_xiaohongshu_short_binding_failure_retry_resolves_original_link(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    short_url = "https://xhslink.com/a/original-short-code"
+    expected_id = "6411cf99000000001300b6d9"
+    wrong_id = "6411cf99000000001300b6da"
+    expected_url = f"https://www.xiaohongshu.com/explore/{expected_id}"
+
+    class ShortLinkRebindingEngine:
+        def __init__(self) -> None:
+            self.discovery_calls: list[tuple[str, Platform, SourceKind]] = []
+            self.download_calls: list[str] = []
+
+        def discover(self, url, platform, kind, *, should_cancel):
+            self.discovery_calls.append((url, platform, kind))
+            return DiscoveryResult(
+                author="Short Author",
+                items=[
+                    DownloadItem(
+                        id="fresh-short-target",
+                        media_id=expected_id,
+                        source_url=f"{expected_url}?xsec_token=fresh",
+                        title="Resolved note",
+                        media_type=MediaType.IMAGE,
+                        metadata={
+                            "xiaohongshu_resolved_source_url": expected_url,
+                            "xiaohongshu_resolved_source_kind": (
+                                SourceKind.ITEM.value
+                            ),
+                        },
+                    )
+                ],
+            )
+
+        def download_item(
+            self,
+            item,
+            platform,
+            output_dir,
+            *,
+            callback,
+            should_cancel,
+        ):
+            self.download_calls.append(str(item.media_id))
+            return DownloadOutcome(
+                output_paths=[str(Path(output_dir) / "resolved.webp")],
+                title=item.title,
+                author="Short Author",
+                media_type=MediaType.IMAGE,
+            )
+
+    manager = DownloadManager(
+        state_dir=tmp_path / "state",
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    engine = ShortLinkRebindingEngine()
+    monkeypatch.setattr(manager, "_engine_for_job", lambda job: engine)
+
+    try:
+        created = manager.create_job(short_url, auto_start=False)
+        with manager._lock:
+            job = manager._require_job(created.id)
+            job.items = [
+                DownloadItem(
+                    id="wrong-short-note",
+                    media_id=wrong_id,
+                    source_url=f"https://www.xiaohongshu.com/explore/{wrong_id}",
+                    title="Wrong short target",
+                    metadata={
+                        "xiaohongshu_resolved_source_url": expected_url,
+                        "xiaohongshu_resolved_source_kind": SourceKind.ITEM.value,
+                    },
+                )
+            ]
+            job.refresh_counts()
+            manager._commit_locked(job)
+
+        manager.start_job(created.id)
+        blocked = wait_for_job(manager, created.id)
+        assert blocked.status == JobStatus.FAILED
+        assert engine.download_calls == []
+
+        manager.retry_failed(created.id)
+        completed = wait_for_job(manager, created.id)
+
+        assert completed.status == JobStatus.COMPLETED
+        assert engine.discovery_calls == [
+            (short_url, Platform.XIAOHONGSHU, SourceKind.SHORT_LINK)
+        ]
+        assert engine.download_calls == [expected_id]
+        assert [item.media_id for item in completed.items] == [expected_id]
+    finally:
+        manager.shutdown()
+
+
+def test_xiaohongshu_short_profile_retry_preserves_completed_history(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    short_url = "https://xhslink.com/a/profile-short-code"
+    profile_id = "5c99d4b30000000011015e6d"
+    profile_url = f"https://www.xiaohongshu.com/user/profile/{profile_id}"
+    completed_id = "6411cf99000000001300b6d9"
+    retry_id = "6411cf99000000001300b6da"
+    completed_path = tmp_path / "downloads" / "completed.webp"
+    completed_path.parent.mkdir(parents=True)
+    completed_path.write_bytes(b"preserved")
+
+    def metadata() -> dict:
+        return {
+            "xiaohongshu_resolved_source_url": profile_url,
+            "xiaohongshu_resolved_source_kind": SourceKind.PROFILE.value,
+            "xiaohongshu_profile_id": profile_id,
+            "profile_note_membership_verified": True,
+        }
+
+    class ProfileShortRetryEngine:
+        def __init__(self) -> None:
+            self.download_calls: list[str] = []
+
+        def discover(self, url, platform, kind, *, should_cancel):
+            assert (url, platform, kind) == (
+                short_url,
+                Platform.XIAOHONGSHU,
+                SourceKind.SHORT_LINK,
+            )
+            return DiscoveryResult(
+                author="Profile Author",
+                items=[
+                    DownloadItem(
+                        id="fresh-retry-note",
+                        media_id=retry_id,
+                        source_url=(
+                            f"https://www.xiaohongshu.com/explore/{retry_id}"
+                            "?xsec_token=fresh"
+                        ),
+                        title="Fresh retry note",
+                        media_type=MediaType.IMAGE,
+                        metadata=metadata(),
+                    )
+                ],
+            )
+
+        def download_item(
+            self,
+            item,
+            platform,
+            output_dir,
+            *,
+            callback,
+            should_cancel,
+        ):
+            self.download_calls.append(str(item.media_id))
+            return DownloadOutcome(
+                output_paths=[str(Path(output_dir) / "fresh.webp")],
+                title=item.title,
+                author="Profile Author",
+                media_type=MediaType.IMAGE,
+            )
+
+    state_dir = tmp_path / "state"
+    manager = DownloadManager(
+        state_dir=state_dir,
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    engine = ProfileShortRetryEngine()
+    monkeypatch.setattr(manager, "_engine_for_job", lambda job: engine)
+    try:
+        created = manager.create_job(short_url, auto_start=False)
+        with manager._lock:
+            job = manager._require_job(created.id)
+            job.resolved_source_kind = SourceKind.PROFILE
+            job.resolved_source_id = profile_id
+            job.status = JobStatus.FAILED
+            job.discovery_complete = False
+            job.items = [
+                DownloadItem(
+                    id="completed-note",
+                    media_id=completed_id.upper(),
+                    source_url=(
+                        f"https://www.xiaohongshu.com/explore/{completed_id}"
+                    ),
+                    title="Completed note",
+                    media_type=MediaType.IMAGE,
+                    status=ItemStatus.COMPLETED,
+                    output_paths=[str(completed_path)],
+                    metadata=metadata(),
+                ),
+                DownloadItem(
+                    id="failed-note",
+                    media_id=retry_id,
+                    source_url=(
+                        f"https://www.xiaohongshu.com/explore/{retry_id}"
+                    ),
+                    title="Failed note",
+                    media_type=MediaType.IMAGE,
+                    status=ItemStatus.FAILED,
+                    metadata={
+                        **metadata(),
+                        XIAOHONGSHU_BINDING_REDISCOVERY_MARKER: True,
+                    },
+                ),
+            ]
+            job.refresh_counts()
+            manager._commit_locked(job)
+
+        manager.retry_failed(created.id)
+        completed = wait_for_job(manager, created.id)
+
+        assert completed.status == JobStatus.COMPLETED
+        assert engine.download_calls == [retry_id]
+        assert len(completed.items) == 2
+        preserved = next(
+            item for item in completed.items if item.id == "completed-note"
+        )
+        assert preserved.media_id == completed_id
+        assert preserved.status == ItemStatus.COMPLETED
+        assert preserved.output_paths == [str(completed_path)]
+        assert completed_path.read_bytes() == b"preserved"
+    finally:
+        manager.shutdown()
+
+    restored_manager = DownloadManager(
+        state_dir=state_dir,
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    try:
+        restored = restored_manager.get_job(created.id)
+        assert restored.status == JobStatus.COMPLETED
+        assert len(restored.items) == 2
+        assert next(
+            item for item in restored.items if item.id == "completed-note"
+        ).output_paths == [str(completed_path)]
+    finally:
+        restored_manager.shutdown()
+
+
+def test_xiaohongshu_retry_normalizes_media_id_case_before_merge() -> None:
+    profile_id = "5c99d4b30000000011015e6d"
+    profile_url = f"https://www.xiaohongshu.com/user/profile/{profile_id}"
+    note_id = "6411cf99000000001300b6d9"
+    job = DownloadJob(
+        id="xhs-case-normalization",
+        source_url="https://xhslink.com/a/profile-short-code",
+        platform=Platform.XIAOHONGSHU,
+        source_kind=SourceKind.SHORT_LINK,
+        resolved_source_kind=SourceKind.PROFILE,
+        resolved_source_id=profile_id,
+        output_root="/tmp/downloads",
+    )
+    common_metadata = {
+        "xiaohongshu_resolved_source_url": profile_url,
+        "xiaohongshu_resolved_source_kind": SourceKind.PROFILE.value,
+        "xiaohongshu_profile_id": profile_id,
+        "profile_note_membership_verified": True,
+    }
+    old = DownloadItem(
+        id="old-note",
+        media_id=note_id.upper(),
+        source_url=f"https://www.xiaohongshu.com/explore/{note_id}",
+        status=ItemStatus.COMPLETED,
+        output_paths=["/tmp/completed.webp"],
+        metadata=dict(common_metadata),
+    )
+    fresh = DownloadItem(
+        id="fresh-note",
+        media_id=note_id,
+        source_url=f"https://www.xiaohongshu.com/explore/{note_id}",
+        metadata=dict(common_metadata),
+    )
+    DownloadManager._normalize_xiaohongshu_item_identity(old)
+    DownloadManager._normalize_xiaohongshu_item_identity(fresh)
+
+    trusted = DownloadManager._trusted_xiaohongshu_previous_items(
+        job,
+        [old],
+        [fresh],
+    )
+    merged = DownloadManager._merge_discovered_items(trusted, [fresh])
+
+    assert len(merged) == 1
+    assert merged[0].media_id == note_id
+    assert merged[0].status == ItemStatus.COMPLETED
+    assert merged[0].output_paths == ["/tmp/completed.webp"]
+
+
+def test_persisted_xiaohongshu_direct_binding_failure_rediscovery_after_restart(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    expected_id = "6411cf99000000001300b6d9"
+    wrong_id = "6411cf99000000001300b6da"
+    source_url = f"https://www.xiaohongshu.com/explore/{expected_id}"
+    state_dir = tmp_path / "state"
+    downloads_dir = tmp_path / "downloads"
+
+    class UnexpectedDownloadEngine:
+        def download_item(self, *args, **kwargs):
+            raise AssertionError("Cross-wired item must not reach the downloader")
+
+    first_manager = DownloadManager(
+        state_dir=state_dir,
+        default_output_root=downloads_dir,
+        max_workers=1,
+    )
+    monkeypatch.setattr(
+        first_manager,
+        "_engine_for_job",
+        lambda job: UnexpectedDownloadEngine(),
+    )
+    try:
+        created = first_manager.create_job(source_url, auto_start=False)
+        with first_manager._lock:
+            job = first_manager._require_job(created.id)
+            job.items = [
+                DownloadItem(
+                    id="persisted-wrong-note",
+                    media_id=wrong_id,
+                    source_url=f"https://www.xiaohongshu.com/explore/{wrong_id}",
+                    title="Persisted wrong note",
+                )
+            ]
+            job.discovery_complete = True
+            first_manager._commit_locked(job)
+
+        first_manager.start_job(created.id)
+        blocked = wait_for_job(first_manager, created.id)
+        assert blocked.status == JobStatus.FAILED
+        persisted = JsonJobStore(state_dir).get(created.id)
+        assert persisted.items[0].metadata[
+            XIAOHONGSHU_BINDING_REDISCOVERY_MARKER
+        ] is True
+    finally:
+        first_manager.shutdown()
+
+    class RestartRebindingEngine:
+        def __init__(self) -> None:
+            self.discovery_calls = 0
+            self.download_calls: list[str] = []
+
+        def discover(self, url, platform, kind, *, should_cancel):
+            self.discovery_calls += 1
+            assert url == source_url
+            assert platform == Platform.XIAOHONGSHU
+            assert kind == SourceKind.ITEM
+            return DiscoveryResult(
+                author="Restart Author",
+                items=[
+                    DownloadItem(
+                        id="restart-fresh-target",
+                        media_id=expected_id,
+                        source_url=f"{source_url}?xsec_token=restart-fresh",
+                        title="Restart fresh note",
+                        media_type=MediaType.IMAGE,
+                    )
+                ],
+            )
+
+        def download_item(
+            self,
+            item,
+            platform,
+            output_dir,
+            *,
+            callback,
+            should_cancel,
+        ):
+            self.download_calls.append(str(item.media_id))
+            return DownloadOutcome(
+                output_paths=[str(Path(output_dir) / "restart.webp")],
+                title=item.title,
+                author="Restart Author",
+                media_type=MediaType.IMAGE,
+            )
+
+    second_manager = DownloadManager(
+        state_dir=state_dir,
+        default_output_root=downloads_dir,
+        max_workers=1,
+    )
+    engine = RestartRebindingEngine()
+    monkeypatch.setattr(second_manager, "_engine_for_job", lambda job: engine)
+    try:
+        restored = second_manager.get_job(created.id)
+        assert restored.status == JobStatus.FAILED
+        assert restored.discovery_complete is False
+        assert restored.items[0].id == "persisted-wrong-note"
+
+        second_manager.retry_item(created.id, "persisted-wrong-note")
+        completed = wait_for_job(second_manager, created.id)
+
+        assert completed.status == JobStatus.COMPLETED
+        assert engine.discovery_calls == 1
+        assert engine.download_calls == [expected_id]
+        assert [item.id for item in completed.items] == ["restart-fresh-target"]
+        assert [item.media_id for item in completed.items] == [expected_id]
+    finally:
+        second_manager.shutdown()
+
+
+def test_persisted_xiaohongshu_profile_item_is_revalidated_before_download(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    class UnexpectedDownloadEngine:
+        def __init__(self) -> None:
+            self.download_calls = 0
+
+        def download_item(self, *args, **kwargs):
+            self.download_calls += 1
+            raise AssertionError("Untrusted item must not reach the downloader")
+
+    manager = DownloadManager(
+        state_dir=tmp_path / "state",
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    engine = UnexpectedDownloadEngine()
+    monkeypatch.setattr(manager, "_engine_for_job", lambda job: engine)
+    try:
+        created = manager.create_job(
+            "https://www.xiaohongshu.com/user/profile/expected",
+            auto_start=False,
+        )
+        with manager._lock:
+            job = manager._require_job(created.id)
+            job.items = [
+                DownloadItem(
+                    id="legacy-untrusted",
+                    media_id="6411cf99000000001300b6d9",
+                    source_url=(
+                        "https://evil.example/explore/"
+                        "6411cf99000000001300b6d9"
+                    ),
+                    status=ItemStatus.QUEUED,
+                    metadata={
+                        "xiaohongshu_profile_id": "expected",
+                        "profile_note_membership_verified": True,
+                    },
+                )
+            ]
+            job.refresh_counts()
+            manager._commit_locked(job)
+
+        manager.start_job(created.id)
+        failed = wait_for_job(manager, created.id)
+
+        assert failed.status == JobStatus.FAILED
+        assert failed.items[0].status == ItemStatus.FAILED
+        assert "cross-wired entry was blocked" in (failed.items[0].error or "")
+        assert engine.download_calls == 0
+    finally:
+        manager.shutdown()
+
+
+def test_douyin_profile_local_cache_failure_is_retryable_without_chrome(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    profile_url = "https://www.douyin.com/user/verified-profile-owner"
+    media_id = "7670000000000000001"
+
+    class CacheFailureEngine:
+        def __init__(self) -> None:
+            self.discovery_calls = 0
+            self.download_calls = 0
+
+        def discover(self, url, platform, kind, *, should_cancel):
+            self.discovery_calls += 1
+            return DiscoveryResult(
+                author="Verified author",
+                items=[
+                    DownloadItem(
+                        id=media_id,
+                        media_id=media_id,
+                        source_url=f"https://www.douyin.com/video/{media_id}",
+                        title="Verified profile video",
+                        media_type=MediaType.VIDEO,
+                        metadata=complete_douyin_profile_metadata(
+                            profile_url,
+                            media_id,
+                        ),
+                    )
+                ],
+            )
+
+        def download_item(
+            self,
+            item,
+            platform,
+            output_dir,
+            *,
+            callback,
+            should_cancel,
+        ):
+            self.download_calls += 1
+            if self.download_calls == 1:
+                raise MediaDownloadError(
+                    "Douyin profile media metadata is incomplete; Chrome "
+                    "verification is not required"
+                )
+            return DownloadOutcome(
+                output_paths=[str(Path(output_dir) / f"{media_id}.mp4")],
+                title=item.title,
+                author="Verified author",
+                media_type=MediaType.VIDEO,
+            )
+
+    manager = DownloadManager(
+        state_dir=tmp_path / "state",
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    engine = CacheFailureEngine()
+    monkeypatch.setattr(manager, "_engine_for_job", lambda job: engine)
+
+    try:
+        created = manager.create_job(profile_url, auto_start=True)
+        failed = wait_for_job(manager, created.id)
+
+        assert failed.status == JobStatus.FAILED
+        assert failed.items[0].status == ItemStatus.FAILED
+        assert failed.items[0].retryable is True
+        assert failed.auth_message is None
+        assert failed.verification_url is None
+        assert failed.items[0].auth_message is None
+
+        manager.retry_failed(created.id)
+        completed = wait_for_job(manager, created.id)
+
+        assert completed.status == JobStatus.COMPLETED
+        assert engine.discovery_calls == 2
+        assert engine.download_calls == 2
     finally:
         manager.shutdown()
 
@@ -427,9 +1407,10 @@ def test_douyin_item_discovery_rejects_matching_id_from_wrong_host(
         created = manager.create_job(source_url, auto_start=True)
         blocked = wait_for_job(manager, created.id)
 
-        assert blocked.status == JobStatus.NEEDS_AUTH
+        assert blocked.status == JobStatus.FAILED
         assert blocked.items == []
-        assert blocked.verification_url == source_url
+        assert blocked.verification_url is None
+        assert blocked.auth_message is None
     finally:
         manager.shutdown()
 
@@ -845,6 +1826,48 @@ def test_restore_marks_corrupted_douyin_item_expansion_for_rediscovery(
         manager.shutdown()
 
 
+def test_restore_reclassifies_legacy_generic_douyin_signing_auth(
+    tmp_path,
+) -> None:
+    state_dir = tmp_path / "state"
+    profile_url = "https://www.douyin.com/user/verified-profile"
+    legacy_message = (
+        "Douyin could not create a verified signed request. Open the provided URL "
+        "in Chrome, finish any CAPTCHA or login, then retry."
+    )
+    job = DownloadJob(
+        id="legacy-generic-signing-auth",
+        source_url=profile_url,
+        platform=Platform.DOUYIN,
+        source_kind=SourceKind.PROFILE,
+        output_root=str(tmp_path / "downloads"),
+        status=JobStatus.NEEDS_AUTH,
+        error=legacy_message,
+        auth_message=legacy_message,
+        verification_url=profile_url,
+        retryable=True,
+    )
+    JsonJobStore(state_dir).save(job)
+
+    manager = DownloadManager(
+        state_dir=state_dir,
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    try:
+        restored = manager.get_job(job.id)
+
+        assert restored.status == JobStatus.FAILED
+        assert restored.auth_message is None
+        assert restored.verification_url is None
+        assert restored.discovery_complete is False
+        assert restored.retryable is True
+        assert "older version" in (restored.error or "")
+        assert DownloadManager._should_rediscover_on_retry(restored) is True
+    finally:
+        manager.shutdown()
+
+
 def test_restore_removes_unsaved_numeric_items_from_direct_video_expansion(
     monkeypatch,
     tmp_path,
@@ -956,9 +1979,16 @@ def test_restore_removes_unsaved_numeric_items_from_direct_video_expansion(
         manager.shutdown()
 
 
-def test_restore_quarantines_unverifiable_numeric_profile_queue(tmp_path) -> None:
+def test_restore_discards_numeric_profile_placeholders_and_rediscovers(
+    monkeypatch,
+    tmp_path,
+) -> None:
     state_dir = tmp_path / "state"
-    profile_url = "https://www.douyin.com/user/wrong-profile"
+    profile_url = (
+        "https://www.douyin.com/user/"
+        "MS4wLjABAAAA9OBQVqfaEUOvYbk2U0bSMCmaGV9OiG5-"
+        "k15gEXhWLuFzBhLejblDoYncRu6bRB-x"
+    )
     media_ids = [str(7670000000000000000 + index) for index in range(151)]
     job = DownloadJob(
         id="legacy-151-lost-source",
@@ -968,7 +1998,7 @@ def test_restore_quarantines_unverifiable_numeric_profile_queue(tmp_path) -> Non
         output_root=str(tmp_path / "downloads"),
         status=JobStatus.NEEDS_AUTH,
         auth_message="Complete verification",
-        verification_url=profile_url,
+        verification_url="https://evil.example/wrong-verification-target",
         items=[
             DownloadItem(
                 id=media_id,
@@ -988,19 +2018,192 @@ def test_restore_quarantines_unverifiable_numeric_profile_queue(tmp_path) -> Non
         default_output_root=tmp_path / "downloads",
         max_workers=1,
     )
+
+    class RediscoveredProfileEngine:
+        def __init__(self) -> None:
+            self.discovery_calls = 0
+
+        def discover(self, url, platform, kind, *, should_cancel):
+            self.discovery_calls += 1
+            assert url == profile_url
+            assert platform == Platform.DOUYIN
+            assert kind == SourceKind.PROFILE
+            media_id = media_ids[0]
+            return DiscoveryResult(
+                author="Recovered author",
+                items=[
+                    DownloadItem(
+                        id="rediscovered-profile-item",
+                        media_id=media_id,
+                        source_url=f"https://www.douyin.com/video/{media_id}",
+                        title="Recovered real title",
+                        media_type=MediaType.VIDEO,
+                        metadata=complete_douyin_profile_metadata(
+                            profile_url,
+                            media_id,
+                            title="Recovered real title",
+                        ),
+                    )
+                ],
+            )
+
+        def download_item(
+            self,
+            item,
+            platform,
+            output_dir,
+            *,
+            callback,
+            should_cancel,
+        ):
+            return DownloadOutcome(
+                output_paths=[str(Path(output_dir) / "rediscovered.mp4")],
+                title=item.title,
+                author="Recovered author",
+                media_type=MediaType.VIDEO,
+                resolution="1440x2560",
+            )
+
+    engine = RediscoveredProfileEngine()
+    monkeypatch.setattr(manager, "_engine_for_job", lambda current: engine)
     try:
         restored = manager.get_job(job.id)
 
-        assert restored.status == JobStatus.FAILED
+        assert restored.status == JobStatus.INTERRUPTED
         assert restored.total_items == 0
         assert restored.items == []
         assert restored.auth_message is None
-        assert restored.verification_url is None
+        assert restored.verification_url == profile_url
         assert restored.discovery_complete is False
-        assert restored.retryable is False
-        assert "unverified numeric queue" in (restored.error or "")
-        with pytest.raises(ItemNotRetryableError):
-            manager.retry_failed(job.id)
+        assert restored.retryable is True
+        assert restored.error == DOUYIN_PROFILE_REDISCOVERY_MESSAGE
+
+        manager.retry_failed(job.id)
+        completed = wait_for_job(manager, job.id)
+
+        assert completed.status == JobStatus.COMPLETED
+        assert completed.total_items == 1
+        assert completed.items[0].title == "Recovered real title"
+        assert completed.items[0].resolution == "1440x2560"
+        assert engine.discovery_calls == 1
+    finally:
+        manager.shutdown()
+
+
+def test_restore_upgrades_previously_quarantined_profile_for_rediscovery(
+    tmp_path,
+) -> None:
+    state_dir = tmp_path / "state"
+    profile_id = (
+        "MS4wLjABAAAA9OBQVqfaEUOvYbk2U0bSMCmaGV9OiG5-"
+        "k15gEXhWLuFzBhLejblDoYncRu6bRB-x"
+    )
+    submitted_url = (
+        f"https://www.douyin.com/user/{profile_id}?from_tab_name=main"
+    )
+    canonical_url = f"https://www.douyin.com/user/{profile_id}"
+    job = DownloadJob(
+        id="previously-quarantined-profile",
+        source_url=submitted_url,
+        platform=Platform.DOUYIN,
+        source_kind=SourceKind.PROFILE,
+        output_root=str(tmp_path / "downloads"),
+        status=JobStatus.FAILED,
+        error=DOUYIN_UNVERIFIABLE_QUEUE_ERROR,
+        warning=DOUYIN_UNVERIFIABLE_QUEUE_ERROR,
+        retryable=False,
+        discovery_complete=False,
+        items=[],
+    )
+    JsonJobStore(state_dir).save(job)
+
+    first_manager = DownloadManager(
+        state_dir=state_dir,
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    first = first_manager.get_job(job.id)
+    first_manager.shutdown()
+
+    assert first.source_url == canonical_url
+    assert first.status == JobStatus.INTERRUPTED
+    assert first.retryable is True
+    assert first.discovery_complete is False
+    assert first.error == DOUYIN_PROFILE_REDISCOVERY_MESSAGE
+    assert first.warning == DOUYIN_PROFILE_REDISCOVERY_MESSAGE
+    assert first.auth_message is None
+    assert first.verification_url == canonical_url
+    assert first.items == []
+
+    second_manager = DownloadManager(
+        state_dir=state_dir,
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    try:
+        second = second_manager.get_job(job.id)
+
+        assert second.model_dump(mode="json") == first.model_dump(mode="json")
+    finally:
+        second_manager.shutdown()
+
+
+def test_restore_upgrades_quarantined_profile_and_preserves_existing_files(
+    tmp_path,
+) -> None:
+    state_dir = tmp_path / "state"
+    output_path = tmp_path / "downloads" / "preserved.mp4"
+    output_path.parent.mkdir(parents=True)
+    output_path.write_bytes(b"preserved-original-bytes")
+    media_id = "7664225419386607205"
+    profile_url = (
+        "https://www.douyin.com/user/"
+        "MS4wLjABAAAA9OBQVqfaEUOvYbk2U0bSMCmaGV9OiG5-"
+        "k15gEXhWLuFzBhLejblDoYncRu6bRB-x"
+    )
+    job = DownloadJob(
+        id="previously-quarantined-profile-with-file",
+        source_url=profile_url,
+        platform=Platform.DOUYIN,
+        source_kind=SourceKind.PROFILE,
+        output_root=str(tmp_path / "downloads"),
+        status=JobStatus.FAILED,
+        error=DOUYIN_UNVERIFIABLE_QUEUE_ERROR,
+        warning=DOUYIN_UNVERIFIABLE_QUEUE_ERROR,
+        retryable=False,
+        discovery_complete=False,
+        items=[
+            DownloadItem(
+                id=media_id,
+                media_id=media_id,
+                source_url=f"https://www.douyin.com/video/{media_id}",
+                title=media_id,
+                status=ItemStatus.FAILED,
+                retryable=False,
+                output_paths=[str(output_path)],
+            )
+        ],
+    )
+    job.refresh_counts()
+    JsonJobStore(state_dir).save(job)
+
+    manager = DownloadManager(
+        state_dir=state_dir,
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    try:
+        restored = manager.get_job(job.id)
+
+        assert restored.status == JobStatus.INTERRUPTED
+        assert restored.retryable is True
+        assert len(restored.items) == 1
+        assert restored.items[0].output_paths == [str(output_path)]
+        assert restored.items[0].retryable is False
+        assert restored.items[0].metadata[
+            DOUYIN_PROFILE_REDISCOVERY_ITEM_MARKER
+        ] is True
+        assert output_path.read_bytes() == b"preserved-original-bytes"
     finally:
         manager.shutdown()
 
@@ -1012,7 +2215,7 @@ def test_restore_quarantines_unverifiable_numeric_profile_queue(tmp_path) -> Non
         (JobStatus.CANCELLED, ItemStatus.CANCELLED),
     ],
 )
-def test_restore_quarantines_terminal_numeric_profile_queue(
+def test_restore_migrates_terminal_numeric_profile_queue_for_rediscovery(
     job_status,
     item_status,
     tmp_path,
@@ -1048,15 +2251,147 @@ def test_restore_quarantines_terminal_numeric_profile_queue(
     try:
         restored = manager.get_job(job.id)
 
-        assert restored.status == JobStatus.FAILED
+        assert restored.status == JobStatus.INTERRUPTED
         assert restored.items == []
-        assert restored.retryable is False
-        assert "unverified numeric queue" in (restored.error or "")
+        assert restored.retryable is True
+        assert restored.discovery_complete is False
+        assert restored.verification_url == job.source_url
+        assert restored.error == DOUYIN_PROFILE_REDISCOVERY_MESSAGE
     finally:
         manager.shutdown()
 
 
-def test_restore_quarantines_mixed_verified_and_unverified_numeric_queue(
+def test_restore_quarantines_numeric_queue_without_a_recoverable_profile_source(
+    tmp_path,
+) -> None:
+    state_dir = tmp_path / "state"
+    job = DownloadJob(
+        id="legacy-numeric-queue-without-profile-source",
+        source_url="https://example.com/lost-source",
+        platform=Platform.DOUYIN,
+        source_kind=SourceKind.PROFILE,
+        output_root=str(tmp_path / "downloads"),
+        status=JobStatus.NEEDS_AUTH,
+        items=[
+            DownloadItem(
+                id=media_id,
+                media_id=media_id,
+                source_url=f"https://www.douyin.com/video/{media_id}",
+                title=media_id,
+                status=ItemStatus.NEEDS_AUTH,
+            )
+            for media_id in ("7670000000000000001", "7670000000000000002")
+        ],
+    )
+    job.refresh_counts()
+    JsonJobStore(state_dir).save(job)
+
+    manager = DownloadManager(
+        state_dir=state_dir,
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    try:
+        restored = manager.get_job(job.id)
+
+        assert restored.status == JobStatus.FAILED
+        assert restored.items == []
+        assert restored.retryable is False
+        assert restored.verification_url is None
+        assert "unverified numeric queue" in (restored.error or "")
+    finally:
+        manager.shutdown()
+
+    second_manager = DownloadManager(
+        state_dir=state_dir,
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    try:
+        second = second_manager.get_job(job.id)
+
+        assert second.model_dump(mode="json") == restored.model_dump(mode="json")
+    finally:
+        second_manager.shutdown()
+
+
+@pytest.mark.parametrize(
+    "source_url",
+    [
+        "http://www.douyin.com/user/MS4wLjABAAAATEST",
+        "https://foo.douyin.com/user/MS4wLjABAAAATEST",
+        "https://www.douyin.com:444/user/MS4wLjABAAAATEST",
+        "https://www.douyin.com/user/%2F",
+        "https://www.douyin.com/user/short",
+        "https://www.douyin.com/user/MS4wLjABAAAATEST?modal_id=7664225419386607205",
+        "https://www.douyin.com/video/7664225419386607205",
+        "https://www.douyin.com/user/MS4wLjABAAAATEST/extra",
+        "https://user@www.douyin.com/user/MS4wLjABAAAATEST",
+    ],
+)
+def test_legacy_profile_rediscovery_rejects_untrusted_source_anchors(
+    source_url,
+    tmp_path,
+) -> None:
+    state_dir = tmp_path / "state"
+    output_path = tmp_path / "preserved-wrong-output.mp4"
+    output_path.write_bytes(b"must-remain-unchanged")
+    preserved_media_id = "7670000000000000001"
+    job = DownloadJob(
+        id="untrusted-profile-anchor",
+        source_url=source_url,
+        platform=Platform.DOUYIN,
+        source_kind=SourceKind.PROFILE,
+        output_root=str(tmp_path),
+        status=JobStatus.FAILED,
+        error=DOUYIN_UNVERIFIABLE_QUEUE_ERROR,
+        warning=DOUYIN_UNVERIFIABLE_QUEUE_ERROR,
+        retryable=False,
+        discovery_complete=False,
+        verification_url="https://evil.example/stale-verification",
+        items=[
+            DownloadItem(
+                id=preserved_media_id,
+                media_id=preserved_media_id,
+                source_url=(
+                    f"https://www.douyin.com/video/{preserved_media_id}"
+                ),
+                title="Preserved unverified file",
+                status=ItemStatus.FAILED,
+                retryable=False,
+                output_paths=[str(output_path)],
+            )
+        ],
+    )
+    job.refresh_counts()
+
+    assert DownloadManager._recoverable_douyin_profile_source(job) is None
+    JsonJobStore(state_dir).save(job)
+
+    manager = DownloadManager(
+        state_dir=state_dir,
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    try:
+        restored = manager.get_job(job.id)
+
+        assert restored.source_url == source_url
+        assert restored.source_kind == SourceKind.PROFILE
+        assert restored.status == JobStatus.FAILED
+        assert restored.retryable is False
+        assert restored.discovery_complete is False
+        assert restored.error == DOUYIN_UNVERIFIABLE_QUEUE_ERROR
+        assert restored.verification_url == "https://evil.example/stale-verification"
+        assert len(restored.items) == 1
+        assert restored.items[0].output_paths == [str(output_path)]
+        assert restored.items[0].retryable is False
+        assert output_path.read_bytes() == b"must-remain-unchanged"
+    finally:
+        manager.shutdown()
+
+
+def test_restore_preserves_files_and_rediscovers_mixed_numeric_profile_queue(
     tmp_path,
 ) -> None:
     state_dir = tmp_path / "state"
@@ -1105,21 +2440,156 @@ def test_restore_quarantines_mixed_verified_and_unverified_numeric_queue(
     try:
         restored = manager.get_job(job.id)
 
-        assert restored.status == JobStatus.FAILED
+        assert restored.status == JobStatus.INTERRUPTED
+        assert restored.error == DOUYIN_PROFILE_REDISCOVERY_MESSAGE
+        assert restored.warning == restored.error
+        assert restored.auth_message is None
+        assert restored.verification_url == job.source_url
+        assert restored.retryable is True
+        assert restored.discovery_complete is False
         assert restored.total_items == 1
         assert restored.items[0].output_paths == [str(output_path)]
         assert restored.items[0].retryable is False
+        assert (
+            restored.items[0].metadata[DOUYIN_PROFILE_REDISCOVERY_ITEM_MARKER]
+            is True
+        )
         assert output_path.exists()
     finally:
         manager.shutdown()
 
+    second_manager = DownloadManager(
+        state_dir=state_dir,
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    try:
+        second = second_manager.get_job(job.id)
 
-def test_restore_keeps_fully_verified_numeric_profile_queue(tmp_path) -> None:
+        assert second.model_dump(mode="json") == restored.model_dump(mode="json")
+        assert output_path.read_bytes() == b"preserved"
+    finally:
+        second_manager.shutdown()
+
+
+def test_restore_repairs_owner_verified_numeric_queue_and_rediscovery(
+    monkeypatch,
+    tmp_path,
+) -> None:
     state_dir = tmp_path / "state"
+    profile_url = "https://www.douyin.com/user/verified-profile"
+    media_ids = [str(7670000000000000000 + index) for index in range(151)]
+    job = DownloadJob(
+        id="incomplete-owner-verified-profile",
+        source_url=profile_url,
+        platform=Platform.DOUYIN,
+        source_kind=SourceKind.PROFILE,
+        output_root=str(tmp_path / "downloads"),
+        status=JobStatus.NEEDS_AUTH,
+        auth_message="Complete verification",
+        verification_url=profile_url,
+        items=[
+            DownloadItem(
+                id=media_id,
+                media_id=media_id,
+                source_url=f"https://www.douyin.com/video/{media_id}",
+                title=media_id,
+                status=(ItemStatus.NEEDS_AUTH if index == 0 else ItemStatus.QUEUED),
+                metadata={
+                    "profile_url": profile_url,
+                    "profile_owner_verified": True,
+                },
+            )
+            for index, media_id in enumerate(media_ids)
+        ],
+    )
+    job.refresh_counts()
+    JsonJobStore(state_dir).save(job)
+
+    class RediscoveredProfileEngine:
+        def __init__(self) -> None:
+            self.discovery_calls = 0
+            self.download_calls = 0
+
+        def discover(self, url, platform, kind, *, should_cancel):
+            self.discovery_calls += 1
+            media_id = media_ids[0]
+            return DiscoveryResult(
+                author="Verified author",
+                items=[
+                    DownloadItem(
+                        id="rediscovered-item",
+                        media_id=media_id,
+                        source_url=f"https://www.douyin.com/video/{media_id}",
+                        title="Rediscovered title",
+                        media_type=MediaType.VIDEO,
+                        metadata=complete_douyin_profile_metadata(
+                            profile_url,
+                            media_id,
+                            title="Rediscovered title",
+                        ),
+                    )
+                ],
+            )
+
+        def download_item(
+            self,
+            item,
+            platform,
+            output_dir,
+            *,
+            callback,
+            should_cancel,
+        ):
+            self.download_calls += 1
+            return DownloadOutcome(
+                output_paths=[str(Path(output_dir) / "rediscovered.mp4")],
+                title=item.title,
+                author="Verified author",
+                media_type=MediaType.VIDEO,
+                resolution="1440x2560",
+            )
+
+    manager = DownloadManager(
+        state_dir=state_dir,
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    engine = RediscoveredProfileEngine()
+    monkeypatch.setattr(manager, "_engine_for_job", lambda current: engine)
+    try:
+        restored = manager.get_job(job.id)
+
+        assert restored.status == JobStatus.INTERRUPTED
+        assert restored.items == []
+        assert restored.total_items == 0
+        assert restored.auth_message is None
+        assert restored.verification_url == profile_url
+        assert restored.discovery_complete is False
+        assert restored.retryable is True
+
+        manager.retry_failed(job.id)
+        completed = wait_for_job(manager, job.id)
+
+        assert completed.status == JobStatus.COMPLETED
+        assert completed.total_items == 1
+        assert completed.items[0].title == "Rediscovered title"
+        assert completed.items[0].resolution == "1440x2560"
+        assert engine.discovery_calls == 1
+        assert engine.download_calls == 1
+    finally:
+        manager.shutdown()
+
+
+def test_restore_repairs_numeric_item_titles_with_complete_profile_cache(
+    tmp_path,
+) -> None:
+    state_dir = tmp_path / "state"
+    profile_url = "https://www.douyin.com/user/verified-profile"
     media_ids = ("7670000000000000001", "7670000000000000002")
     job = DownloadJob(
-        id="verified-numeric-profile",
-        source_url="https://www.douyin.com/user/verified-profile",
+        id="complete-numeric-title-profile",
+        source_url=profile_url,
         platform=Platform.DOUYIN,
         source_kind=SourceKind.PROFILE,
         output_root=str(tmp_path / "downloads"),
@@ -1131,9 +2601,13 @@ def test_restore_keeps_fully_verified_numeric_profile_queue(tmp_path) -> None:
                 source_url=f"https://www.douyin.com/video/{media_id}",
                 title=media_id,
                 status=ItemStatus.NEEDS_AUTH,
-                metadata={"profile_owner_verified": True},
+                metadata=complete_douyin_profile_metadata(
+                    profile_url,
+                    media_id,
+                    title=f"Cached title {index}",
+                ),
             )
-            for media_id in media_ids
+            for index, media_id in enumerate(media_ids, start=1)
         ],
     )
     job.refresh_counts()
@@ -1149,12 +2623,199 @@ def test_restore_keeps_fully_verified_numeric_profile_queue(tmp_path) -> None:
 
         assert restored.status == JobStatus.NEEDS_AUTH
         assert restored.total_items == 2
+        assert [item.title for item in restored.items] == [
+            "Cached title 1",
+            "Cached title 2",
+        ]
         assert restored.retryable is True
     finally:
         manager.shutdown()
 
 
-def test_numeric_profile_quarantine_migration_is_idempotent(tmp_path) -> None:
+def test_restore_repairs_even_one_owner_verified_numeric_placeholder(tmp_path) -> None:
+    state_dir = tmp_path / "state"
+    profile_url = "https://www.douyin.com/user/one-video-profile"
+    media_id = "7670000000000000001"
+    job = DownloadJob(
+        id="single-incomplete-profile-placeholder",
+        source_url=profile_url,
+        platform=Platform.DOUYIN,
+        source_kind=SourceKind.PROFILE,
+        output_root=str(tmp_path / "downloads"),
+        status=JobStatus.NEEDS_AUTH,
+        items=[
+            DownloadItem(
+                id=media_id,
+                media_id=media_id,
+                source_url=f"https://www.douyin.com/video/{media_id}",
+                title=media_id,
+                status=ItemStatus.NEEDS_AUTH,
+                metadata={
+                    "profile_url": profile_url,
+                    "profile_owner_verified": True,
+                },
+            )
+        ],
+    )
+    job.refresh_counts()
+    JsonJobStore(state_dir).save(job)
+
+    manager = DownloadManager(
+        state_dir=state_dir,
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    try:
+        restored = manager.get_job(job.id)
+
+        assert restored.status == JobStatus.INTERRUPTED
+        assert restored.items == []
+        assert restored.retryable is True
+        assert restored.discovery_complete is False
+        assert restored.verification_url == profile_url
+    finally:
+        manager.shutdown()
+
+
+def test_incomplete_owner_verified_profile_migration_preserves_files_and_is_idempotent(
+    tmp_path,
+) -> None:
+    state_dir = tmp_path / "state"
+    output_dir = tmp_path / "downloads"
+    output_dir.mkdir(parents=True)
+    profile_url = "https://www.douyin.com/user/verified-profile"
+    saved_id = "7670000000000000001"
+    queued_ids = ("7670000000000000002", "7670000000000000003")
+    saved_path = output_dir / "saved.mp4"
+    saved_path.write_bytes(b"preserved")
+    shared_metadata = {
+        "profile_url": profile_url,
+        "profile_owner_verified": True,
+    }
+    job = DownloadJob(
+        id="idempotent-incomplete-profile",
+        source_url=profile_url,
+        platform=Platform.DOUYIN,
+        source_kind=SourceKind.PROFILE,
+        output_root=str(output_dir),
+        status=JobStatus.NEEDS_AUTH,
+        items=[
+            DownloadItem(
+                id=saved_id,
+                media_id=saved_id,
+                source_url=f"https://www.douyin.com/video/{saved_id}",
+                title=saved_id,
+                status=ItemStatus.COMPLETED,
+                output_paths=[str(saved_path)],
+                metadata=dict(shared_metadata),
+            ),
+            *[
+                DownloadItem(
+                    id=media_id,
+                    media_id=media_id,
+                    source_url=f"https://www.douyin.com/video/{media_id}",
+                    title=media_id,
+                    status=ItemStatus.QUEUED,
+                    metadata=dict(shared_metadata),
+                )
+                for media_id in queued_ids
+            ],
+        ],
+    )
+    job.refresh_counts()
+    JsonJobStore(state_dir).save(job)
+
+    first_manager = DownloadManager(
+        state_dir=state_dir,
+        default_output_root=output_dir,
+        max_workers=1,
+    )
+    first = first_manager.get_job(job.id)
+    first_manager.shutdown()
+
+    assert first.status == JobStatus.INTERRUPTED
+    assert first.discovery_complete is False
+    assert first.retryable is True
+    assert len(first.items) == 1
+    assert first.items[0].output_paths == [str(saved_path)]
+    assert first.items[0].status == ItemStatus.FAILED
+    assert first.items[0].retryable is False
+    assert first.items[0].title == f"Recovered Douyin files {saved_id}"
+    assert first.items[0].metadata["_douyin_profile_rediscovery_pending"] is True
+    assert saved_path.read_bytes() == b"preserved"
+
+    second_manager = DownloadManager(
+        state_dir=state_dir,
+        default_output_root=output_dir,
+        max_workers=1,
+    )
+    try:
+        second = second_manager.get_job(job.id)
+
+        assert second.model_dump(mode="json") == first.model_dump(mode="json")
+        assert saved_path.read_bytes() == b"preserved"
+    finally:
+        second_manager.shutdown()
+
+
+def test_profile_rediscovery_marker_preserves_needs_auth_across_restart(
+    tmp_path,
+) -> None:
+    state_dir = tmp_path / "state"
+    profile_url = "https://www.douyin.com/user/verified-profile"
+    media_id = "7670000000000000001"
+    auth_message = "Explicit CAPTCHA is required"
+    job = DownloadJob(
+        id="profile-rediscovery-needs-auth",
+        source_url=profile_url,
+        platform=Platform.DOUYIN,
+        source_kind=SourceKind.PROFILE,
+        output_root=str(tmp_path / "downloads"),
+        status=JobStatus.NEEDS_AUTH,
+        error=auth_message,
+        warning=DOUYIN_PROFILE_REDISCOVERY_MESSAGE,
+        auth_message=auth_message,
+        verification_url=profile_url,
+        discovery_complete=False,
+        items=[
+            DownloadItem(
+                id=media_id,
+                media_id=media_id,
+                source_url=f"https://www.douyin.com/video/{media_id}",
+                title=f"Recovered Douyin files {media_id}",
+                status=ItemStatus.FAILED,
+                retryable=False,
+                output_paths=[str(tmp_path / "downloads" / "preserved.mp4")],
+                metadata={
+                    "profile_url": profile_url,
+                    "profile_owner_verified": True,
+                    DOUYIN_PROFILE_REDISCOVERY_ITEM_MARKER: True,
+                },
+            )
+        ],
+    )
+    job.refresh_counts()
+    JsonJobStore(state_dir).save(job)
+
+    manager = DownloadManager(
+        state_dir=state_dir,
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    try:
+        restored = manager.get_job(job.id)
+
+        assert restored.status == JobStatus.NEEDS_AUTH
+        assert restored.auth_message == auth_message
+        assert restored.verification_url == profile_url
+        assert restored.items[0].metadata[
+            DOUYIN_PROFILE_REDISCOVERY_ITEM_MARKER
+        ] is True
+    finally:
+        manager.shutdown()
+
+
+def test_numeric_profile_rediscovery_migration_is_idempotent(tmp_path) -> None:
     state_dir = tmp_path / "state"
     output_dir = tmp_path / "downloads"
     output_dir.mkdir(parents=True)
@@ -1205,14 +2866,19 @@ def test_numeric_profile_quarantine_migration_is_idempotent(tmp_path) -> None:
     try:
         second = second_manager.get_job(job.id)
 
-        assert first.status == JobStatus.FAILED
-        assert first.retryable is False
+        assert first.status == JobStatus.INTERRUPTED
+        assert first.retryable is True
+        assert first.error == DOUYIN_PROFILE_REDISCOVERY_MESSAGE
         assert first.revision == second.revision
         assert first.finished_at == second.finished_at
         assert [item.output_paths for item in second.items] == [
             [output_paths[0]],
             [output_paths[1]],
         ]
+        assert all(
+            item.metadata[DOUYIN_PROFILE_REDISCOVERY_ITEM_MARKER] is True
+            for item in second.items
+        )
     finally:
         second_manager.shutdown()
 
@@ -1395,7 +3061,7 @@ def test_fresh_douyin_discovery_cannot_launder_wrong_cache_binding(tmp_path) -> 
         },
     )
 
-    with pytest.raises(AuthenticationRequiredError, match="uploader profile"):
+    with pytest.raises(DiscoveryError, match="uploader profile"):
         DownloadManager._validate_discovery_result(
             job,
             DiscoveryResult(author="Author", items=[item]),
@@ -1419,6 +3085,71 @@ def test_failed_douyin_profile_retry_refreshes_signed_media_urls(tmp_path) -> No
                 id="failed-item",
                 media_id="2222222222222222222",
                 source_url="https://www.douyin.com/video/2222222222222222222",
+                status=ItemStatus.FAILED,
+                retryable=True,
+            )
+        ],
+    )
+
+    assert DownloadManager._should_rediscover_on_retry(job) is True
+
+
+def test_failed_xiaohongshu_profile_retry_refreshes_xsec_tokens(tmp_path) -> None:
+    job = DownloadJob(
+        id="xhs-profile-expired-token",
+        source_url="https://www.xiaohongshu.com/user/profile/expected",
+        platform=Platform.XIAOHONGSHU,
+        source_kind=SourceKind.PROFILE,
+        output_root=str(tmp_path),
+        status=JobStatus.FAILED,
+        discovery_complete=True,
+        items=[
+            DownloadItem(
+                id="failed-note",
+                media_id="6411cf99000000001300b6d9",
+                source_url=(
+                    "https://www.xiaohongshu.com/explore/6411cf99000000001300b6d9"
+                    "?xsec_token=stale&xsec_source=pc_user"
+                ),
+                status=ItemStatus.FAILED,
+                retryable=True,
+            )
+        ],
+    )
+
+    assert DownloadManager._should_rediscover_on_retry(job) is True
+
+
+@pytest.mark.parametrize(
+    ("source_kind", "source_url"),
+    [
+        (
+            SourceKind.ITEM,
+            "https://www.xiaohongshu.com/explore/6411cf99000000001300b6d9",
+        ),
+        (SourceKind.SHORT_LINK, "https://xhslink.com/a/stable-short-code"),
+    ],
+)
+def test_failed_xiaohongshu_direct_retry_refreshes_discovery(
+    source_kind: SourceKind,
+    source_url: str,
+    tmp_path,
+) -> None:
+    job = DownloadJob(
+        id="xhs-direct-expired-token",
+        source_url=source_url,
+        platform=Platform.XIAOHONGSHU,
+        source_kind=source_kind,
+        output_root=str(tmp_path),
+        status=JobStatus.FAILED,
+        items=[
+            DownloadItem(
+                id="failed-note",
+                media_id="6411cf99000000001300b6d9",
+                source_url=(
+                    "https://www.xiaohongshu.com/explore/"
+                    "6411cf99000000001300b6d9?xsec_token=stale"
+                ),
                 status=ItemStatus.FAILED,
                 retryable=True,
             )
@@ -1865,6 +3596,117 @@ def test_profile_refresh_preserves_files_saved_before_a_partial_failure() -> Non
     assert merged.error == "Image 3 failed"
 
 
+def test_douyin_profile_rediscovery_queues_matched_recovery_and_skips_missing() -> None:
+    matched_id = "7670000000000000001"
+    missing_id = "7670000000000000002"
+    previous = [
+        DownloadItem(
+            id="old-matched",
+            media_id=matched_id,
+            source_url=f"https://www.douyin.com/video/{matched_id}",
+            title=f"Recovered Douyin files {matched_id}",
+            status=ItemStatus.FAILED,
+            retryable=False,
+            output_paths=["/downloads/preserved-matched.mp4"],
+            attempts=2,
+            metadata={DOUYIN_PROFILE_REDISCOVERY_ITEM_MARKER: True},
+        ),
+        DownloadItem(
+            id="old-missing",
+            media_id=missing_id,
+            source_url=f"https://www.douyin.com/video/{missing_id}",
+            title=missing_id,
+            status=ItemStatus.FAILED,
+            retryable=False,
+            output_paths=["/downloads/preserved-missing.mp4"],
+            metadata={DOUYIN_PROFILE_REDISCOVERY_ITEM_MARKER: True},
+        ),
+    ]
+    fresh = DownloadItem(
+        id="fresh-matched",
+        media_id=matched_id,
+        source_url=f"https://www.douyin.com/video/{matched_id}",
+        title="Verified refreshed title",
+        status=ItemStatus.QUEUED,
+        retryable=True,
+        metadata={"verified": True},
+    )
+
+    merged = DownloadManager._merge_discovered_items(previous, [fresh])
+    refreshed, retired = merged
+
+    assert refreshed.id == "fresh-matched"
+    assert refreshed.title == "Verified refreshed title"
+    assert refreshed.status == ItemStatus.QUEUED
+    assert refreshed.retryable is True
+    assert refreshed.output_paths == ["/downloads/preserved-matched.mp4"]
+    assert refreshed.attempts == 2
+    assert DOUYIN_PROFILE_REDISCOVERY_ITEM_MARKER not in refreshed.metadata
+    assert retired.status == ItemStatus.SKIPPED
+    assert retired.retryable is False
+    assert retired.title == f"Recovered Douyin files {missing_id}"
+    assert DOUYIN_PROFILE_REDISCOVERY_ITEM_MARKER not in retired.metadata
+
+
+def test_completed_profile_refresh_uses_fresh_verified_display_metadata() -> None:
+    media_id = "7670000000000000001"
+    previous = DownloadItem(
+        id="old-id",
+        media_id=media_id,
+        source_url=f"https://www.douyin.com/video/{media_id}",
+        title=media_id,
+        author="Old author",
+        upload_date="2024-01-01",
+        media_type=MediaType.VIDEO,
+        status=ItemStatus.COMPLETED,
+        output_paths=["/downloads/preserved.mp4"],
+    )
+    fresh = DownloadItem(
+        id="fresh-id",
+        media_id=media_id,
+        source_url=f"https://www.douyin.com/video/{media_id}",
+        title="Fresh verified title",
+        author="Fresh author",
+        upload_date="2025-08-27",
+        media_type=MediaType.IMAGE,
+        extractor_key="Douyin",
+    )
+
+    merged = DownloadManager._merge_discovered_items([previous], [fresh])[0]
+
+    assert merged.status == ItemStatus.COMPLETED
+    assert merged.output_paths == previous.output_paths
+    assert merged.title == "Fresh verified title"
+    assert merged.author == "Fresh author"
+    assert merged.upload_date == "2025-08-27"
+    assert merged.media_type == MediaType.IMAGE
+
+
+def test_completed_non_douyin_refresh_preserves_saved_display_metadata() -> None:
+    previous = DownloadItem(
+        id="old-note",
+        media_id="note-id",
+        source_url="https://www.xiaohongshu.com/explore/note-id?token=old",
+        title="Previously parsed title",
+        author="Known author",
+        upload_date="2025-01-02",
+        status=ItemStatus.COMPLETED,
+        output_paths=["/downloads/note.webp"],
+    )
+    fresh = DownloadItem(
+        id="fresh-note",
+        media_id="note-id",
+        source_url="https://www.xiaohongshu.com/explore/note-id?token=fresh",
+        title="note-id",
+    )
+
+    merged = DownloadManager._merge_discovered_items([previous], [fresh])[0]
+
+    assert merged.title == "Previously parsed title"
+    assert merged.author == "Known author"
+    assert merged.upload_date == "2025-01-02"
+
+
 def test_profile_refresh_failure_can_be_retried_again(monkeypatch, tmp_path) -> None:
     manager = DownloadManager(
         state_dir=tmp_path / "state",
@@ -1904,8 +3746,10 @@ def test_incomplete_profile_with_only_completed_items_can_continue_discovery(
     tmp_path,
 ) -> None:
     profile_url = "https://www.xiaohongshu.com/user/profile/example"
-    existing_url = "https://www.xiaohongshu.com/explore/existing-note"
-    new_url = "https://www.xiaohongshu.com/explore/new-note"
+    existing_media_id = "6411cf99000000001300b6d9"
+    new_media_id = "6411cf99000000001300b6da"
+    existing_url = f"https://www.xiaohongshu.com/explore/{existing_media_id}"
+    new_url = f"https://www.xiaohongshu.com/explore/{new_media_id}"
 
     class ContinuedDiscoveryEngine:
         def __init__(self) -> None:
@@ -1921,17 +3765,25 @@ def test_incomplete_profile_with_only_completed_items_can_continue_discovery(
                 items=[
                     DownloadItem(
                         id="existing-note",
-                        media_id="existing-note",
+                        media_id=existing_media_id,
                         source_url=existing_url,
                         title="Existing note",
                         media_type=MediaType.IMAGE,
+                        metadata={
+                            "xiaohongshu_profile_id": "example",
+                            "profile_note_membership_verified": True,
+                        },
                     ),
                     DownloadItem(
                         id="new-note",
-                        media_id="new-note",
+                        media_id=new_media_id,
                         source_url=new_url,
                         title="New note",
                         media_type=MediaType.IMAGE,
+                        metadata={
+                            "xiaohongshu_profile_id": "example",
+                            "profile_note_membership_verified": True,
+                        },
                     ),
                 ],
             )
@@ -1972,7 +3824,7 @@ def test_incomplete_profile_with_only_completed_items_can_continue_discovery(
             job.items = [
                 DownloadItem(
                     id="existing-note",
-                    media_id="existing-note",
+                    media_id=existing_media_id,
                     source_url=existing_url,
                     title="Existing note",
                     media_type=MediaType.IMAGE,

@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import queue
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Iterator
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
@@ -31,6 +33,24 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 DATA_DIR = PROJECT_ROOT / "data"
 CONFIG_PATH = DATA_DIR / "config.json"
 DEFAULT_DOWNLOAD_DIR = PROJECT_ROOT / "downloads"
+PUBLIC_DOUYIN_MEDIA_FIELDS = frozenset(
+    {
+        "asset_count",
+        "author",
+        "create_time",
+        "duration_ms",
+        "image_count",
+        "live_photo_count",
+        "media_id",
+        "media_kind",
+        "media_type",
+        "minimum_height",
+        "minimum_width",
+        "owner_id",
+        "title",
+    }
+)
+PUBLIC_SENSITIVE_QUERY_FIELDS = frozenset({"xsec_token"})
 
 
 class AppConfig(BaseModel):
@@ -126,14 +146,64 @@ def _http_error(exc: Exception) -> HTTPException:
     return HTTPException(status_code=400, detail=str(exc))
 
 
+def _redact_public_url(value: str) -> str:
+    if "xsec_token" not in value.lower():
+        return value
+    try:
+        parsed = urlsplit(value)
+        filtered_query = [
+            (name, item)
+            for name, item in parse_qsl(parsed.query, keep_blank_values=True)
+            if name.lower() not in PUBLIC_SENSITIVE_QUERY_FIELDS
+        ]
+        return urlunsplit(
+            (
+                parsed.scheme,
+                parsed.netloc,
+                parsed.path,
+                urlencode(filtered_query, doseq=True),
+                parsed.fragment,
+            )
+        )
+    except (TypeError, ValueError):
+        return re.sub(
+            r"([?&])xsec_token=[^&#]*&?",
+            lambda match: match.group(1) if match.group(0).endswith("&") else "",
+            value,
+            flags=re.IGNORECASE,
+        )
+
+
+def _redact_public_value(value):
+    if isinstance(value, str):
+        return _redact_public_url(value)
+    if isinstance(value, list):
+        return [_redact_public_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_public_value(item) for item in value)
+    if isinstance(value, dict):
+        return {name: _redact_public_value(item) for name, item in value.items()}
+    return value
+
+
 def _public_job(job: DownloadJob) -> DownloadJob:
     public = job.model_copy(deep=True)
+    public.source_url = _redact_public_url(public.source_url)
+    if public.verification_url:
+        public.verification_url = _redact_public_url(public.verification_url)
     for item in public.items:
+        item.source_url = _redact_public_url(item.source_url)
+        item.metadata = _redact_public_value(item.metadata)
         for key in ("douyin_item_media", "douyin_profile_media"):
             cached = item.metadata.get(key)
             if isinstance(cached, dict):
-                cached.pop("video_uri", None)
-                cached.pop("direct_candidates", None)
+                item.metadata[key] = {
+                    name: value
+                    for name, value in cached.items()
+                    if name in PUBLIC_DOUYIN_MEDIA_FIELDS
+                }
+            elif key in item.metadata:
+                item.metadata.pop(key, None)
     return public
 
 
@@ -234,7 +304,7 @@ def open_verification(job_id: str) -> dict[str, str]:
             raise UnsupportedUrlError("The original task URL is no longer verifiable")
         url = source.url
         _open_chrome(url)
-        return {"status": "opened", "url": url}
+        return {"status": "opened", "url": _redact_public_url(url)}
     except Exception as exc:
         raise _http_error(exc) from exc
 

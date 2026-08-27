@@ -23,9 +23,9 @@ if errorlevel 1 (
 )
 
 where ffmpeg >nul 2>nul
-if errorlevel 1 echo Warning: FFmpeg was not found. Douyin quality verification and split video/audio downloads may fail.
+if errorlevel 1 echo Warning: FFmpeg was not found. Split video/audio downloads may fail.
 where ffprobe >nul 2>nul
-if errorlevel 1 echo Warning: FFprobe was not found. Douyin quality verification will fail.
+if errorlevel 1 echo Warning: FFprobe was not found. Douyin and Xiaohongshu video quality verification will fail.
 
 if not exist ".venv\Scripts\python.exe" (
   echo Creating the local Python environment...

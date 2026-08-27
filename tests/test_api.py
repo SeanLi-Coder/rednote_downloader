@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app import main as main_module
@@ -45,6 +46,34 @@ def test_index_injects_build_identity_and_disables_html_cache() -> None:
 
     assert static_response.status_code == 200
     assert static_response.headers["cache-control"] == "no-store, max-age=0"
+    for progress_marker in (
+        "Checking Douyin Live Photo quality",
+        "Checking Douyin direct quality",
+        "Checking Douyin quality",
+        "Retrying Douyin quality",
+        "正在检测抖音 Live Photo 最高画质",
+        "正在检测抖音直连候选画质",
+        "正在重试",
+    ):
+        assert progress_marker in static_response.text
+    for classification_marker in (
+        "这是旧版本把通用签名失败误标成了验证码",
+        "抖音返回了其他视频或其他作者的数据，程序已拦截",
+        "抖音签名解析在拿到可验证响应前遇到临时网络或超时错误",
+        "只有抖音明确显示验证码或登录页面时才需要打开 Chrome",
+        "小红书任务中的作品身份或主页归属无法验证",
+        "小红书短链接这次跳到了与首次解析不同的作品或主页",
+        "最终下载文件与已验证的最高画质不一致",
+        "这是旧版本留下的不完整抖音主页队列",
+        "已保留的旧抖音文件",
+        "FFprobe 未返回码率或完整媒体大小",
+    ):
+        assert classification_marker in static_response.text
+    assert (
+        "discoveryFailureMessage || localizeRuntimeMessage(job?.warning, job)"
+        in static_response.text
+    )
+    assert "抖音暂时无法创建经过验证的请求。请在 Chrome" not in static_response.text
 
 
 def test_douyin_item_verification_always_opens_original_video(
@@ -106,6 +135,8 @@ def test_public_job_hides_internal_douyin_media_identity(tmp_path) -> None:
                 metadata={
                     "douyin_item_media": {
                         "media_id": "7664225419386607205",
+                        "media_kind": "video",
+                        "title": "Public title",
                         "video_uri": "internal-media-credential",
                         "direct_candidates": [
                             {
@@ -114,7 +145,28 @@ def test_public_job_hides_internal_douyin_media_identity(tmp_path) -> None:
                                 "urls": ["https://v26-web.douyinvod.com/secret"],
                             }
                         ],
-                    }
+                    },
+                    "douyin_profile_media": {
+                        "media_id": "7664225419386607205",
+                        "media_kind": "image",
+                        "title": "Public image title",
+                        "image_assets": [
+                            {
+                                "index": 1,
+                                "candidates": [
+                                    "https://p3-sign.douyinpic.com/private-image"
+                                ],
+                            }
+                        ],
+                        "live_photo_assets": [
+                            {
+                                "index": 1,
+                                "candidates": [
+                                    "https://v26-web.douyinvod.com/private-live-photo"
+                                ],
+                            }
+                        ],
+                    },
                 },
             )
         ],
@@ -123,17 +175,73 @@ def test_public_job_hides_internal_douyin_media_identity(tmp_path) -> None:
     public = main_module._public_job(job)
 
     assert public.items[0].metadata["douyin_item_media"] == {
-        "media_id": "7664225419386607205"
+        "media_id": "7664225419386607205",
+        "media_kind": "video",
+        "title": "Public title",
+    }
+    assert public.items[0].metadata["douyin_profile_media"] == {
+        "media_id": "7664225419386607205",
+        "media_kind": "image",
+        "title": "Public image title",
     }
     assert job.items[0].metadata["douyin_item_media"]["video_uri"] == (
         "internal-media-credential"
     )
+    assert "image_assets" in job.items[0].metadata["douyin_profile_media"]
+    assert "live_photo_assets" in job.items[0].metadata["douyin_profile_media"]
+
+
+def test_public_xiaohongshu_urls_redact_xsec_token_but_keep_internal_url(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    secret = "TOP_SECRET_XSEC_TOKEN"
+    source_url = (
+        "https://www.xiaohongshu.com/explore/6411cf99000000001300b6d9"
+        f"?xsec_token={secret}&xsec_source=pc_user"
+    )
+    job = DownloadJob(
+        id="public-xhs-token",
+        source_url=source_url,
+        platform=Platform.XIAOHONGSHU,
+        source_kind=SourceKind.ITEM,
+        output_root=str(tmp_path),
+        verification_url=source_url,
+        items=[
+            DownloadItem(
+                id="xhs-item",
+                source_url=source_url,
+                metadata={"nested_url": source_url},
+            )
+        ],
+    )
+
+    public = main_module._public_job(job)
+    public_json = public.model_dump_json()
+
+    assert secret not in public_json
+    assert "xsec_token" not in public.source_url
+    assert "xsec_source=pc_user" in public.source_url
+    assert secret in job.source_url
+    assert secret in job.items[0].source_url
+
+    opened = []
+    monkeypatch.setattr(main_module.manager, "get_job", lambda job_id: job)
+    monkeypatch.setattr(main_module, "_open_chrome", opened.append)
+
+    response = main_module.open_verification(job.id)
+
+    assert opened == [source_url]
+    assert secret not in response["url"]
+    assert "xsec_token" not in response["url"]
 
 
 def test_jobs_endpoint_never_serializes_douyin_direct_candidate_urls(
     monkeypatch, tmp_path
 ) -> None:
     secret_url = "https://v26-web.douyinvod.com/private-signed-stream"
+    secret_image_url = "https://p3-sign.douyinpic.com/private-signed-image"
+    secret_live_url = "https://v26-web.douyinvod.com/private-signed-live-photo"
     job = DownloadJob(
         id="public-list-job",
         source_url="https://www.douyin.com/video/7664225419386607205",
@@ -151,6 +259,12 @@ def test_jobs_endpoint_never_serializes_douyin_direct_candidate_urls(
                         "direct_candidates": [
                             {"width": 1440, "height": 2560, "urls": [secret_url]}
                         ],
+                        "image_assets": [
+                            {"index": 1, "candidates": [secret_image_url]}
+                        ],
+                        "live_photo_assets": [
+                            {"index": 1, "candidates": [secret_live_url]}
+                        ],
                     }
                 },
             )
@@ -165,4 +279,36 @@ def test_jobs_endpoint_never_serializes_douyin_direct_candidate_urls(
 
     assert response.status_code == 200
     assert secret_url not in response.text
+    assert secret_image_url not in response.text
+    assert secret_live_url not in response.text
     assert "direct_candidates" not in response.text
+    assert "image_assets" not in response.text
+    assert "live_photo_assets" not in response.text
+
+
+@pytest.mark.parametrize("malformed", [[], "signed-url", 123])
+def test_public_job_removes_malformed_douyin_media_cache(malformed, tmp_path) -> None:
+    job = DownloadJob(
+        id="malformed-public-cache",
+        source_url="https://www.douyin.com/video/7664225419386607205",
+        platform=Platform.DOUYIN,
+        source_kind=SourceKind.ITEM,
+        output_root=str(tmp_path),
+        items=[
+                DownloadItem(
+                    id="target",
+                    source_url=(
+                        "https://www.douyin.com/video/7664225419386607205"
+                    ),
+                    metadata={
+                    "douyin_item_media": malformed,
+                    "douyin_profile_media": malformed,
+                },
+            )
+        ],
+    )
+
+    public = main_module._public_job(job)
+
+    assert "douyin_item_media" not in public.items[0].metadata
+    assert "douyin_profile_media" not in public.items[0].metadata

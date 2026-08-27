@@ -4,6 +4,7 @@ import contextlib
 import re
 import time
 from dataclasses import dataclass, field
+from html.parser import HTMLParser
 from http.cookiejar import CookieJar
 from typing import Any, Callable, Iterable
 from urllib.parse import parse_qs, unquote, urlsplit
@@ -12,7 +13,12 @@ from yt_dlp.cookies import extract_cookies_from_browser
 
 from .browser import chrome_user_agent
 from .douyin_signing import fetch_signed_profile_awemes
-from .errors import AuthenticationRequiredError, DiscoveryError, DownloadCancelledError
+from .errors import (
+    AuthenticationRequiredError,
+    DiscoveryError,
+    DownloadCancelledError,
+    TemporaryAccessError,
+)
 
 
 AUTH_TEXT_PATTERNS = (
@@ -22,13 +28,26 @@ AUTH_TEXT_PATTERNS = (
     "安全验证",
     "验证码",
     "请完成下列验证",
-    "访问频繁",
-    "网络环境存在风险",
     "登录后查看",
 )
+TRANSIENT_TEXT_PATTERNS = (
+    "访问频繁",
+    "请求频繁",
+    "too many requests",
+    "try again later",
+    "网络环境存在风险",
+)
+EXPLICIT_AUTH_PATH_MARKERS = ("/captcha", "/login", "/passport/", "/verify")
 
 DOUYIN_QUALITY_FLOOR_SHORT_EDGE = 1080
 DOUYIN_QUALITY_FLOOR_LONG_EDGE = 1920
+_DOUYIN_VIDEO_DOMAINS = (
+    "douyin.com",
+    "douyinvod.com",
+    "amemv.com",
+    "zjcdn.com",
+)
+_DOUYIN_IMAGE_DOMAINS = ("douyinpic.com",)
 
 
 @dataclass(slots=True)
@@ -59,9 +78,70 @@ class _QuietCookieLogger:
         pass
 
 
+class _VisibleTextParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._hidden_depth = 0
+        self.values: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        del attrs
+        if tag.lower() in {"script", "style", "template", "noscript"}:
+            self._hidden_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if (
+            tag.lower() in {"script", "style", "template", "noscript"}
+            and self._hidden_depth
+        ):
+            self._hidden_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if not self._hidden_depth and data.strip():
+            self.values.append(data)
+
+
+def _visible_text(value: str) -> str:
+    parser = _VisibleTextParser()
+    try:
+        parser.feed(value)
+        parser.close()
+    except Exception:
+        return ""
+    return re.sub(r"\s+", " ", " ".join(parser.values)).lower()
+
+
 def _looks_like_auth_page(text: str) -> bool:
-    lowered = text.lower()
+    lowered = _visible_text(text)
     return any(pattern in lowered for pattern in AUTH_TEXT_PATTERNS)
+
+
+def _looks_like_transient_limit(text: str) -> bool:
+    lowered = _visible_text(text)
+    return any(pattern in lowered for pattern in TRANSIENT_TEXT_PATTERNS)
+
+
+def _is_trusted_douyin_page_url(value: str) -> bool:
+    try:
+        parsed = urlsplit(value)
+        hostname = (parsed.hostname or "").lower()
+        return (
+            parsed.scheme == "https"
+            and (hostname == "douyin.com" or hostname.endswith(".douyin.com"))
+            and parsed.port in {None, 443}
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_explicit_douyin_auth_url(value: str) -> bool:
+    if not _is_trusted_douyin_page_url(value):
+        return False
+    try:
+        path = unquote(urlsplit(value).path).lower()
+    except (TypeError, ValueError):
+        return False
+    return any(marker in path for marker in EXPLICIT_AUTH_PATH_MARKERS)
 
 
 def _profile_id(url: str) -> str | None:
@@ -103,9 +183,6 @@ def _parse_profile_awemes(
         nickname = author_data.get("nickname")
         if isinstance(nickname, str) and nickname.strip():
             authors.append(nickname.strip())
-        video_data = aweme.get("video")
-        if not isinstance(video_data, dict) or not video_data:
-            continue
         aweme_id = str(aweme.get("aweme_id") or aweme.get("awemeId") or "")
         if aweme_id.isdigit():
             entries.append((aweme_id, f"https://www.douyin.com/video/{aweme_id}"))
@@ -150,17 +227,51 @@ def quality_floor_dimensions(
     )
 
 
+def _is_trusted_https_url(value: str, domains: tuple[str, ...]) -> bool:
+    if not isinstance(value, str) or not value or len(value) > 8_192:
+        return False
+    try:
+        parsed = urlsplit(value)
+        hostname = (parsed.hostname or "").lower().rstrip(".")
+        if (
+            parsed.scheme != "https"
+            or not hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or not any(
+                hostname == domain or hostname.endswith(f".{domain}")
+                for domain in domains
+            )
+        ):
+            return False
+        return parsed.port in {None, 443}
+    except (TypeError, ValueError):
+        return False
+
+
 def _safe_direct_media_urls(address: dict[str, Any]) -> list[str]:
     result: list[str] = []
     for value in address.get("url_list") or []:
-        if not isinstance(value, str) or len(value) > 8_192:
+        if not _is_trusted_https_url(value, _DOUYIN_VIDEO_DOMAINS):
             continue
-        parsed = urlsplit(value)
-        hostname = (parsed.hostname or "").lower().rstrip(".")
-        if parsed.scheme != "https" or not any(
-            hostname == domain or hostname.endswith(f".{domain}")
-            for domain in ("douyin.com", "douyinvod.com", "amemv.com")
-        ):
+        if value not in result:
+            result.append(value)
+        if len(result) >= 5:
+            break
+    return result
+
+
+def _safe_image_urls(image: dict[str, Any]) -> list[str]:
+    """Return only the high-pixel image renditions exposed in ``url_list``.
+
+    ``download_url_list`` is intentionally excluded: Douyin currently returns a
+    separate, visibly transformed 1080p download rendition there even when the
+    post contains a larger image.
+    """
+
+    result: list[str] = []
+    for value in image.get("url_list") or []:
+        if not _is_trusted_https_url(value, _DOUYIN_IMAGE_DOMAINS):
             continue
         if value not in result:
             result.append(value)
@@ -186,6 +297,9 @@ def _direct_quality_candidate(
         "height": dimensions[1],
         "urls": urls,
     }
+    video_uri = str(address.get("uri") or "").strip()
+    if re.fullmatch(r"[A-Za-z0-9_-]{10,200}", video_uri):
+        candidate["video_uri"] = video_uri
     try:
         normalized_bit_rate = int(bit_rate or address.get("bit_rate") or 0)
     except (TypeError, ValueError, OverflowError):
@@ -195,6 +309,227 @@ def _direct_quality_candidate(
     if codec_hint:
         candidate["codec_hint"] = codec_hint
     return candidate
+
+
+def _highest_live_photo_asset(
+    video: Any,
+    *,
+    index: int,
+) -> dict[str, Any] | None:
+    if not isinstance(video, dict) or not video:
+        return None
+    address_values = [
+        (video.get("play_addr"), None, None),
+        (video.get("play_addr_h264"), None, "h264"),
+        (video.get("play_addr_265"), None, "hevc"),
+        (video.get("play_addr_bytevc1"), None, "hevc"),
+    ]
+    bit_rates = video.get("bit_rate")
+    if isinstance(bit_rates, list):
+        for value in bit_rates:
+            if not isinstance(value, dict):
+                continue
+            codec_hint = (
+                "hevc"
+                if value.get("is_h265") in {1, True}
+                or value.get("is_bytevc1") in {1, True}
+                else "h264"
+            )
+            address_values.append(
+                (value.get("play_addr"), value.get("bit_rate"), codec_hint)
+            )
+    candidates = [
+        candidate
+        for address, bit_rate, codec_hint in address_values
+        if (
+            candidate := _direct_quality_candidate(
+                address,
+                bit_rate=bit_rate,
+                codec_hint=codec_hint,
+            )
+        )
+    ]
+    if not candidates:
+        return None
+    candidate_uris = {
+        str(candidate.get("video_uri") or "").strip()
+        for candidate in candidates
+        if candidate.get("video_uri")
+    }
+    if len(candidate_uris) != 1 or any(
+        not candidate.get("video_uri") for candidate in candidates
+    ):
+        return None
+    video_uri = next(iter(candidate_uris))
+    candidates.sort(
+        key=lambda value: (
+            value["width"] * value["height"],
+            int(value.get("bit_rate") or 0),
+        ),
+        reverse=True,
+    )
+    highest_pixels = candidates[0]["width"] * candidates[0]["height"]
+    highest_candidates = [
+        candidate
+        for candidate in candidates
+        if candidate["width"] * candidate["height"] == highest_pixels
+    ]
+    urls: list[str] = []
+    for candidate in highest_candidates:
+        if candidate.get("video_uri") != video_uri:
+            continue
+        for value in candidate["urls"]:
+            if value not in urls:
+                urls.append(value)
+            if len(urls) >= 5:
+                break
+        if len(urls) >= 5:
+            break
+    if not urls:
+        return None
+    result: dict[str, Any] = {
+        "index": index,
+        "width": candidates[0]["width"],
+        "height": candidates[0]["height"],
+        "candidates": urls,
+        "video_uri": video_uri,
+    }
+    duration_ms = video.get("duration")
+    if isinstance(duration_ms, int) and duration_ms > 0:
+        result["duration_ms"] = duration_ms
+    return result
+
+
+def _image_asset(image: Any, *, index: int) -> dict[str, Any] | None:
+    if not isinstance(image, dict):
+        return None
+    dimensions = quality_floor_dimensions([image], cap_full_hd=False)
+    candidates = _safe_image_urls(image)
+    if not dimensions or not candidates:
+        return None
+    return {
+        "index": index,
+        "width": dimensions[0],
+        "height": dimensions[1],
+        "candidates": candidates,
+    }
+
+
+def _metadata_title(
+    aweme: dict[str, Any],
+    media_kind: str,
+    media_id: str,
+) -> str:
+    for key in ("desc", "item_title", "preview_title"):
+        value = aweme.get(key)
+        if isinstance(value, str) and value.strip():
+            title = re.sub(r"\s+", " ", value).strip()[:240]
+            if title != media_id and not title.isdigit():
+                return title
+    return f"Untitled Douyin {media_kind}"
+
+
+def _valid_cached_asset(asset: Any, *, image: bool) -> bool:
+    if not isinstance(asset, dict) or type(asset.get("index")) is not int:
+        return False
+    if asset["index"] <= 0:
+        return False
+    try:
+        width = int(asset.get("width") or 0)
+        height = int(asset.get("height") or 0)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not (0 < width <= 16_384 and 0 < height <= 16_384):
+        return False
+    candidates = asset.get("candidates")
+    if not isinstance(candidates, list) or not candidates or len(candidates) > 5:
+        return False
+    domains = _DOUYIN_IMAGE_DOMAINS if image else _DOUYIN_VIDEO_DOMAINS
+    if not all(_is_trusted_https_url(value, domains) for value in candidates):
+        return False
+    if not image:
+        video_uri = str(asset.get("video_uri") or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{10,200}", video_uri):
+            return False
+        duration_ms = asset.get("duration_ms")
+        if duration_ms is not None and (
+            type(duration_ms) is not int or duration_ms <= 0
+        ):
+            return False
+    return True
+
+
+def _valid_direct_quality_candidate(value: Any, video_uri: str) -> bool:
+    if not isinstance(value, dict) or value.get("video_uri") != video_uri:
+        return False
+    try:
+        width = int(value.get("width") or 0)
+        height = int(value.get("height") or 0)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    urls = value.get("urls")
+    return (
+        0 < width <= 16_384
+        and 0 < height <= 16_384
+        and isinstance(urls, list)
+        and 0 < len(urls) <= 5
+        and all(_is_trusted_https_url(url, _DOUYIN_VIDEO_DOMAINS) for url in urls)
+    )
+
+
+def is_complete_profile_media_metadata(
+    cached: Any,
+    media_id: str,
+    owner_id: str,
+) -> bool:
+    """Return whether cached profile metadata is identity-bound and downloadable."""
+
+    if (
+        not isinstance(cached, dict)
+        or not isinstance(media_id, str)
+        or not isinstance(owner_id, str)
+        or not media_id.isdigit()
+        or not owner_id
+        or str(cached.get("media_id") or "").strip() != media_id
+        or str(cached.get("owner_id") or "").strip() != owner_id
+    ):
+        return False
+    media_kind = cached.get("media_kind")
+    if media_kind == "video":
+        video_uri = str(cached.get("video_uri") or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{10,200}", video_uri):
+            return False
+        direct_candidates = cached.get("direct_candidates")
+        return direct_candidates is None or (
+            isinstance(direct_candidates, list)
+            and 0 < len(direct_candidates) <= 4
+            and all(
+                _valid_direct_quality_candidate(value, video_uri)
+                for value in direct_candidates
+            )
+        )
+    if media_kind != "image":
+        return False
+    image_assets = cached.get("image_assets")
+    if not isinstance(image_assets, list) or not image_assets:
+        return False
+    if not all(_valid_cached_asset(value, image=True) for value in image_assets):
+        return False
+    image_indexes = [value["index"] for value in image_assets]
+    if len(set(image_indexes)) != len(image_indexes):
+        return False
+    live_assets = cached.get("live_photo_assets")
+    if live_assets is None:
+        return True
+    if not isinstance(live_assets, list) or not live_assets:
+        return False
+    if not all(_valid_cached_asset(value, image=False) for value in live_assets):
+        return False
+    live_indexes = [value["index"] for value in live_assets]
+    return (
+        len(set(live_indexes)) == len(live_indexes)
+        and set(live_indexes).issubset(set(image_indexes))
+    )
 
 
 def _minimal_aweme_metadata(
@@ -207,10 +542,48 @@ def _minimal_aweme_metadata(
     owner_id = str(author.get("sec_uid") or author.get("secUid") or "").strip()
     if owner_id != profile_id:
         return None
+    images = aweme.get("images")
+    is_image_post = str(aweme.get("aweme_type") or "") == "68" or (
+        isinstance(images, list) and bool(images)
+    )
+    if is_image_post:
+        if not isinstance(images, list) or not images:
+            return None
+        image_assets: list[dict[str, Any]] = []
+        live_photo_assets: list[dict[str, Any]] = []
+        for index, image in enumerate(images, start=1):
+            asset = _image_asset(image, index=index)
+            if not asset:
+                return None
+            image_assets.append(asset)
+            nested_video = image.get("video") if isinstance(image, dict) else None
+            if isinstance(nested_video, dict) and nested_video:
+                live_asset = _highest_live_photo_asset(nested_video, index=index)
+                if not live_asset:
+                    return None
+                live_photo_assets.append(live_asset)
+        metadata: dict[str, Any] = {
+            "media_id": aweme_id,
+            "owner_id": owner_id,
+            "media_kind": "image",
+            "image_assets": image_assets,
+            "title": _metadata_title(aweme, "image", aweme_id),
+        }
+        if live_photo_assets:
+            metadata["live_photo_assets"] = live_photo_assets
+        create_time = aweme.get("create_time")
+        if isinstance(create_time, int) and create_time > 0:
+            metadata["create_time"] = create_time
+        nickname = author.get("nickname")
+        if isinstance(nickname, str) and nickname.strip():
+            metadata["author"] = nickname.strip()
+        if not is_complete_profile_media_metadata(metadata, aweme_id, profile_id):
+            return None
+        return aweme_id, metadata
+
     video = aweme.get("video")
     if not isinstance(video, dict):
         return None
-    video_uri = ""
     address_values = [
         ("play_addr", video.get("play_addr"), None),
         ("play_addr_h264", video.get("play_addr_h264"), "h264"),
@@ -223,20 +596,25 @@ def _minimal_aweme_metadata(
         addresses.extend(
             value.get("play_addr") for value in bit_rates if isinstance(value, dict)
         )
-    for address in addresses:
-        if not isinstance(address, dict):
-            continue
-        candidate = str(address.get("uri") or "").strip()
-        if re.fullmatch(r"[A-Za-z0-9_-]{10,200}", candidate):
-            video_uri = candidate
-            break
-    if not video_uri:
+    video_uris = {
+        candidate
+        for address in addresses
+        if isinstance(address, dict)
+        and re.fullmatch(
+            r"[A-Za-z0-9_-]{10,200}",
+            candidate := str(address.get("uri") or "").strip(),
+        )
+    }
+    if len(video_uris) != 1:
         return None
+    video_uri = next(iter(video_uris))
 
     metadata: dict[str, Any] = {
         "media_id": aweme_id,
         "owner_id": owner_id,
+        "media_kind": "video",
         "video_uri": video_uri,
+        "title": _metadata_title(aweme, "video", aweme_id),
     }
     direct_candidates = [
         candidate
@@ -265,6 +643,11 @@ def _minimal_aweme_metadata(
             )
             if candidate:
                 direct_candidates.append(candidate)
+    if any(
+        candidate.get("video_uri") != video_uri
+        for candidate in direct_candidates
+    ):
+        return None
     if direct_candidates:
         direct_candidates.sort(
             key=lambda value: (
@@ -306,12 +689,11 @@ def _minimal_aweme_metadata(
     create_time = aweme.get("create_time")
     if isinstance(create_time, int) and create_time > 0:
         metadata["create_time"] = create_time
-    description = aweme.get("desc")
-    if isinstance(description, str) and description.strip():
-        metadata["title"] = description.strip()
     nickname = author.get("nickname")
     if isinstance(nickname, str) and nickname.strip():
         metadata["author"] = nickname.strip()
+    if not is_complete_profile_media_metadata(metadata, aweme_id, profile_id):
+        return None
     return aweme_id, metadata
 
 
@@ -338,7 +720,14 @@ def discover_item_metadata_from_profile(
         if str(aweme.get("aweme_id") or "").strip() != media_id:
             continue
         parsed = _minimal_aweme_metadata(aweme, profile_id)
-        return parsed[1] if parsed else None
+        if not parsed or not is_complete_profile_media_metadata(
+            parsed[1], media_id, profile_id
+        ):
+            raise TemporaryAccessError(
+                "Douyin returned the requested profile item without complete, "
+                "verified media metadata. Retry after a short wait."
+            )
+        return parsed[1]
     return None
 
 
@@ -416,16 +805,35 @@ def discover_profile(
                 cookie_profile=cookie_profile,
                 should_cancel=should_cancel,
             )
-        except AuthenticationRequiredError:
+        except (AuthenticationRequiredError, DiscoveryError):
             pass
         else:
             signed_data = {"aweme_list": signed_awemes, "has_more": False}
             entries, authors, _ = _parse_profile_awemes(signed_data, profile_id)
-            metadata = dict(
-                value
-                for aweme in signed_awemes
-                if (value := _minimal_aweme_metadata(aweme, profile_id))
-            )
+            metadata: dict[str, dict[str, Any]] = {}
+            entry_ids = {aweme_id for aweme_id, _ in entries}
+            incomplete_ids: list[str] = []
+            for aweme in signed_awemes:
+                aweme_id = str(aweme.get("aweme_id") or "").strip()
+                if aweme_id not in entry_ids:
+                    continue
+                value = _minimal_aweme_metadata(aweme, profile_id)
+                if not value or not is_complete_profile_media_metadata(
+                    value[1], aweme_id, profile_id
+                ):
+                    incomplete_ids.append(aweme_id)
+                    continue
+                metadata[value[0]] = value[1]
+            if incomplete_ids or len(metadata) != len(entries):
+                first_id = (incomplete_ids or sorted(entry_ids - metadata.keys()))[0]
+                raise TemporaryAccessError(
+                    "Douyin returned profile media without complete verified metadata "
+                    f"(first incomplete item: {first_id}). Retry after a short wait."
+                )
+            if not entries:
+                raise DiscoveryError(
+                    "Douyin returned no complete video or image posts for this profile"
+                )
             return DouyinProfile(
                 author=authors[0] if authors else "Douyin Author",
                 video_urls=[video_url for _, video_url in entries],
@@ -449,11 +857,11 @@ def discover_profile(
             )
         except Exception as exc:
             if not allow_cookie_fallback:
-                raise AuthenticationRequiredError(
+                raise TemporaryAccessError(
                     "Chrome cookies could not be read. Fully quit Chrome and retry, "
                     "approve any system cookie-access prompt, or disable Chrome Cookie "
-                    "in settings to continue explicitly without login and create a new task.",
-                    verification_url=url,
+                    "in settings to continue explicitly without login and create a new "
+                    "task. Opening a verification page is not required.",
                 ) from exc
             cookie_fallback_used = True
 
@@ -471,6 +879,7 @@ def discover_profile(
                     context.add_cookies(browser_cookies)
                 discovered: dict[str, str] = {}
                 media_metadata: dict[str, dict[str, Any]] = {}
+                incomplete_media_ids: set[str] = set()
                 api_authors: list[str] = []
                 api_has_more: bool | None = None
 
@@ -484,15 +893,27 @@ def discover_profile(
                         return
                     entries, authors, has_more = _parse_profile_awemes(data, profile_id)
                     values = data.get("aweme_list") or data.get("awemeList") or []
+                    entries_by_id = dict(entries)
                     for aweme in values:
                         if not isinstance(aweme, dict):
                             continue
+                        aweme_id = str(
+                            aweme.get("aweme_id") or aweme.get("awemeId") or ""
+                        ).strip()
+                        if aweme_id not in entries_by_id:
+                            continue
                         metadata = _minimal_aweme_metadata(aweme, profile_id)
-                        if metadata:
-                            media_metadata.setdefault(*metadata)
+                        if not metadata or not is_complete_profile_media_metadata(
+                            metadata[1], aweme_id, profile_id
+                        ):
+                            incomplete_media_ids.add(aweme_id)
+                            continue
+                        media_metadata.setdefault(*metadata)
+                        incomplete_media_ids.discard(aweme_id)
                     api_authors.extend(authors)
                     for aweme_id, video_url in entries:
-                        discovered.setdefault(aweme_id, video_url)
+                        if aweme_id in media_metadata:
+                            discovered.setdefault(aweme_id, video_url)
                     if has_more is not None:
                         api_has_more = has_more
 
@@ -501,17 +922,33 @@ def discover_profile(
                 page.goto(url, wait_until="commit", timeout=navigation_timeout_ms)
                 page.wait_for_timeout(4_000)
 
-                if page.locator("body").count() == 0 and not discovered:
+                if _is_explicit_douyin_auth_url(page.url):
                     raise AuthenticationRequiredError(
-                        "Douyin returned a blank verification response. Open this profile "
-                        "in Chrome, finish any CAPTCHA or login, then retry the task.",
+                        "Douyin redirected to an explicit login or verification page. "
+                        "Complete it in Chrome and retry.",
                         verification_url=url,
+                    )
+                if not _is_trusted_douyin_page_url(page.url):
+                    raise DiscoveryError(
+                        "Douyin profile discovery redirected outside the trusted "
+                        "Douyin origin"
+                    )
+                if page.locator("body").count() == 0 and not discovered:
+                    raise TemporaryAccessError(
+                        "Douyin profile discovery temporarily returned a blank browser "
+                        "response. Retry after a short wait; Chrome verification was "
+                        "not requested."
                     )
                 try:
                     body_text = page.locator("body").inner_text(timeout=5_000)
                 except Exception:
                     body_text = page.content()
-                if _looks_like_auth_page(body_text) or "captcha" in page.url.lower():
+                if _looks_like_transient_limit(body_text):
+                    raise TemporaryAccessError(
+                        "Douyin profile discovery was temporarily rate-limited. Retry "
+                        "after a short wait; Chrome verification is not required."
+                    )
+                if _looks_like_auth_page(body_text):
                     raise AuthenticationRequiredError(
                         "Douyin requires verification. Open this profile in Chrome, "
                         "finish the CAPTCHA or login, then retry the task.",
@@ -548,10 +985,27 @@ def discover_profile(
                             """
                         )
                     page.wait_for_timeout(1_200)
+                    if _is_explicit_douyin_auth_url(page.url):
+                        raise AuthenticationRequiredError(
+                            "Douyin redirected to an explicit login or verification "
+                            "page. Complete it in Chrome and retry.",
+                            verification_url=url,
+                        )
+                    if not _is_trusted_douyin_page_url(page.url):
+                        raise DiscoveryError(
+                            "Douyin profile discovery redirected outside the trusted "
+                            "Douyin origin"
+                        )
                     try:
                         updated_body = page.locator("body").inner_text(timeout=2_000)
                     except Exception:
                         updated_body = page.content()
+                    if _looks_like_transient_limit(updated_body):
+                        raise TemporaryAccessError(
+                            "Douyin profile discovery was temporarily rate-limited. "
+                            "Retry after a short wait; Chrome verification is not "
+                            "required."
+                        )
                     if _looks_like_auth_page(updated_body):
                         raise AuthenticationRequiredError(
                             "Douyin interrupted discovery with a verification challenge. "
@@ -568,7 +1022,7 @@ def discover_profile(
                         discovery_warning = (
                             "Douyin stopped returning new videos before the profile "
                             "reported completion. The discovered list may be incomplete; "
-                            "retry after checking Chrome verification."
+                            "retry after a short wait."
                         )
                         break
                 if not discovery_complete and not discovery_warning:
@@ -577,11 +1031,17 @@ def discover_profile(
                         "end of the profile. Retry to continue discovering videos."
                     )
 
+                if incomplete_media_ids:
+                    raise TemporaryAccessError(
+                        "Douyin browser discovery returned media without complete "
+                        "verified metadata (first incomplete item: "
+                        f"{sorted(incomplete_media_ids)[0]}). Retry after a short wait."
+                    )
                 if not discovered:
-                    raise AuthenticationRequiredError(
-                        "Douyin did not return verifiable profile-owned video data. Open "
-                        "this profile in Chrome, finish verification, then retry.",
-                        verification_url=url,
+                    raise TemporaryAccessError(
+                        "Douyin profile discovery temporarily returned no verified "
+                        "profile-owned media. Retry after a short wait; Chrome "
+                        "verification was not requested."
                     )
                 return DouyinProfile(
                     author=(api_authors[0] if api_authors else author),
@@ -593,13 +1053,17 @@ def discover_profile(
                 )
             finally:
                 browser.close()
-    except (AuthenticationRequiredError, DownloadCancelledError):
+    except (
+        AuthenticationRequiredError,
+        DownloadCancelledError,
+        TemporaryAccessError,
+    ):
         raise
     except PlaywrightError as exc:
         message = str(exc)
-        if _looks_like_auth_page(message) or "timeout" in message.lower():
-            raise AuthenticationRequiredError(
-                "Douyin requires verification in Chrome before this task can continue.",
-                verification_url=url,
+        if "timeout" in message.lower() or _looks_like_transient_limit(message):
+            raise TemporaryAccessError(
+                "Douyin profile discovery temporarily timed out or was rate-limited. "
+                "Retry after a short wait; Chrome verification is not required."
             ) from exc
         raise DiscoveryError(f"Douyin browser discovery failed: {message}") from exc

@@ -4,7 +4,7 @@ import pytest
 
 from app.browser import chrome_user_agent
 from app.douyin import discover_profile as discover_douyin_profile
-from app.errors import AuthenticationRequiredError
+from app.errors import AuthenticationRequiredError, TemporaryAccessError
 from app.douyin import _cookie_jar_to_playwright as douyin_cookies
 from app.xiaohongshu import discover_profile as discover_xhs_profile
 from app.xiaohongshu import _cookie_jar_to_playwright as xhs_cookies
@@ -93,9 +93,20 @@ def test_profile_cookie_access_failure_never_silently_falls_back(
     def fail_cookie_read(profile):
         raise OSError("Could not copy Chrome cookie database")
 
+    if extractor_path == "app.douyin._extract_cookies":
+        def require_browser_fallback(*args, **kwargs):
+            raise AuthenticationRequiredError(
+                "Signed profile unavailable",
+                verification_url=url,
+            )
+
+        monkeypatch.setattr(
+            "app.douyin.fetch_signed_profile_awemes",
+            require_browser_fallback,
+        )
     monkeypatch.setattr(extractor_path, fail_cookie_read)
 
-    with pytest.raises(AuthenticationRequiredError, match="Fully quit Chrome") as error:
+    with pytest.raises(TemporaryAccessError, match="Fully quit Chrome") as error:
         discover(url)
 
-    assert error.value.verification_url == url
+    assert "verification page is not required" in str(error.value)

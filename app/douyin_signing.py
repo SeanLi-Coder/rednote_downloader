@@ -8,6 +8,7 @@ import time
 from html.parser import HTMLParser
 from http.cookiejar import CookieJar
 from typing import Any, Callable
+from urllib.error import HTTPError as UrllibHTTPError
 from urllib.parse import unquote, urlsplit
 from urllib.request import HTTPCookieProcessor, Request, build_opener
 
@@ -16,6 +17,7 @@ from yt_dlp.cookies import extract_cookies_from_browser
 from .browser import chrome_user_agent
 from .errors import (
     AuthenticationRequiredError,
+    DiscoveryError,
     DownloadCancelledError,
     TemporaryAccessError,
 )
@@ -45,6 +47,35 @@ _MAX_GLUE_BYTES = 1_000_000
 _MAX_SOURCE_HTML_BYTES = 5_000_000
 _SIGNED_FETCH_LOCK = threading.Lock()
 _TRANSIENT_HTTP_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
+_TRUSTED_DOUYIN_AUTH_HOSTS = frozenset(
+    {"douyin.com", "www.douyin.com", "sso.douyin.com"}
+)
+_EXPLICIT_AUTH_PATH_MARKERS = ("/captcha", "/login", "/passport/", "/verify")
+_EXPLICIT_AUTH_TEXT_MARKERS = (
+    "captcha",
+    "verify you are human",
+    "complete the verification",
+    "security verification",
+    "验证码",
+    "安全验证",
+    "请完成下列验证",
+    "请完成验证",
+    "登录后继续",
+)
+_EXPLICIT_AUTH_API_MARKERS = (
+    "captcha",
+    "verify you are human",
+    "complete the verification",
+    "security verification",
+    "login required",
+    "please login",
+    "please log in",
+    "sign in required",
+    "验证码",
+    "安全验证",
+    "请登录",
+    "登录后",
+)
 
 # These two official runtimes are required by the current SecSDK glue bootstrap.
 # The glue script itself is always taken from the current Douyin HTML instead of
@@ -146,6 +177,14 @@ class _SigningFailure(RuntimeError):
 
 
 class _TransientSigningFailure(_SigningFailure):
+    pass
+
+
+class _AuthenticationSigningFailure(_SigningFailure):
+    pass
+
+
+class _CookieAccessSigningFailure(_SigningFailure):
     pass
 
 
@@ -281,9 +320,55 @@ class _SdkGlueParser(HTMLParser):
             raise _SigningFailure("Douyin returned an incomplete SecSDK script tag")
 
 
+class _VisibleTextParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._hidden_depth = 0
+        self.values: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        del attrs
+        if tag.lower() in {"script", "style", "template", "noscript"}:
+            self._hidden_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if (
+            tag.lower() in {"script", "style", "template", "noscript"}
+            and self._hidden_depth
+        ):
+            self._hidden_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if not self._hidden_depth and data.strip():
+            self.values.append(data)
+
+
+def _has_explicit_auth_html(source_html: str) -> bool:
+    parser = _VisibleTextParser()
+    try:
+        parser.feed(source_html)
+        parser.close()
+    except Exception:
+        return False
+    visible_text = re.sub(r"\s+", " ", " ".join(parser.values)).lower()
+    return any(marker in visible_text for marker in _EXPLICIT_AUTH_TEXT_MARKERS)
+
+
+def _has_explicit_auth_api_message(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    message = str(
+        payload.get("status_msg")
+        or payload.get("status_message")
+        or payload.get("message")
+        or ""
+    ).lower()
+    return any(marker in message for marker in _EXPLICIT_AUTH_API_MARKERS)
+
+
 def _extract_sdk_glue_tags(source_html: str) -> tuple[str, ...]:
     if not isinstance(source_html, str) or not source_html.strip():
-        raise _SigningFailure("Douyin returned an empty HTML response")
+        raise _TransientSigningFailure("Douyin returned an empty HTML response")
     if len(source_html.encode("utf-8")) > _MAX_SOURCE_HTML_BYTES:
         raise _SigningFailure("Douyin HTML response was unexpectedly large")
     parser = _SdkGlueParser()
@@ -295,7 +380,13 @@ def _extract_sdk_glue_tags(source_html: str) -> tuple[str, ...]:
     except Exception as exc:
         raise _SigningFailure("Douyin SecSDK HTML could not be parsed") from exc
     if not parser.tags:
-        raise _SigningFailure("Douyin SecSDK glue was not present in the HTML")
+        if _has_explicit_auth_html(source_html):
+            raise _AuthenticationSigningFailure(
+                "Douyin HTML displayed an explicit verification challenge"
+            )
+        raise _TransientSigningFailure(
+            "Douyin SecSDK glue was not present in the HTML"
+        )
     if len(parser.tags) > _MAX_GLUE_TAGS:
         raise _SigningFailure("Douyin returned too many SecSDK glue tags")
     if sum(len(tag.encode("utf-8")) for tag in parser.tags) > _MAX_GLUE_BYTES:
@@ -320,9 +411,14 @@ def _build_signing_document(glue_tags: tuple[str, ...]) -> str:
 
 
 def _load_chrome_cookie_jar(cookie_profile: str | None) -> CookieJar:
-    return extract_cookies_from_browser(
-        "chrome", profile=cookie_profile, logger=_QuietCookieLogger()
-    )
+    try:
+        return extract_cookies_from_browser(
+            "chrome", profile=cookie_profile, logger=_QuietCookieLogger()
+        )
+    except Exception as exc:
+        raise _CookieAccessSigningFailure(
+            "Chrome cookies could not be read"
+        ) from exc
 
 
 def _cookie_jar_to_playwright(cookie_jar: CookieJar) -> list[dict[str, Any]]:
@@ -351,7 +447,9 @@ def _cookie_jar_to_playwright(cookie_jar: CookieJar) -> list[dict[str, Any]]:
             item["httpOnly"] = True
         result.append(item)
     if not result:
-        raise _SigningFailure("No current Douyin Chrome cookies were available")
+        raise _AuthenticationSigningFailure(
+            "No current Douyin Chrome cookies were available"
+        )
     return result
 
 
@@ -366,6 +464,24 @@ def _is_allowed_douyin_origin(value: str) -> bool:
         return parsed.port in {None, 443}
     except ValueError:
         return False
+
+
+def _is_explicit_auth_url(value: str) -> bool:
+    try:
+        parsed = urlsplit(value)
+        hostname = (parsed.hostname or "").lower()
+        if (
+            parsed.scheme != "https"
+            or hostname not in _TRUSTED_DOUYIN_AUTH_HOSTS
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.port not in {None, 443}
+        ):
+            return False
+        path = unquote(parsed.path).lower()
+    except (TypeError, ValueError):
+        return False
+    return any(marker in path for marker in _EXPLICIT_AUTH_PATH_MARKERS)
 
 
 def _fetch_source_html_with_urllib(
@@ -384,29 +500,92 @@ def _fetch_source_html_with_urllib(
         method="GET",
     )
     opener = build_opener(HTTPCookieProcessor(cookie_jar))
-    with opener.open(request, timeout=max(timeout_ms / 1_000, 0.001)) as response:
-        status = getattr(response, "status", None)
-        if type(status) is not int or not 200 <= status < 300:
-            raise _SigningFailure("Douyin HTML returned an invalid HTTP status")
-        if not _is_allowed_douyin_origin(response.geturl()):
-            raise _SigningFailure("Douyin HTML redirected outside the trusted origin")
-        content_length = response.headers.get("Content-Length")
-        if content_length:
-            try:
-                if int(content_length) > _MAX_SOURCE_HTML_BYTES:
-                    raise _SigningFailure("Douyin HTML response was unexpectedly large")
-            except ValueError as exc:
+    try:
+        with opener.open(
+            request, timeout=max(timeout_ms / 1_000, 0.001)
+        ) as response:
+            status = getattr(response, "status", None)
+            if _is_explicit_auth_url(response.geturl()):
+                raise _AuthenticationSigningFailure(
+                    "Douyin HTML redirected to an explicit verification page"
+                )
+            if not _is_allowed_douyin_origin(response.geturl()):
                 raise _SigningFailure(
-                    "Douyin HTML returned an invalid content length"
+                    "Douyin HTML redirected outside the trusted origin"
+                )
+            if type(status) is int and status in _TRANSIENT_HTTP_STATUSES:
+                raise _TransientSigningFailure(
+                    "Douyin HTML request was temporarily limited"
+                )
+            if type(status) is int and status == 401:
+                raise _AuthenticationSigningFailure(
+                    "Douyin HTML request requires authentication"
+                )
+            if type(status) is int and status == 403:
+                raise _TransientSigningFailure(
+                    "Douyin HTML request was temporarily rejected"
+                )
+            if type(status) is not int or not 200 <= status < 300:
+                raise _SigningFailure("Douyin HTML returned an invalid HTTP status")
+            content_length = response.headers.get("Content-Length")
+            if content_length:
+                try:
+                    if int(content_length) > _MAX_SOURCE_HTML_BYTES:
+                        raise _SigningFailure(
+                            "Douyin HTML response was unexpectedly large"
+                        )
+                except ValueError as exc:
+                    raise _SigningFailure(
+                        "Douyin HTML returned an invalid content length"
+                    ) from exc
+            body = response.read(_MAX_SOURCE_HTML_BYTES + 1)
+            if len(body) > _MAX_SOURCE_HTML_BYTES:
+                raise _SigningFailure("Douyin HTML response was unexpectedly large")
+            charset = response.headers.get_content_charset() or "utf-8"
+            try:
+                return body.decode(charset)
+            except (LookupError, UnicodeDecodeError) as exc:
+                raise _SigningFailure(
+                    "Douyin HTML response could not be decoded"
                 ) from exc
-        body = response.read(_MAX_SOURCE_HTML_BYTES + 1)
-        if len(body) > _MAX_SOURCE_HTML_BYTES:
-            raise _SigningFailure("Douyin HTML response was unexpectedly large")
-        charset = response.headers.get_content_charset() or "utf-8"
+    except UrllibHTTPError as exc:
         try:
-            return body.decode(charset)
-        except (LookupError, UnicodeDecodeError) as exc:
-            raise _SigningFailure("Douyin HTML response could not be decoded") from exc
+            if _is_explicit_auth_url(exc.geturl()):
+                raise _AuthenticationSigningFailure(
+                    "Douyin HTML redirected to an explicit verification page"
+                ) from exc
+            if not _is_allowed_douyin_origin(exc.geturl()):
+                raise _SigningFailure(
+                    "Douyin HTML redirected outside the trusted origin"
+                ) from exc
+            if exc.code in _TRANSIENT_HTTP_STATUSES:
+                raise _TransientSigningFailure(
+                    "Douyin HTML request was temporarily limited"
+                ) from exc
+            if exc.code == 401:
+                raise _AuthenticationSigningFailure(
+                    "Douyin HTML request requires authentication"
+                ) from exc
+            if exc.code == 403:
+                try:
+                    body = exc.read(_MAX_SOURCE_HTML_BYTES + 1)
+                    charset = exc.headers.get_content_charset() or "utf-8"
+                    source_html = body.decode(charset, errors="replace")
+                except Exception:
+                    source_html = ""
+                if _has_explicit_auth_html(source_html):
+                    raise _AuthenticationSigningFailure(
+                        "Douyin HTML displayed an explicit verification challenge"
+                    ) from exc
+                raise _TransientSigningFailure(
+                    "Douyin HTML request was temporarily rejected"
+                ) from exc
+            raise _SigningFailure(
+                "Douyin HTML returned an invalid HTTP status"
+            ) from exc
+        finally:
+            with contextlib.suppress(Exception):
+                exc.close()
 
 
 def _extract_glue_with_context_fallback(
@@ -427,19 +606,57 @@ def _extract_glue_with_context_fallback(
         return _extract_sdk_glue_tags(source_html), True
     except DownloadCancelledError:
         raise
+    except _AuthenticationSigningFailure:
+        raise
     except Exception:
         _raise_if_cancelled(should_cancel)
-        response = context.request.get(
-            verification_url,
-            timeout=timeout_ms,
-        )
-        if (
-            type(response.status) is not int
-            or not 200 <= response.status < 300
-            or not _is_allowed_douyin_origin(response.url)
-        ):
-            raise _SigningFailure("Douyin HTML returned an invalid browser response")
-        return _extract_sdk_glue_tags(response.text()), False
+        try:
+            response = context.request.get(
+                verification_url,
+                timeout=timeout_ms,
+            )
+        except Exception as exc:
+            raise _TransientSigningFailure(
+                "Douyin browser HTML request temporarily failed"
+            ) from exc
+        try:
+            status = response.status
+            if _is_explicit_auth_url(response.url):
+                raise _AuthenticationSigningFailure(
+                    "Douyin HTML redirected to an explicit verification page"
+                )
+            if not _is_allowed_douyin_origin(response.url):
+                raise _SigningFailure(
+                    "Douyin HTML redirected outside the trusted origin"
+                )
+            if type(status) is int and status in _TRANSIENT_HTTP_STATUSES:
+                raise _TransientSigningFailure(
+                    "Douyin browser HTML request was temporarily limited"
+                )
+            if type(status) is int and status == 401:
+                raise _AuthenticationSigningFailure(
+                    "Douyin browser HTML request requires authentication"
+                )
+            if type(status) is int and status == 403:
+                source_html = response.text()
+                if _has_explicit_auth_html(source_html):
+                    raise _AuthenticationSigningFailure(
+                        "Douyin HTML displayed an explicit verification challenge"
+                    )
+                raise _TransientSigningFailure(
+                    "Douyin browser HTML request was temporarily rejected"
+                )
+            if (
+                type(status) is not int
+                or not 200 <= status < 300
+            ):
+                raise _SigningFailure(
+                    "Douyin HTML returned an invalid browser response"
+                )
+            return _extract_sdk_glue_tags(response.text()), False
+        finally:
+            with contextlib.suppress(Exception):
+                response.dispose()
 
 
 def _raise_if_cancelled(should_cancel: CancelCallback | None) -> None:
@@ -496,7 +713,7 @@ def _wait_for_signer(
         if page.evaluate("() => typeof window.useWebSecsdkApi === 'function'"):
             return
         page.wait_for_timeout(_POLL_INTERVAL_MS)
-    raise _SigningFailure("Douyin SecSDK did not become ready")
+    raise _TransientSigningFailure("Douyin SecSDK did not become ready")
 
 
 def _start_signed_fetch(
@@ -538,7 +755,17 @@ def _wait_for_signed_response(
                 raise _TransientSigningFailure(
                     "Douyin signed network request temporarily failed"
                 )
-            raise _SigningFailure("Douyin rejected the signed detail request")
+            if type(http_status) is int and http_status == 401:
+                raise _AuthenticationSigningFailure(
+                    "Douyin signed request requires authentication"
+                )
+            if type(http_status) is int and http_status == 403:
+                raise _TransientSigningFailure(
+                    "Douyin signed request was temporarily rejected"
+                )
+            raise _TransientSigningFailure(
+                "Douyin temporarily rejected the signed request"
+            )
         page.wait_for_timeout(_POLL_INTERVAL_MS)
     with contextlib.suppress(Exception):
         page.evaluate(_ABORT_SIGNED_FETCH_SCRIPT)
@@ -554,17 +781,33 @@ def _validated_payload(
         raise _TransientSigningFailure(
             f"Douyin {request_name} request was temporarily limited"
         )
+    payload = response.get("payload")
+    if type(http_status) is int and http_status == 401:
+        raise _AuthenticationSigningFailure(
+            f"Douyin {request_name} request requires authentication"
+        )
+    if type(http_status) is int and http_status == 403:
+        if _has_explicit_auth_api_message(payload):
+            raise _AuthenticationSigningFailure(
+                f"Douyin {request_name} API requires authentication"
+            )
+        raise _TransientSigningFailure(
+            f"Douyin {request_name} request was temporarily rejected"
+        )
     if type(http_status) is not int or not 200 <= http_status < 300:
         raise _SigningFailure(
             f"Douyin {request_name} request returned an invalid HTTP status"
         )
-    payload = response.get("payload")
     if not isinstance(payload, dict):
         raise _SigningFailure(f"Douyin {request_name} request returned no JSON object")
     status_code = payload.get("status_code")
     if type(status_code) is not int or status_code != 0:
-        raise _SigningFailure(
-            f"Douyin {request_name} API returned an unsuccessful status"
+        if _has_explicit_auth_api_message(payload):
+            raise _AuthenticationSigningFailure(
+                f"Douyin {request_name} API requires authentication"
+            )
+        raise _TransientSigningFailure(
+            f"Douyin {request_name} API temporarily rejected the request"
         )
     return payload
 
@@ -620,8 +863,13 @@ def _validate_profile_response(
         if sec_uid != profile_id:
             raise _SigningFailure("Douyin profile API returned another author's aweme")
         video = aweme.get("video")
-        if not isinstance(video, dict) or not video:
-            continue
+        images = aweme.get("images")
+        has_video = isinstance(video, dict) and bool(video)
+        has_images = isinstance(images, list) and bool(images)
+        if not has_video and not has_images:
+            raise _TransientSigningFailure(
+                "Douyin profile API returned incomplete aweme media"
+            )
         awemes.append(aweme)
 
     has_more_value = payload.get("has_more")
@@ -663,7 +911,14 @@ def _run_with_signing_page(
     page: Any | None = None
     try:
         _raise_if_cancelled(should_cancel)
-        cookie_jar = _load_chrome_cookie_jar(cookie_profile)
+        try:
+            cookie_jar = _load_chrome_cookie_jar(cookie_profile)
+        except (DownloadCancelledError, _SigningFailure):
+            raise
+        except Exception as exc:
+            raise _CookieAccessSigningFailure(
+                "Chrome cookies could not be read"
+            ) from exc
         browser_cookies = _cookie_jar_to_playwright(cookie_jar)
         _raise_if_cancelled(should_cancel)
         from playwright.sync_api import sync_playwright
@@ -721,7 +976,7 @@ def _run_with_signing_page(
         _close_resources(page, context, browser)
 
 
-def _raise_authentication_required(
+def _raise_signing_error(
     verification_url: str,
     cause: Exception,
 ) -> None:
@@ -730,10 +985,36 @@ def _raise_authentication_required(
             "Douyin temporarily limited a signed request after automatic retries. "
             "Wait a minute or two and retry; no lower-quality media was downloaded."
         ) from cause
-    raise AuthenticationRequiredError(
-        "Douyin could not create a verified signed request. Open the provided "
-        "URL in Chrome, finish any CAPTCHA or login, then retry.",
-        verification_url=verification_url,
+    if isinstance(cause, _CookieAccessSigningFailure):
+        raise TemporaryAccessError(
+            "Chrome cookies could not be read. Fully quit Chrome and retry, approve "
+            "any system cookie-access prompt, or disable Chrome Cookie in settings "
+            "to continue explicitly without login and create a new task. Opening a "
+            "verification page is not required."
+        ) from cause
+    if isinstance(cause, _AuthenticationSigningFailure):
+        raise AuthenticationRequiredError(
+            "Douyin requires current Chrome cookies or an explicit verification. "
+            "Open the provided URL in Chrome, finish any CAPTCHA or login, then retry.",
+            verification_url=verification_url,
+        ) from cause
+    if isinstance(cause, _SigningFailure):
+        raise DiscoveryError(
+            "Douyin signed data failed identity or integrity validation. Retry the "
+            "original link; Chrome verification is not required unless Douyin "
+            "explicitly shows a CAPTCHA or login page."
+        ) from cause
+    message = str(cause).lower()
+    if any(marker in message for marker in ("timeout", "timed out", "network")):
+        raise TemporaryAccessError(
+            "Douyin signed discovery temporarily failed before a verified response "
+            "was available. Retry after a short wait; Chrome verification is not "
+            "required."
+        ) from cause
+    raise DiscoveryError(
+        "Douyin signed discovery failed before a verified response was available. "
+        "Retry the original link; Chrome verification is not required unless Douyin "
+        "explicitly shows a CAPTCHA or login page."
     ) from cause
 
 
@@ -830,7 +1111,7 @@ def fetch_signed_aweme_detail(
     except DownloadCancelledError:
         raise
     except Exception as exc:
-        _raise_authentication_required(verification_url, exc)
+        _raise_signing_error(verification_url, exc)
 
 
 def _profile_request_params(profile_id: str, cursor: str) -> dict[str, str]:
@@ -970,4 +1251,4 @@ def fetch_signed_profile_awemes(
     except DownloadCancelledError:
         raise
     except Exception as exc:
-        _raise_authentication_required(profile_url, exc)
+        _raise_signing_error(profile_url, exc)

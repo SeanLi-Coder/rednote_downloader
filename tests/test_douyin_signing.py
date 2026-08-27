@@ -1,15 +1,22 @@
 from __future__ import annotations
 
+from io import BytesIO
 from types import SimpleNamespace
+from urllib.error import HTTPError as UrllibHTTPError
 
 import pytest
 
 from app.douyin_signing import (
+    _AuthenticationSigningFailure,
     _SigningFailure,
     _TransientSigningFailure,
     _build_signing_document,
     _extract_sdk_glue_tags,
+    _extract_glue_with_context_fallback,
+    _fetch_source_html_with_urllib,
+    _is_allowed_douyin_origin,
     _is_douyin_url,
+    _is_explicit_auth_url,
     _validate_detail_response,
     _validate_profile_response,
     _wait_for_signed_response,
@@ -18,6 +25,7 @@ from app.douyin_signing import (
 )
 from app.errors import (
     AuthenticationRequiredError,
+    DiscoveryError,
     DownloadCancelledError,
     TemporaryAccessError,
 )
@@ -144,6 +152,22 @@ def test_douyin_verification_url_rejects_unsafe_origin_or_path(url: str) -> None
     assert not _is_douyin_url(url)
 
 
+def test_signing_source_origin_and_explicit_auth_redirect_are_distinct() -> None:
+    assert _is_allowed_douyin_origin(VIDEO_URL)
+    assert not _is_allowed_douyin_origin("https://sso.douyin.com/verify")
+    assert not _is_allowed_douyin_origin("https://evil.example/login")
+    assert _is_explicit_auth_url("https://www.douyin.com/passport/safe/verify")
+    assert _is_explicit_auth_url("https://www.douyin.com/login")
+    assert _is_explicit_auth_url("https://sso.douyin.com/verify")
+    assert not _is_explicit_auth_url("https://evil.example/login")
+    assert not _is_explicit_auth_url("http://captive.portal/passport/verify")
+    assert not _is_explicit_auth_url("https://sso.douyin.com.evil.example/verify")
+    assert not _is_explicit_auth_url("https://sso.douyin.com:444/verify")
+    assert not _is_explicit_auth_url("https://user@sso.douyin.com/verify")
+    assert not _is_explicit_auth_url("https://sso.douyin.com/home")
+    assert not _is_explicit_auth_url(PROFILE_URL)
+
+
 @pytest.mark.parametrize(
     "source_html",
     [
@@ -182,6 +206,23 @@ def test_validate_detail_response_marks_http_429_as_transient() -> None:
         )
 
 
+def test_validate_detail_response_marks_bare_http_403_as_transient() -> None:
+    with pytest.raises(_TransientSigningFailure, match="temporarily rejected"):
+        _validate_detail_response(
+            _detail_response(http_status=403),
+            AWEME_ID,
+            SEC_UID,
+        )
+
+
+def test_validate_detail_response_requires_auth_for_explicit_403_login() -> None:
+    response = _detail_response(http_status=403)
+    response["payload"]["status_msg"] = "Please login to continue"
+
+    with pytest.raises(_AuthenticationSigningFailure, match="authentication"):
+        _validate_detail_response(response, AWEME_ID, SEC_UID)
+
+
 def test_invalid_json_http_503_is_treated_as_transient() -> None:
     page = FakePage(
         {
@@ -193,6 +234,88 @@ def test_invalid_json_http_503_is_treated_as_transient() -> None:
 
     with pytest.raises(_TransientSigningFailure, match="temporary HTTP status"):
         _wait_for_signed_response(page, 1_000, lambda: False)
+
+
+def test_invalid_json_http_200_is_treated_as_transient_rejection() -> None:
+    page = FakePage(
+        {
+            "state": "error",
+            "reason": "invalid_json",
+            "httpStatus": 200,
+        }
+    )
+
+    with pytest.raises(_TransientSigningFailure, match="temporarily rejected"):
+        _wait_for_signed_response(page, 1_000, lambda: False)
+
+
+def test_invalid_json_http_403_is_treated_as_transient_rejection() -> None:
+    page = FakePage(
+        {
+            "state": "error",
+            "reason": "invalid_json",
+            "httpStatus": 403,
+        }
+    )
+
+    with pytest.raises(_TransientSigningFailure, match="temporarily rejected"):
+        _wait_for_signed_response(page, 1_000, lambda: False)
+
+
+def test_missing_sdk_glue_is_transient_but_unsafe_glue_is_not() -> None:
+    with pytest.raises(_TransientSigningFailure, match="not present"):
+        _extract_sdk_glue_tags("<html><body>temporary shell</body></html>")
+
+    with pytest.raises(_SigningFailure) as captured:
+        _extract_sdk_glue_tags(
+            '<script data-sdk-glue="load" '
+            'src="https://malicious.example/sdk-glue.js"></script>'
+        )
+    assert not isinstance(captured.value, _TransientSigningFailure)
+
+
+@pytest.mark.parametrize(
+    "source_html",
+    [
+        "<html><body>captcha</body></html>",
+        "<html><body>请完成下列验证 验证码</body></html>",
+        (
+            "<html><body>verify you are human"
+            "<script>const text = 'temporary shell';</script></body></html>"
+        ),
+    ],
+)
+def test_visible_verification_without_sdk_glue_requires_authentication(
+    source_html,
+) -> None:
+    with pytest.raises(
+        _AuthenticationSigningFailure,
+        match="verification challenge",
+    ):
+        _extract_sdk_glue_tags(source_html)
+
+
+def test_auth_words_inside_hidden_script_do_not_trigger_verification() -> None:
+    with pytest.raises(_TransientSigningFailure, match="not present"):
+        _extract_sdk_glue_tags(
+            "<html><body>temporary shell"
+            "<script>const messages = ['captcha', '验证码'];</script>"
+            "</body></html>"
+        )
+
+
+def test_nonzero_api_status_is_transient_unless_auth_is_explicit() -> None:
+    with pytest.raises(_TransientSigningFailure, match="temporarily rejected"):
+        _validate_detail_response(
+            _detail_response(status_code=4),
+            AWEME_ID,
+            SEC_UID,
+        )
+
+    response = _detail_response(status_code=4)
+    response["payload"]["status_msg"] = "Please login to continue"
+    with pytest.raises(_AuthenticationSigningFailure, match="authentication"):
+        _validate_detail_response(response, AWEME_ID, SEC_UID)
 
 
 @pytest.mark.parametrize(
@@ -213,7 +336,7 @@ def test_validate_detail_response_rejects_unverified_identity(
         _validate_detail_response(response, AWEME_ID, expected_sec_uid)
 
 
-def test_validate_profile_response_keeps_videos_and_skips_owned_photo_posts() -> None:
+def test_validate_profile_response_keeps_owned_video_and_photo_posts() -> None:
     response = _profile_response(
         ["7000000000000000001"],
         has_more=0,
@@ -222,7 +345,22 @@ def test_validate_profile_response_keeps_videos_and_skips_owned_photo_posts() ->
         {
             "aweme_id": "7000000000000000002",
             "author": {"sec_uid": SEC_UID},
-            "images": [{"uri": "photo-1"}],
+            "aweme_type": 68,
+            "video": {
+                "play_addr": {
+                    "uri": "https://lf9-music-east.douyinstatic.com/music.mp3"
+                }
+            },
+            "images": [
+                {
+                    "uri": "photo-1",
+                    "width": 1080,
+                    "height": 1920,
+                    "url_list": [
+                        "https://p3-pc-sign.douyinpic.com/photo-1.webp"
+                    ],
+                }
+            ],
         }
     )
 
@@ -231,9 +369,25 @@ def test_validate_profile_response_keeps_videos_and_skips_owned_photo_posts() ->
         SEC_UID,
     )
 
-    assert [aweme["aweme_id"] for aweme in awemes] == ["7000000000000000001"]
+    assert [aweme["aweme_id"] for aweme in awemes] == [
+        "7000000000000000001",
+        "7000000000000000002",
+    ]
     assert has_more is False
     assert next_cursor is None
+
+
+def test_validate_profile_response_retries_incomplete_owned_media() -> None:
+    response = _profile_response([], has_more=0)
+    response["payload"]["aweme_list"] = [
+        {
+            "aweme_id": "7000000000000000002",
+            "author": {"sec_uid": SEC_UID},
+        }
+    ]
+
+    with pytest.raises(_TransientSigningFailure, match="incomplete aweme media"):
+        _validate_profile_response(response, SEC_UID)
 
 
 @pytest.mark.parametrize(
@@ -260,11 +414,23 @@ def test_validate_profile_response_rejects_unverified_pages(mutate) -> None:
 
 
 class FakeApiResponse:
-    status = 200
-    url = VIDEO_URL
+    def __init__(
+        self,
+        *,
+        status: int = 200,
+        url: str = VIDEO_URL,
+        body: str = GLUE_HTML,
+    ) -> None:
+        self.status = status
+        self.url = url
+        self.body = body
+        self.disposed = False
 
     def text(self) -> str:
-        return GLUE_HTML
+        return self.body
+
+    def dispose(self) -> None:
+        self.disposed = True
 
 
 class FakeRoute:
@@ -504,6 +670,257 @@ def test_fetch_falls_back_to_browser_context_when_urllib_fails(monkeypatch) -> N
     assert manager.resources_closed_on_exit is True
 
 
+def test_browser_html_429_is_transient_and_response_is_disposed(monkeypatch) -> None:
+    response = FakeApiResponse(status=429)
+    context = SimpleNamespace(
+        request=SimpleNamespace(get=lambda url, timeout: response)
+    )
+    monkeypatch.setattr(
+        "app.douyin_signing._fetch_source_html_with_urllib",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            OSError("temporary source request failure")
+        ),
+    )
+
+    with pytest.raises(_TransientSigningFailure, match="temporarily limited"):
+        _extract_glue_with_context_fallback(
+            context,
+            VIDEO_URL,
+            object(),
+            "Test User Agent",
+            1_000,
+            lambda: False,
+        )
+
+    assert response.disposed is True
+
+
+def test_browser_html_bare_403_is_transient_and_response_is_disposed(
+    monkeypatch,
+) -> None:
+    response = FakeApiResponse(status=403, body="temporarily unavailable")
+    context = SimpleNamespace(
+        request=SimpleNamespace(get=lambda url, timeout: response)
+    )
+    monkeypatch.setattr(
+        "app.douyin_signing._fetch_source_html_with_urllib",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            OSError("temporary source request failure")
+        ),
+    )
+
+    with pytest.raises(_TransientSigningFailure, match="temporarily rejected"):
+        _extract_glue_with_context_fallback(
+            context,
+            VIDEO_URL,
+            object(),
+            "Test User Agent",
+            1_000,
+            lambda: False,
+        )
+
+    assert response.disposed is True
+
+
+def test_browser_html_off_origin_401_is_not_treated_as_authentication(
+    monkeypatch,
+) -> None:
+    response = FakeApiResponse(
+        status=401,
+        url="https://evil.example/login",
+        body="login",
+    )
+    context = SimpleNamespace(
+        request=SimpleNamespace(get=lambda url, timeout: response)
+    )
+    monkeypatch.setattr(
+        "app.douyin_signing._fetch_source_html_with_urllib",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            OSError("temporary source request failure")
+        ),
+    )
+
+    with pytest.raises(_SigningFailure, match="outside the trusted origin") as captured:
+        _extract_glue_with_context_fallback(
+            context,
+            VIDEO_URL,
+            object(),
+            "Test User Agent",
+            1_000,
+            lambda: False,
+        )
+
+    assert not isinstance(captured.value, _AuthenticationSigningFailure)
+    assert response.disposed is True
+
+
+def test_browser_html_sso_verify_redirect_requires_authentication(
+    monkeypatch,
+) -> None:
+    response = FakeApiResponse(
+        status=200,
+        url="https://sso.douyin.com/verify",
+        body="verification",
+    )
+    context = SimpleNamespace(
+        request=SimpleNamespace(get=lambda url, timeout: response)
+    )
+    monkeypatch.setattr(
+        "app.douyin_signing._fetch_source_html_with_urllib",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            OSError("temporary source request failure")
+        ),
+    )
+
+    with pytest.raises(
+        _AuthenticationSigningFailure,
+        match="explicit verification page",
+    ):
+        _extract_glue_with_context_fallback(
+            context,
+            VIDEO_URL,
+            object(),
+            "Test User Agent",
+            1_000,
+            lambda: False,
+        )
+
+    assert response.disposed is True
+
+
+def test_browser_html_403_with_visible_captcha_requires_authentication(
+    monkeypatch,
+) -> None:
+    response = FakeApiResponse(status=403, body="<body>请完成下列验证 验证码</body>")
+    context = SimpleNamespace(
+        request=SimpleNamespace(get=lambda url, timeout: response)
+    )
+    monkeypatch.setattr(
+        "app.douyin_signing._fetch_source_html_with_urllib",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            OSError("temporary source request failure")
+        ),
+    )
+
+    with pytest.raises(_AuthenticationSigningFailure, match="verification challenge"):
+        _extract_glue_with_context_fallback(
+            context,
+            VIDEO_URL,
+            object(),
+            "Test User Agent",
+            1_000,
+            lambda: False,
+        )
+
+    assert response.disposed is True
+
+
+def test_urllib_html_429_is_transient_and_response_is_closed(monkeypatch) -> None:
+    payload = BytesIO(b"rate limited")
+    error = UrllibHTTPError(
+        VIDEO_URL,
+        429,
+        "Too Many Requests",
+        {},
+        payload,
+    )
+
+    class FailingOpener:
+        def open(self, request, timeout):
+            raise error
+
+    monkeypatch.setattr(
+        "app.douyin_signing.build_opener",
+        lambda *args, **kwargs: FailingOpener(),
+    )
+
+    with pytest.raises(_TransientSigningFailure, match="temporarily limited"):
+        _fetch_source_html_with_urllib(
+            VIDEO_URL,
+            object(),
+            "Test User Agent",
+            1_000,
+        )
+
+    assert payload.closed is True
+
+
+def test_urllib_html_off_origin_401_is_not_treated_as_authentication(
+    monkeypatch,
+) -> None:
+    payload = BytesIO(b"login")
+    error = UrllibHTTPError(
+        "https://evil.example/login",
+        401,
+        "Unauthorized",
+        {},
+        payload,
+    )
+
+    class FailingOpener:
+        def open(self, request, timeout):
+            raise error
+
+    monkeypatch.setattr(
+        "app.douyin_signing.build_opener",
+        lambda *args, **kwargs: FailingOpener(),
+    )
+
+    with pytest.raises(_SigningFailure, match="outside the trusted origin") as captured:
+        _fetch_source_html_with_urllib(
+            VIDEO_URL,
+            object(),
+            "Test User Agent",
+            1_000,
+        )
+
+    assert not isinstance(captured.value, _AuthenticationSigningFailure)
+    assert payload.closed is True
+
+
+def test_urllib_html_sso_verify_redirect_requires_authentication(
+    monkeypatch,
+) -> None:
+    class RedirectedResponse:
+        status = 200
+
+        def __init__(self) -> None:
+            self.closed = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback) -> None:
+            self.closed = True
+
+        def geturl(self) -> str:
+            return "https://sso.douyin.com/verify"
+
+    response = RedirectedResponse()
+
+    class RedirectingOpener:
+        def open(self, request, timeout):
+            return response
+
+    monkeypatch.setattr(
+        "app.douyin_signing.build_opener",
+        lambda *args, **kwargs: RedirectingOpener(),
+    )
+
+    with pytest.raises(
+        _AuthenticationSigningFailure,
+        match="explicit verification page",
+    ):
+        _fetch_source_html_with_urllib(
+            VIDEO_URL,
+            object(),
+            "Test User Agent",
+            1_000,
+        )
+
+    assert response.closed is True
+
+
 def test_fetch_errors_are_mapped_without_exposing_cookie_details(monkeypatch) -> None:
     def fail_cookie_read(profile):
         raise OSError("cookie token=do-not-expose")
@@ -513,14 +930,14 @@ def test_fetch_errors_are_mapped_without_exposing_cookie_details(monkeypatch) ->
         fail_cookie_read,
     )
 
-    with pytest.raises(AuthenticationRequiredError) as captured:
+    with pytest.raises(TemporaryAccessError, match="Fully quit Chrome") as captured:
         fetch_signed_aweme_detail(
             AWEME_ID,
             verification_url=VIDEO_URL,
             signer_settle_ms=0,
         )
 
-    assert captured.value.verification_url == VIDEO_URL
+    assert "verification page is not required" in str(captured.value)
     assert "do-not-expose" not in str(captured.value)
 
 
@@ -548,10 +965,9 @@ def test_fetch_rejects_unsafe_verification_url_before_cookie_access(
         load_cookie_jar,
     )
 
-    with pytest.raises(AuthenticationRequiredError) as captured:
+    with pytest.raises(DiscoveryError, match="Chrome verification is not required"):
         fetch_signed_aweme_detail(AWEME_ID, verification_url=unsafe_url)
 
-    assert captured.value.verification_url == unsafe_url
     assert cookie_accessed is False
 
 
@@ -580,7 +996,7 @@ def test_detail_fetch_binds_verification_url_identity_before_cookie_access(
         load_cookie_jar,
     )
 
-    with pytest.raises(AuthenticationRequiredError):
+    with pytest.raises(DiscoveryError, match="Chrome verification is not required"):
         fetch_signed_aweme_detail(
             AWEME_ID,
             verification_url=verification_url,
@@ -590,7 +1006,7 @@ def test_detail_fetch_binds_verification_url_identity_before_cookie_access(
     assert cookie_accessed is False
 
 
-def test_invalid_signed_response_maps_to_auth_and_closes_resources(
+def test_invalid_signed_response_does_not_request_auth_and_closes_resources(
     monkeypatch,
 ) -> None:
     page, context, browser, manager = _install_fake_playwright(
@@ -598,7 +1014,7 @@ def test_invalid_signed_response_maps_to_auth_and_closes_resources(
         _detail_response(aweme_id="7000000000000000000"),
     )
 
-    with pytest.raises(AuthenticationRequiredError) as captured:
+    with pytest.raises(DiscoveryError, match="Chrome verification is not required"):
         fetch_signed_aweme_detail(
             AWEME_ID,
             verification_url=VIDEO_URL,
@@ -606,7 +1022,6 @@ def test_invalid_signed_response_maps_to_auth_and_closes_resources(
             signer_settle_ms=0,
         )
 
-    assert captured.value.verification_url == VIDEO_URL
     assert page.closed is True
     assert context.closed is True
     assert browser.closed is True
@@ -814,7 +1229,9 @@ def test_profile_transient_exhaustion_is_not_mislabeled_as_captcha(
     assert delays == [5_000, 10_000]
 
 
-def test_profile_page_limit_maps_to_auth_and_closes_resources(monkeypatch) -> None:
+def test_profile_page_limit_does_not_request_auth_and_closes_resources(
+    monkeypatch,
+) -> None:
     page, context, browser, manager = _install_fake_playwright(
         monkeypatch,
         [
@@ -826,7 +1243,7 @@ def test_profile_page_limit_maps_to_auth_and_closes_resources(monkeypatch) -> No
         ],
     )
 
-    with pytest.raises(AuthenticationRequiredError) as captured:
+    with pytest.raises(DiscoveryError, match="Chrome verification is not required"):
         fetch_signed_profile_awemes(
             PROFILE_URL,
             SEC_UID,
@@ -834,6 +1251,5 @@ def test_profile_page_limit_maps_to_auth_and_closes_resources(monkeypatch) -> No
             signer_settle_ms=0,
         )
 
-    assert captured.value.verification_url == PROFILE_URL
     assert page.closed and context.closed and browser.closed
     assert manager.resources_closed_on_exit is True

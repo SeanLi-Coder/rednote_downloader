@@ -2,15 +2,103 @@ from __future__ import annotations
 
 from http.cookiejar import CookieJar
 
+import pytest
+
 from app.douyin import (
+    _is_explicit_douyin_auth_url,
     _is_target_post_response,
+    _looks_like_auth_page,
+    _looks_like_transient_limit,
     _minimal_aweme_metadata,
     _parse_profile_awemes,
     discover_item_metadata_from_profile,
     discover_profile,
+    is_complete_profile_media_metadata,
     quality_floor_dimensions,
 )
-from app.errors import AuthenticationRequiredError
+from app.errors import (
+    AuthenticationRequiredError,
+    DiscoveryError,
+    TemporaryAccessError,
+)
+
+
+def _install_fake_douyin_browser(monkeypatch, page) -> None:
+    class FakeContext:
+        def new_page(self):
+            return page
+
+    class FakeBrowser:
+        version = "151.0.0.0"
+
+        def new_context(self, **kwargs):
+            return FakeContext()
+
+        def close(self) -> None:
+            return None
+
+    class FakeChromium:
+        def launch(self, **kwargs):
+            return FakeBrowser()
+
+    class FakePlaywright:
+        chromium = FakeChromium()
+
+    class FakePlaywrightContext:
+        def __enter__(self):
+            return FakePlaywright()
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            return None
+
+    def signed_profile_failure(*args, **kwargs):
+        raise DiscoveryError("Force browser discovery")
+
+    monkeypatch.setattr(
+        "app.douyin.fetch_signed_profile_awemes",
+        signed_profile_failure,
+    )
+    monkeypatch.setattr("app.douyin._extract_cookies", lambda profile: CookieJar())
+    monkeypatch.setattr(
+        "playwright.sync_api.sync_playwright",
+        lambda: FakePlaywrightContext(),
+    )
+
+
+def test_douyin_rate_limit_text_is_not_treated_as_captcha() -> None:
+    assert _looks_like_transient_limit("当前访问频繁，请稍后再试")
+    assert not _looks_like_auth_page("当前访问频繁，请稍后再试")
+    assert _looks_like_auth_page("请完成下列验证码")
+    assert not _looks_like_auth_page(
+        '<script>const route = "captcha";</script><main>正常主页</main>'
+    )
+    assert _looks_like_transient_limit("网络环境存在风险，请稍后再试")
+    assert not _looks_like_auth_page("网络环境存在风险，请稍后再试")
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://www.douyin.com/login",
+        "https://www.douyin.com/passport/web/login",
+        "https://sso.douyin.com/verify",
+        "https://www.douyin.com/captcha/?from=profile",
+    ],
+)
+def test_douyin_explicit_auth_urls_are_trusted_and_actionable(url: str) -> None:
+    assert _is_explicit_douyin_auth_url(url)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://www.douyin.com.evil.example/login",
+        "https://evil.example/passport/login",
+        "http://www.douyin.com/login",
+    ],
+)
+def test_douyin_lookalike_auth_urls_are_not_actionable(url: str) -> None:
+    assert not _is_explicit_douyin_auth_url(url)
 
 
 def test_item_metadata_profile_lookup_stops_at_target(monkeypatch) -> None:
@@ -75,6 +163,7 @@ def test_douyin_signed_profile_discovery_returns_verified_complete_metadata(
     assert result.media_metadata[aweme_id] == {
         "media_id": aweme_id,
         "owner_id": profile_id,
+        "media_kind": "video",
         "video_uri": video_uri,
         "minimum_width": 1080,
         "minimum_height": 1920,
@@ -83,6 +172,356 @@ def test_douyin_signed_profile_discovery_returns_verified_complete_metadata(
         "title": "Signed profile video",
         "author": "Signed Author",
     }
+
+
+def test_douyin_browser_timeout_does_not_request_chrome_verification(
+    monkeypatch,
+) -> None:
+    from playwright.sync_api import Error as PlaywrightError
+
+    profile_id = "MS4wLjABAAAAexpected"
+    profile_url = f"https://www.douyin.com/user/{profile_id}"
+
+    def signed_profile_failure(*args, **kwargs):
+        raise AuthenticationRequiredError(
+            "Signed profile unavailable",
+            verification_url=profile_url,
+        )
+
+    class TimeoutPlaywrightContext:
+        def __enter__(self):
+            raise PlaywrightError("Timeout 45000ms exceeded while navigating")
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "app.douyin.fetch_signed_profile_awemes",
+        signed_profile_failure,
+    )
+    monkeypatch.setattr("app.douyin._extract_cookies", lambda profile: CookieJar())
+    monkeypatch.setattr(
+        "playwright.sync_api.sync_playwright",
+        lambda: TimeoutPlaywrightContext(),
+    )
+
+    with pytest.raises(TemporaryAccessError, match="Chrome verification is not required"):
+        discover_profile(profile_url, use_browser_cookies=True)
+
+
+def test_douyin_browser_mixed_login_and_rate_limit_is_temporary(
+    monkeypatch,
+) -> None:
+    profile_id = "MS4wLjABAAAAexpected"
+    profile_url = f"https://www.douyin.com/user/{profile_id}"
+
+    def signed_profile_failure(*args, **kwargs):
+        raise DiscoveryError("Force browser discovery")
+
+    class FakeBody:
+        def count(self) -> int:
+            return 1
+
+        def inner_text(self, timeout: int) -> str:
+            return "请登录 当前访问频繁，请稍后再试"
+
+    class FakePage:
+        url = profile_url
+
+        def on(self, event: str, callback) -> None:
+            return None
+
+        def goto(self, url: str, wait_until: str, timeout: int) -> None:
+            self.url = url
+
+        def wait_for_timeout(self, timeout: int) -> None:
+            return None
+
+        def locator(self, selector: str) -> FakeBody:
+            return FakeBody()
+
+    class FakeContext:
+        def new_page(self) -> FakePage:
+            return FakePage()
+
+    class FakeBrowser:
+        version = "151.0.0.0"
+
+        def new_context(self, **kwargs) -> FakeContext:
+            return FakeContext()
+
+        def close(self) -> None:
+            return None
+
+    class FakeChromium:
+        def launch(self, **kwargs) -> FakeBrowser:
+            return FakeBrowser()
+
+    class FakePlaywright:
+        chromium = FakeChromium()
+
+    class FakePlaywrightContext:
+        def __enter__(self) -> FakePlaywright:
+            return FakePlaywright()
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "app.douyin.fetch_signed_profile_awemes",
+        signed_profile_failure,
+    )
+    monkeypatch.setattr("app.douyin._extract_cookies", lambda profile: CookieJar())
+    monkeypatch.setattr(
+        "playwright.sync_api.sync_playwright",
+        lambda: FakePlaywrightContext(),
+    )
+
+    with pytest.raises(
+        TemporaryAccessError,
+        match="Chrome verification is not required",
+    ):
+        discover_profile(profile_url, use_browser_cookies=True)
+
+
+def test_douyin_initial_html_hidden_auth_word_does_not_request_verification(
+    monkeypatch,
+) -> None:
+    profile_id = "MS4wLjABAAAAexpected"
+    profile_url = f"https://www.douyin.com/user/{profile_id}"
+
+    class FakeBody:
+        def count(self) -> int:
+            return 1
+
+        def inner_text(self, timeout: int) -> str:
+            raise RuntimeError("DOM text unavailable")
+
+    class FakePage:
+        url = profile_url
+
+        def on(self, event: str, callback) -> None:
+            return None
+
+        def goto(self, url: str, wait_until: str, timeout: int) -> None:
+            self.url = url
+
+        def wait_for_timeout(self, timeout: int) -> None:
+            return None
+
+        def locator(self, selector: str) -> FakeBody:
+            return FakeBody()
+
+        def content(self) -> str:
+            return '<script>const route="captcha";</script><main>正常主页</main>'
+
+    _install_fake_douyin_browser(monkeypatch, FakePage())
+
+    with pytest.raises(
+        TemporaryAccessError,
+        match="no verified profile-owned media",
+    ):
+        discover_profile(profile_url, max_scrolls=0)
+
+
+@pytest.mark.parametrize(
+    ("scroll_text", "expect_rate_limit"),
+    [
+        (None, False),
+        ("网络环境存在风险，请稍后再试", True),
+    ],
+)
+def test_douyin_scroll_non_auth_content_does_not_request_verification(
+    monkeypatch,
+    scroll_text: str | None,
+    expect_rate_limit: bool,
+) -> None:
+    profile_id = "MS4wLjABAAAAexpected"
+    profile_url = f"https://www.douyin.com/user/{profile_id}"
+    media_id = "1111111111111111111"
+
+    class FakeResponse:
+        url = (
+            "https://www.douyin.com/aweme/v1/web/aweme/post/"
+            f"?sec_user_id={profile_id}"
+        )
+
+        def json(self):
+            return {
+                "aweme_list": [
+                    {
+                        "aweme_id": media_id,
+                        "desc": "Verified title",
+                        "create_time": 1_756_656_000,
+                        "author": {
+                            "sec_uid": profile_id,
+                            "nickname": "Verified Author",
+                        },
+                        "video": {
+                            "duration": 12_000,
+                            "width": 1080,
+                            "height": 1920,
+                            "play_addr": {
+                                "uri": "v0200fg10000fixturevideoid"
+                            },
+                        },
+                    }
+                ],
+                "has_more": True,
+            }
+
+    class FakeBody:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def count(self) -> int:
+            return 1
+
+        def inner_text(self, timeout: int) -> str:
+            self.calls += 1
+            if self.calls == 1:
+                return "正常主页"
+            if scroll_text is not None:
+                return scroll_text
+            raise RuntimeError("DOM text unavailable after scroll")
+
+    class FakePage:
+        url = profile_url
+
+        def __init__(self) -> None:
+            self.body = FakeBody()
+            self.response_callback = None
+            self.mouse = self
+
+        def on(self, event: str, callback) -> None:
+            if event == "response":
+                self.response_callback = callback
+
+        def goto(self, url: str, wait_until: str, timeout: int) -> None:
+            self.url = url
+            assert self.response_callback is not None
+            self.response_callback(FakeResponse())
+
+        def wait_for_timeout(self, timeout: int) -> None:
+            return None
+
+        def locator(self, selector: str) -> FakeBody:
+            return self.body
+
+        def content(self) -> str:
+            return '<script>const route="captcha";</script><main>正常主页</main>'
+
+        def wheel(self, x: int, y: int) -> None:
+            return None
+
+        def evaluate(self, script: str) -> None:
+            return None
+
+    _install_fake_douyin_browser(monkeypatch, FakePage())
+
+    if expect_rate_limit:
+        with pytest.raises(
+            TemporaryAccessError,
+            match="temporarily rate-limited",
+        ):
+            discover_profile(profile_url, max_scrolls=1)
+        return
+
+    result = discover_profile(profile_url, max_scrolls=1)
+    assert result.author == "Verified Author"
+    assert result.video_urls == [f"https://www.douyin.com/video/{media_id}"]
+    assert result.discovery_complete is False
+
+
+@pytest.mark.parametrize(
+    ("redirect_url", "expected_error"),
+    [
+        ("https://www.douyin.com/login", AuthenticationRequiredError),
+        ("https://evil.example/login", DiscoveryError),
+    ],
+)
+def test_douyin_browser_redirect_requires_trusted_explicit_auth_url(
+    monkeypatch,
+    redirect_url: str,
+    expected_error: type[Exception],
+) -> None:
+    profile_id = "MS4wLjABAAAAexpected"
+    profile_url = f"https://www.douyin.com/user/{profile_id}"
+
+    def signed_profile_failure(*args, **kwargs):
+        raise AuthenticationRequiredError(
+            "Signed profile unavailable",
+            verification_url=profile_url,
+        )
+
+    class FakeLocator:
+        def count(self) -> int:
+            return 1
+
+        def inner_text(self, timeout: int) -> str:
+            return "Neutral client-side shell"
+
+    class FakePage:
+        def __init__(self) -> None:
+            self.url = profile_url
+
+        def on(self, event: str, callback) -> None:
+            return None
+
+        def goto(self, url: str, wait_until: str, timeout: int) -> None:
+            self.url = redirect_url
+
+        def wait_for_timeout(self, timeout: int) -> None:
+            return None
+
+        def locator(self, selector: str) -> FakeLocator:
+            return FakeLocator()
+
+        def content(self) -> str:
+            return "<html><body>Neutral client-side shell</body></html>"
+
+    class FakeContext:
+        def new_page(self) -> FakePage:
+            return FakePage()
+
+    class FakeBrowser:
+        version = "151.0.0.0"
+
+        def new_context(self, **kwargs) -> FakeContext:
+            return FakeContext()
+
+        def close(self) -> None:
+            return None
+
+    class FakeChromium:
+        def launch(self, **kwargs) -> FakeBrowser:
+            return FakeBrowser()
+
+    class FakePlaywright:
+        chromium = FakeChromium()
+
+    class FakePlaywrightContext:
+        def __enter__(self) -> FakePlaywright:
+            return FakePlaywright()
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "app.douyin.fetch_signed_profile_awemes",
+        signed_profile_failure,
+    )
+    monkeypatch.setattr("app.douyin._extract_cookies", lambda profile: CookieJar())
+    monkeypatch.setattr(
+        "playwright.sync_api.sync_playwright",
+        lambda: FakePlaywrightContext(),
+    )
+
+    with pytest.raises(expected_error) as captured:
+        discover_profile(profile_url, use_browser_cookies=True)
+
+    if isinstance(captured.value, AuthenticationRequiredError):
+        assert captured.value.verification_url == profile_url
 
 
 def test_douyin_minimal_metadata_accepts_265_and_bitrate_uris() -> None:
@@ -110,9 +549,315 @@ def test_douyin_minimal_metadata_accepts_265_and_bitrate_uris() -> None:
     )
 
     assert from_265 and from_265[1]["video_uri"] == "v0200fg10000265fixtureid"
+    assert from_265[1]["media_kind"] == "video"
     assert from_bitrate and from_bitrate[1]["video_uri"] == (
         "v0200fg10000bitratefixtureid"
     )
+
+
+def test_douyin_realistic_photo_post_uses_images_not_top_level_music_video() -> None:
+    profile_id = "MS4wLjABAAAAexpected"
+    media_id = "7676078420824775161"
+    image_url = (
+        "https://p3-pc-sign.douyinpic.com/tos-cn-i-0813c000-ce/photo-1"
+        "~tplv-dy-aweme-images:q75.webp?x-signature=verified"
+    )
+    live_720 = "https://v11-weba.douyinvod.com/live-720.mp4"
+    live_1080 = "https://v26-web.douyinvod.com/live-1080.mp4"
+
+    result = _minimal_aweme_metadata(
+        {
+            "aweme_id": media_id,
+            "aweme_type": 68,
+            "desc": "Photo post title",
+            "create_time": 1_756_656_000,
+            "author": {"sec_uid": profile_id, "nickname": "Photo Author"},
+            "video": {
+                "play_addr": {
+                    "uri": "https://lf9-music-east.douyinstatic.com/music.mp3",
+                    "width": 720,
+                    "height": 720,
+                }
+            },
+            "images": [
+                {
+                    "width": 1440,
+                    "height": 2560,
+                    "url_list": [image_url, "https://evil.example/photo.webp"],
+                    "download_url_list": [
+                        "https://p3-pc-sign.douyinpic.com/lower-1080.webp"
+                    ],
+                    "video": {
+                        "play_addr": {
+                            "uri": "v0200fg10000livephotoasset",
+                            "width": 720,
+                            "height": 1280,
+                            "url_list": [live_720],
+                        },
+                        "bit_rate": [
+                            {
+                                "bit_rate": 2_000_000,
+                                "is_h265": 1,
+                                "play_addr": {
+                                    "uri": "v0200fg10000livephotoasset",
+                                    "width": 1080,
+                                    "height": 1920,
+                                    "url_list": [live_1080],
+                                },
+                            }
+                        ],
+                    },
+                }
+            ],
+        },
+        profile_id,
+    )
+
+    assert result is not None
+    metadata = result[1]
+    assert metadata["media_kind"] == "image"
+    assert metadata["title"] == "Photo post title"
+    assert metadata["image_assets"] == [
+        {
+            "index": 1,
+            "width": 1440,
+            "height": 2560,
+            "candidates": [image_url],
+        }
+    ]
+    assert metadata["live_photo_assets"] == [
+        {
+            "index": 1,
+            "width": 1080,
+            "height": 1920,
+            "candidates": [live_1080],
+            "video_uri": "v0200fg10000livephotoasset",
+        }
+    ]
+    assert "lower-1080" not in str(metadata)
+    assert is_complete_profile_media_metadata(metadata, media_id, profile_id)
+
+
+def test_douyin_image_metadata_requires_trusted_complete_assets() -> None:
+    profile_id = "MS4wLjABAAAAexpected"
+    media_id = "7676078420824775161"
+    base = {
+        "media_id": media_id,
+        "owner_id": profile_id,
+        "media_kind": "image",
+        "title": "Photo title",
+        "image_assets": [
+            {
+                "index": 1,
+                "width": 1080,
+                "height": 1920,
+                "candidates": ["https://p3-pc-sign.douyinpic.com/photo.webp"],
+            }
+        ],
+    }
+
+    assert is_complete_profile_media_metadata(base, media_id, profile_id)
+    assert is_complete_profile_media_metadata(
+        {key: value for key, value in base.items() if key != "title"},
+        media_id,
+        profile_id,
+    )
+    assert not is_complete_profile_media_metadata(
+        {**base, "owner_id": "MS4wLjABAAAAother"}, media_id, profile_id
+    )
+    assert not is_complete_profile_media_metadata(
+        {
+            **base,
+            "image_assets": [
+                {
+                    "index": 1,
+                    "width": 1080,
+                    "height": 1920,
+                    "candidates": ["https://evil.example/photo.webp"],
+                }
+            ],
+        },
+        media_id,
+        profile_id,
+    )
+
+
+def test_douyin_live_photo_rejects_multiple_highest_media_identities() -> None:
+    profile_id = "MS4wLjABAAAAexpected"
+    media_id = "7676078420824775161"
+    result = _minimal_aweme_metadata(
+        {
+            "aweme_id": media_id,
+            "aweme_type": 68,
+            "author": {"sec_uid": profile_id},
+            "images": [
+                {
+                    "width": 1080,
+                    "height": 1920,
+                    "url_list": [
+                        "https://p3-pc-sign.douyinpic.com/photo.webp"
+                    ],
+                    "video": {
+                        "play_addr": {
+                            "uri": "v0200fg10000liveidentityA",
+                            "width": 1080,
+                            "height": 1920,
+                            "url_list": [
+                                "https://v26-web.douyinvod.com/live-a.mp4"
+                            ],
+                        },
+                        "play_addr_h264": {
+                            "uri": "v0200fg10000liveidentityB",
+                            "width": 1080,
+                            "height": 1920,
+                            "url_list": [
+                                "https://v11-web.douyinvod.com/live-b.mp4"
+                            ],
+                        },
+                    },
+                }
+            ],
+        },
+        profile_id,
+    )
+
+    assert result is None
+
+
+def test_douyin_live_photo_rejects_different_lower_rendition_identity() -> None:
+    profile_id = "MS4wLjABAAAAexpected"
+    media_id = "7676078420824775161"
+    result = _minimal_aweme_metadata(
+        {
+            "aweme_id": media_id,
+            "aweme_type": 68,
+            "author": {"sec_uid": profile_id},
+            "images": [
+                {
+                    "width": 1080,
+                    "height": 1920,
+                    "url_list": [
+                        "https://p3-pc-sign.douyinpic.com/photo.webp"
+                    ],
+                    "video": {
+                        "play_addr": {
+                            "uri": "v0200fg10000liveidentityA",
+                            "width": 720,
+                            "height": 1280,
+                            "url_list": [
+                                "https://v26-web.douyinvod.com/live-a.mp4"
+                            ],
+                        },
+                        "bit_rate": [
+                            {
+                                "bit_rate": 2_000_000,
+                                "play_addr": {
+                                    "uri": "v0200fg10000liveidentityB",
+                                    "width": 1080,
+                                    "height": 1920,
+                                    "url_list": [
+                                        "https://v11-web.douyinvod.com/live-b.mp4"
+                                    ],
+                                },
+                            }
+                        ],
+                    },
+                }
+            ],
+        },
+        profile_id,
+    )
+
+    assert result is None
+
+
+def test_douyin_profile_video_rejects_multiple_media_identities() -> None:
+    profile_id = "MS4wLjABAAAAexpected"
+    result = _minimal_aweme_metadata(
+        {
+            "aweme_id": "7676078420824775161",
+            "author": {"sec_uid": profile_id},
+            "video": {
+                "play_addr": {
+                    "uri": "v0200fg10000profileidentityA",
+                    "width": 720,
+                    "height": 1280,
+                    "url_list": [
+                        "https://v26-web.douyinvod.com/profile-a.mp4"
+                    ],
+                },
+                "bit_rate": [
+                    {
+                        "bit_rate": 2_000_000,
+                        "play_addr": {
+                            "uri": "v0200fg10000profileidentityB",
+                            "width": 1080,
+                            "height": 1920,
+                            "url_list": [
+                                "https://v11-web.douyinvod.com/profile-b.mp4"
+                            ],
+                        },
+                    }
+                ],
+            },
+        },
+        profile_id,
+    )
+
+    assert result is None
+
+
+def test_douyin_missing_description_gets_non_numeric_display_title() -> None:
+    profile_id = "MS4wLjABAAAAexpected"
+    media_id = "7676078420824775161"
+    result = _minimal_aweme_metadata(
+        {
+            "aweme_id": media_id,
+            "aweme_type": 68,
+            "author": {"sec_uid": profile_id},
+            "images": [
+                {
+                    "width": 1080,
+                    "height": 1920,
+                    "url_list": [
+                        "https://p3-pc-sign.douyinpic.com/photo.webp"
+                    ],
+                }
+            ],
+        },
+        profile_id,
+    )
+
+    assert result is not None
+    assert result[1]["title"] == "Untitled Douyin image"
+
+
+def test_douyin_signed_profile_fails_closed_on_incomplete_media(monkeypatch) -> None:
+    profile_id = "MS4wLjABAAAAexpected"
+    profile_url = f"https://www.douyin.com/user/{profile_id}"
+    media_id = "7676078420824775161"
+    monkeypatch.setattr(
+        "app.douyin.fetch_signed_profile_awemes",
+        lambda *args, **kwargs: [
+            {
+                "aweme_id": media_id,
+                "aweme_type": 68,
+                "desc": "Incomplete photo",
+                "author": {"sec_uid": profile_id, "nickname": "Author"},
+                "video": {"play_addr": {"uri": "music.mp3"}},
+                "images": [
+                    {
+                        "width": 1080,
+                        "height": 1920,
+                        "url_list": ["https://evil.example/photo.webp"],
+                    }
+                ],
+            }
+        ],
+    )
+
+    with pytest.raises(TemporaryAccessError, match="complete verified metadata"):
+        discover_profile(profile_url, use_browser_cookies=True)
 
 
 def test_douyin_minimal_metadata_caches_conservative_quality_floor() -> None:
@@ -127,7 +872,7 @@ def test_douyin_minimal_metadata_caches_conservative_quality_floor() -> None:
                     {
                         "width": 2560,
                         "height": 1440,
-                        "play_addr": {"uri": "v0200fg10000highqualityid"},
+                            "play_addr": {"uri": "v0200fg10000fixturevideoid"},
                     }
                 ],
             },
@@ -192,6 +937,7 @@ def test_douyin_metadata_keeps_highest_verified_direct_rendition() -> None:
             "width": 1440,
             "height": 2560,
             "urls": ["https://v11-weba.douyinvod.com/verified-1440.mp4"],
+            "video_uri": shared_uri,
             "bit_rate": 1_320_511,
             "codec_hint": "hevc",
         }
@@ -315,8 +1061,9 @@ def test_douyin_discovery_waits_for_scrolled_api_page_before_stability_stop(
             "aweme_list": [
                 {
                     "aweme_id": aweme_id,
+                    "desc": f"Video {aweme_id}",
                     "author": {"sec_uid": profile_id, "nickname": "Author"},
-                    "video": {"play_addr": {}},
+                    "video": {"play_addr": {"uri": f"video-{aweme_id}"}},
                 }
             ],
         }
