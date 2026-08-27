@@ -53,6 +53,19 @@ def _server_url(port: int) -> str:
     return f"http://{HOST}:{port}"
 
 
+def _launcher_parent_matches(
+    expected_pid: int,
+    *,
+    platform_name: str | None = None,
+) -> bool:
+    # A Windows venv interpreter can pass through an executable redirector, so
+    # getppid() is not a stable launcher identity there. ParentProcessMonitor
+    # validates the supplied PID with a process handle before serving requests.
+    if (platform_name or os.name) == "nt":
+        return True
+    return expected_pid == os.getppid()
+
+
 def _fetch_health(port: int, *, timeout: float = 1.0) -> dict[str, Any] | None:
     request = Request(
         f"{_server_url(port)}/api/health",
@@ -92,6 +105,9 @@ def _bind_listener(port: int) -> socket.socket:
     _configure_listener(listener)
     try:
         listener.bind((HOST, port))
+        # Reserve the endpoint immediately on platforms where two unlistened
+        # SO_REUSEADDR sockets may otherwise bind the same address.
+        listener.listen()
     except BaseException:
         listener.close()
         raise
@@ -356,7 +372,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.exit_with_parent is not None:
         if args.exit_with_parent <= 1:
             parser.error("parent PID must be greater than 1")
-        if args.exit_with_parent != os.getppid():
+        if not _launcher_parent_matches(args.exit_with_parent):
             print("The expected launcher is no longer this process's parent.")
             return 1
 
@@ -417,6 +433,9 @@ def main(argv: list[str] | None = None) -> int:
                 write_runtime_record(runtime_dir, record)
                 if args.exit_with_parent is not None:
                     parent_monitor = ParentProcessMonitor(args.exit_with_parent)
+                    if parent_monitor.disappeared():
+                        print("The expected launcher is no longer running.")
+                        return 1
                     parent_watcher = threading.Thread(
                         target=_watch_parent,
                         args=(server, parent_monitor, watchers_finished),

@@ -159,7 +159,7 @@ def test_spawn_backend_passes_lock_and_launcher_parent(monkeypatch, tmp_path) ->
     assert result is process
     command = captured["command"]
     assert command == [
-        "/python",
+        str(Path("/python")),
         str(tmp_path / "run.py"),
         "--port",
         "18765",

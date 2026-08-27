@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -549,7 +550,10 @@ def configure_safe_legacy_backend(
     monkeypatch.setattr(
         stop,
         "_macos_process_command",
-        lambda candidate: f"{sys.executable} {stop.PROJECT_ROOT / 'run.py'}",
+        lambda candidate: (
+            f"{shlex.quote(sys.executable)} "
+            f"{shlex.quote(str(stop.PROJECT_ROOT / 'run.py'))}"
+        ),
     )
 
 

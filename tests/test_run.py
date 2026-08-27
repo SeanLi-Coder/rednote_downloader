@@ -34,6 +34,23 @@ def test_current_build_requires_complete_identity() -> None:
     assert run._is_current_build({**current_health(), "restart_required": True}) is False
 
 
+def test_launcher_parent_uses_direct_identity_on_posix(monkeypatch) -> None:
+    monkeypatch.setattr(run.os, "getppid", lambda: 12_345)
+
+    assert run._launcher_parent_matches(12_345, platform_name="posix") is True
+    assert run._launcher_parent_matches(54_321, platform_name="posix") is False
+
+
+def test_launcher_parent_uses_stable_monitor_on_windows(monkeypatch) -> None:
+    monkeypatch.setattr(
+        run.os,
+        "getppid",
+        lambda: (_ for _ in ()).throw(AssertionError("getppid must not be used")),
+    )
+
+    assert run._launcher_parent_matches(12_345, platform_name="nt") is True
+
+
 def test_occupied_old_backend_never_opens_browser(monkeypatch, tmp_path) -> None:
     opened: list[str] = []
     monkeypatch.setattr(
