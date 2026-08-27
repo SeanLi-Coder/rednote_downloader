@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+import threading
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -7,9 +10,17 @@ from app import main as main_module
 from app.build_info import APP_ID, APP_VERSION, BUILD_ID, calculate_build_id
 from app.main import app
 from app.models import DownloadItem, DownloadJob, Platform, SourceKind
+from app.runtime import clear_runtime_identity, configure_runtime_identity
 
 
-def test_health_endpoint_accepts_local_host_and_rejects_dns_rebinding() -> None:
+def test_health_endpoint_accepts_local_host_and_rejects_dns_rebinding(
+    monkeypatch,
+) -> None:
+    configure_runtime_identity(
+        instance_id="a" * 32,
+        stop_token="test_secret_" + "b" * 32,
+        server_port=18765,
+    )
     client = TestClient(app, base_url="http://localhost")
     try:
         assert client.get("/api/health").json() == {
@@ -19,11 +30,64 @@ def test_health_endpoint_accepts_local_host_and_rejects_dns_rebinding() -> None:
             "build_id": BUILD_ID,
             "source_build_id": calculate_build_id(),
             "restart_required": False,
+            "instance_id": "a" * 32,
+            "server_pid": os.getpid(),
+            "server_port": 18765,
         }
         assert (
             client.get("/api/health", headers={"host": "attacker.example"}).status_code
             == 400
         )
+    finally:
+        client.close()
+        clear_runtime_identity(instance_id="a" * 32)
+
+
+def test_runtime_stop_requires_matching_secret_and_stops_asynchronously(
+    monkeypatch,
+) -> None:
+    stopped = threading.Event()
+    instance_id = "c" * 32
+    configure_runtime_identity(
+        instance_id=instance_id,
+        stop_token="runtime_test_secret_" + "d" * 32,
+        server_port=18766,
+    )
+    monkeypatch.setattr(main_module, "_request_process_stop", stopped.set)
+    client = TestClient(app, base_url="http://localhost")
+    try:
+        assert client.post("/api/runtime/stop").status_code == 403
+        assert (
+            client.post(
+                "/api/runtime/stop",
+                headers={"X-Original-Media-Stop-Token": "wrong-secret"},
+            ).status_code
+            == 403
+        )
+        response = client.post(
+            "/api/runtime/stop",
+            headers={
+                "X-Original-Media-Stop-Token": "runtime_test_secret_" + "d" * 32
+            },
+        )
+        assert response.status_code == 200
+        assert response.json() == {
+            "status": "stopping",
+            "instance_id": instance_id,
+        }
+        assert stopped.wait(timeout=1)
+    finally:
+        client.close()
+        clear_runtime_identity(instance_id=instance_id)
+
+
+def test_runtime_stop_is_disabled_without_managed_runtime_token(
+    monkeypatch,
+) -> None:
+    clear_runtime_identity(instance_id="unmanaged")
+    client = TestClient(app, base_url="http://localhost")
+    try:
+        assert client.post("/api/runtime/stop").status_code == 503
     finally:
         client.close()
 

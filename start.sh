@@ -21,23 +21,10 @@ if ! command -v ffmpeg >/dev/null 2>&1; then
   echo "Warning: FFmpeg was not found. Split video/audio downloads may fail."
 fi
 
-if [ ! -x ".venv/bin/python" ]; then
-  echo "Creating the local Python environment..."
-  python3 -m venv .venv
-fi
-
-if ! .venv/bin/python -c 'import sys; raise SystemExit(sys.version_info < (3, 10))'; then
-  echo "The existing .venv uses an unsupported Python version. Delete .venv and run again."
-  exit 1
-fi
-
 if ! command -v google-chrome >/dev/null 2>&1 \
   && ! command -v google-chrome-stable >/dev/null 2>&1; then
   echo "Warning: Google Chrome was not found. Chromium may open the UI, but Chrome Cookie access and profile discovery require Google Chrome."
 fi
 
-echo "Checking dependencies..."
-.venv/bin/python -m pip install --disable-pip-version-check -q -r requirements.txt
-
 echo "Starting Original Media Downloader at http://127.0.0.1:8765"
-exec .venv/bin/python run.py
+exec python3 launcher.py

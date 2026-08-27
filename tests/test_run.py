@@ -5,8 +5,15 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 import run
 from app.build_info import APP_ID, APP_VERSION, BUILD_ID
+
+
+@pytest.fixture(autouse=True)
+def _isolated_project_root(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(run, "PROJECT_ROOT", tmp_path / "project")
 
 
 def current_health() -> dict[str, object]:
@@ -27,7 +34,7 @@ def test_current_build_requires_complete_identity() -> None:
     assert run._is_current_build({**current_health(), "restart_required": True}) is False
 
 
-def test_occupied_old_backend_never_opens_browser(monkeypatch) -> None:
+def test_occupied_old_backend_never_opens_browser(monkeypatch, tmp_path) -> None:
     opened: list[str] = []
     monkeypatch.setattr(
         run,
@@ -43,13 +50,18 @@ def test_occupied_old_backend_never_opens_browser(monkeypatch) -> None:
             AssertionError("the ASGI app must not load while the port is occupied")
         ),
     )
-    result = run.main(["--port", "18765"])
+    result = run.main(
+        ["--port", "18765", "--runtime-dir", str(tmp_path / "runtime")]
+    )
 
     assert result == 2
     assert opened == []
 
 
-def test_occupied_current_backend_opens_existing_instance(monkeypatch) -> None:
+def test_occupied_current_backend_opens_existing_instance(
+    monkeypatch,
+    tmp_path,
+) -> None:
     opened: list[str] = []
     monkeypatch.setattr(
         run,
@@ -59,13 +71,18 @@ def test_occupied_current_backend_opens_existing_instance(monkeypatch) -> None:
     monkeypatch.setattr(run, "_fetch_health", lambda port: current_health())
     monkeypatch.setattr(run, "open_chrome", opened.append)
 
-    result = run.main(["--port", "18766"])
+    result = run.main(
+        ["--port", "18766", "--runtime-dir", str(tmp_path / "runtime")]
+    )
 
     assert result == 0
     assert opened == ["http://127.0.0.1:18766"]
 
 
-def test_no_browser_never_opens_matching_existing_instance(monkeypatch) -> None:
+def test_no_browser_never_opens_matching_existing_instance(
+    monkeypatch,
+    tmp_path,
+) -> None:
     opened: list[str] = []
     monkeypatch.setattr(
         run,
@@ -75,7 +92,15 @@ def test_no_browser_never_opens_matching_existing_instance(monkeypatch) -> None:
     monkeypatch.setattr(run, "_fetch_health", lambda port: current_health())
     monkeypatch.setattr(run, "open_chrome", opened.append)
 
-    result = run.main(["--port", "18767", "--no-browser"])
+    result = run.main(
+        [
+            "--port",
+            "18767",
+            "--no-browser",
+            "--runtime-dir",
+            str(tmp_path / "runtime"),
+        ]
+    )
 
     assert result == 0
     assert opened == []
@@ -87,6 +112,7 @@ def test_listener_exclusively_reserves_port_before_app_import() -> None:
     contender = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     contender.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
+        assert listener.get_inheritable() is False
         try:
             contender.bind((run.HOST, port))
         except OSError:
@@ -134,7 +160,10 @@ def test_launcher_import_does_not_load_downloader_or_task_manager() -> None:
     assert completed.stdout.splitlines() == ["False", "False", "False"]
 
 
-def test_free_port_start_supports_uvicorn_without_load_app(monkeypatch) -> None:
+def test_free_port_start_supports_uvicorn_without_load_app(
+    monkeypatch,
+    tmp_path,
+) -> None:
     class CompatibleConfig:
         def __init__(self, app, **kwargs):
             self.app = app
@@ -151,7 +180,18 @@ def test_free_port_start_supports_uvicorn_without_load_app(monkeypatch) -> None:
     monkeypatch.setattr(run.uvicorn, "Config", CompatibleConfig)
     monkeypatch.setattr(run.uvicorn, "Server", CompatibleServer)
 
-    assert run.main(["--port", "0", "--no-browser"]) == 0
+    assert (
+        run.main(
+            [
+                "--port",
+                "0",
+                "--no-browser",
+                "--runtime-dir",
+                str(tmp_path / "runtime"),
+            ]
+        )
+        == 0
+    )
 
 
 def test_browser_waits_for_exact_build(monkeypatch) -> None:
@@ -164,3 +204,41 @@ def test_browser_waits_for_exact_build(monkeypatch) -> None:
     run._open_when_ready(18768)
 
     assert opened == ["http://127.0.0.1:18768"]
+
+
+def test_parent_watchdog_forces_managed_tree_after_shutdown_timeout(
+    monkeypatch,
+) -> None:
+    class FakeServer:
+        should_exit = False
+
+    class MissingParent:
+        @staticmethod
+        def disappeared() -> bool:
+            return True
+
+    class NeverFinished:
+        def __init__(self) -> None:
+            self.waits: list[float] = []
+
+        def wait(self, timeout: float) -> bool:
+            self.waits.append(timeout)
+            return False
+
+    server = FakeServer()
+    finished = NeverFinished()
+    forced: list[bool] = []
+    monkeypatch.setattr(
+        run,
+        "_force_exit_managed_process_tree",
+        lambda: forced.append(True),
+    )
+
+    run._watch_parent(server, MissingParent(), finished)
+
+    assert server.should_exit is True
+    assert finished.waits == [
+        run.PARENT_POLL_SECONDS,
+        run.PARENT_FORCE_STOP_SECONDS,
+    ]
+    assert forced == [True]

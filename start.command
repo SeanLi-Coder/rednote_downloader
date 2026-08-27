@@ -27,29 +27,36 @@ if ! command -v ffmpeg >/dev/null 2>&1; then
   echo "On macOS with Homebrew, run: brew install ffmpeg"
 fi
 
-if [ ! -x ".venv/bin/python" ]; then
-  echo "Creating the local Python environment..."
-  python3 -m venv .venv
-fi
-
-if ! .venv/bin/python -c 'import sys; raise SystemExit(sys.version_info < (3, 10))'; then
-  echo "The existing .venv uses an unsupported Python version. Delete .venv and run again."
-  read -r -p "Press Enter to close..."
-  exit 1
-fi
-
 if ! /usr/bin/open -Ra "Google Chrome" >/dev/null 2>&1; then
   echo "Warning: Google Chrome was not found. Cookie access and verification cannot work until it is installed."
 fi
 
-echo "Checking dependencies..."
-.venv/bin/python -m pip install --disable-pip-version-check -q -r requirements.txt
-
 echo "Starting Original Media Downloader at http://127.0.0.1:8765"
+launcher_pid=""
+shutdown_requested=0
+
+forward_stop() {
+  shutdown_requested=1
+  if [ -n "$launcher_pid" ] && kill -0 "$launcher_pid" 2>/dev/null; then
+    kill -TERM "$launcher_pid" 2>/dev/null || true
+  fi
+}
+
+trap forward_stop HUP INT TERM
 set +e
-.venv/bin/python run.py
+python3 launcher.py --parent-pid "$$" &
+launcher_pid=$!
+wait "$launcher_pid"
 task_exit_code=$?
+while kill -0 "$launcher_pid" 2>/dev/null; do
+  wait "$launcher_pid"
+  task_exit_code=$?
+done
 set -e
+trap - HUP INT TERM
+if [ "$shutdown_requested" -eq 1 ]; then
+  task_exit_code=0
+fi
 if [ "$task_exit_code" -ne 0 ]; then
   echo ""
   read -r -p "Startup stopped. Review the message above, then press Enter to close..."

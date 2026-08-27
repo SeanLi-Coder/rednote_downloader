@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
 import queue
 import re
+import secrets
+import threading
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Iterator
@@ -19,6 +23,11 @@ from .build_info import APP_ID, APP_VERSION, BUILD_ID, calculate_build_id
 from .downloader import DownloaderConfig
 from .models import DownloadJob
 from .platforms import UnsupportedUrlError, identify_url
+from .runtime import (
+    RUNTIME_STOP_EVENT,
+    STOP_TOKEN_HEADER,
+    current_runtime_identity,
+)
 from .storage import JobNotFoundError
 from .task_manager import (
     DownloadManager,
@@ -208,8 +217,9 @@ def _public_job(job: DownloadJob) -> DownloadJob:
 
 
 @app.get("/api/health")
-def health() -> dict[str, str | bool]:
+def health() -> dict[str, str | bool | int]:
     source_build_id = calculate_build_id()
+    instance_id, _, server_port = current_runtime_identity()
     return {
         "status": "ok",
         "app_id": APP_ID,
@@ -217,6 +227,45 @@ def health() -> dict[str, str | bool]:
         "build_id": BUILD_ID,
         "source_build_id": source_build_id,
         "restart_required": source_build_id != BUILD_ID,
+        "instance_id": instance_id,
+        "server_pid": os.getpid(),
+        "server_port": server_port,
+    }
+
+
+def _request_process_stop() -> None:
+    # Let the HTTP response leave the socket before Uvicorn begins shutdown.
+    time.sleep(0.1)
+    RUNTIME_STOP_EVENT.set()
+
+
+@app.post("/api/runtime/stop")
+def stop_runtime(request: Request) -> dict[str, str]:
+    client_host = request.client.host if request.client is not None else ""
+    if client_host not in {"127.0.0.1", "::1", "testclient"}:
+        raise HTTPException(status_code=403, detail="Runtime stop is local-only")
+
+    instance_id, expected_token, _ = current_runtime_identity()
+    supplied_token = request.headers.get(STOP_TOKEN_HEADER, "")
+    if not expected_token:
+        raise HTTPException(
+            status_code=503,
+            detail="This runtime was not started with a stop token",
+        )
+    if not supplied_token or not secrets.compare_digest(
+        supplied_token,
+        expected_token,
+    ):
+        raise HTTPException(status_code=403, detail="Invalid runtime stop token")
+
+    threading.Thread(
+        target=_request_process_stop,
+        name="runtime-stop",
+        daemon=True,
+    ).start()
+    return {
+        "status": "stopping",
+        "instance_id": instance_id,
     }
 
 

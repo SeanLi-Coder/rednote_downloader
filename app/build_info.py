@@ -5,7 +5,7 @@ from pathlib import Path
 
 
 APP_ID = "original-media-downloader"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -14,6 +14,14 @@ def calculate_build_id(project_root: Path = PROJECT_ROOT) -> str:
 
     candidates = [
         project_root / "run.py",
+        project_root / "launcher.py",
+        project_root / "stop.py",
+        project_root / "start.command",
+        project_root / "start.sh",
+        project_root / "start.bat",
+        project_root / "stop.command",
+        project_root / "stop.sh",
+        project_root / "stop.bat",
         project_root / "pyproject.toml",
         project_root / "requirements.txt",
     ]

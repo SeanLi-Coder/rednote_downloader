@@ -30,6 +30,7 @@ def open_chrome(url: str) -> None:
             ["/usr/bin/open", "-a", "Google Chrome", url],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            start_new_session=True,
         )
         return
     if sys.platform.startswith("win"):
@@ -55,6 +56,11 @@ def open_chrome(url: str) -> None:
                     [candidate, url],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
+                    creationflags=(
+                        subprocess.CREATE_NEW_PROCESS_GROUP
+                        | subprocess.DETACHED_PROCESS
+                        | subprocess.CREATE_BREAKAWAY_FROM_JOB
+                    ),
                 )
                 return
         raise RuntimeError("Google Chrome was not found")
@@ -69,6 +75,7 @@ def open_chrome(url: str) -> None:
                 [executable, url],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                start_new_session=True,
             )
             return
         except FileNotFoundError:
