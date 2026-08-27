@@ -27,6 +27,9 @@ from app.task_manager import (
     DOUYIN_PROFILE_REDISCOVERY_ITEM_MARKER,
     DOUYIN_PROFILE_REDISCOVERY_MESSAGE,
     DOUYIN_UNVERIFIABLE_QUEUE_ERROR,
+    LEGACY_DOUYIN_MEDIA_REDIRECT_MARKER,
+    LEGACY_DOUYIN_MEDIA_REDIRECT_MESSAGE,
+    LEGACY_DOUYIN_SHORT_REDIRECT_MESSAGE,
     DownloadManager,
     ItemNotRetryableError,
     XIAOHONGSHU_BINDING_REDISCOVERY_MARKER,
@@ -1904,6 +1907,345 @@ def test_restore_reclassifies_legacy_generic_douyin_signing_auth(
         assert DownloadManager._should_rediscover_on_retry(restored) is True
     finally:
         manager.shutdown()
+
+
+def test_restore_migrates_legacy_douyin_profile_redirect_for_rediscovery(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    state_dir = tmp_path / "state"
+    output_root = tmp_path / "downloads"
+    profile_url = "https://www.douyin.com/user/verified-profile"
+    preserved_file = output_root / "preserved.mp4"
+    preserved_file.parent.mkdir(parents=True)
+    preserved_file.write_bytes(b"preserved")
+    legacy_message = (
+        f"{LEGACY_DOUYIN_MEDIA_REDIRECT_MARKER}. The media response was blocked."
+    )
+    job = DownloadJob(
+        id="legacy-profile-media-redirect",
+        source_url=profile_url,
+        platform=Platform.DOUYIN,
+        source_kind=SourceKind.PROFILE,
+        output_root=str(output_root),
+        status=JobStatus.PARTIAL,
+        error=legacy_message,
+        warning=legacy_message,
+        retryable=True,
+        discovery_complete=True,
+        items=[
+            DownloadItem(
+                id="preserved",
+                media_id="7664225419386607205",
+                    source_url="https://www.douyin.com/video/7664225419386607205",
+                    title="Preserved",
+                    media_type=MediaType.VIDEO,
+                    status=ItemStatus.COMPLETED,
+                    output_paths=[str(preserved_file)],
+                    metadata=complete_douyin_profile_metadata(
+                        profile_url,
+                        "7664225419386607205",
+                        title="Preserved",
+                    ),
+            ),
+            DownloadItem(
+                id="failed",
+                media_id="7677923079457231738",
+                source_url="https://www.douyin.com/video/7677923079457231738",
+                title="Failed",
+                status=ItemStatus.FAILED,
+                error=legacy_message,
+            ),
+            DownloadItem(
+                id="queued",
+                media_id="7677554129950241521",
+                source_url="https://www.douyin.com/video/7677554129950241521",
+                title="Queued",
+                status=ItemStatus.QUEUED,
+            ),
+        ],
+    )
+    JsonJobStore(state_dir).save(job)
+
+    manager = DownloadManager(
+        state_dir=state_dir,
+        default_output_root=output_root,
+        max_workers=1,
+    )
+    restored_revision = None
+    try:
+        restored = manager.get_job(job.id)
+        restored_revision = restored.revision
+
+        assert restored.status == JobStatus.INTERRUPTED
+        assert restored.discovery_complete is False
+        assert restored.retryable is True
+        assert restored.auth_message is None
+        assert restored.verification_url is None
+        assert len(restored.items) == 1
+        assert restored.items[0].id == "preserved"
+        assert restored.items[0].status == ItemStatus.COMPLETED
+        assert restored.items[0].error is None
+        assert restored.items[0].output_paths == [str(preserved_file)]
+        assert preserved_file.read_bytes() == b"preserved"
+        assert DOUYIN_PROFILE_REDISCOVERY_ITEM_MARKER not in restored.items[0].metadata
+        assert LEGACY_DOUYIN_MEDIA_REDIRECT_MARKER not in restored.model_dump_json()
+        assert DownloadManager._should_rediscover_on_retry(restored) is True
+    finally:
+        manager.shutdown()
+
+    restarted_manager = DownloadManager(
+        state_dir=state_dir,
+        default_output_root=output_root,
+        max_workers=1,
+    )
+
+    class RediscoveryEngine:
+        def __init__(self) -> None:
+            self.discovery_urls: list[str] = []
+            self.download_calls: list[str] = []
+
+        def discover(self, url, platform, kind, *, should_cancel):
+            self.discovery_urls.append(url)
+            media_ids = [
+                "7664225419386607205",
+                "7677923079457231738",
+                "7677554129950241521",
+            ]
+            return DiscoveryResult(
+                author="Verified author",
+                items=[
+                    DownloadItem(
+                        id=("preserved" if index == 0 else f"fresh-{media_id}"),
+                        media_id=media_id,
+                        source_url=f"https://www.douyin.com/video/{media_id}",
+                        title=f"Fresh {index + 1}",
+                        author="Verified author",
+                        media_type=MediaType.VIDEO,
+                        metadata=complete_douyin_profile_metadata(
+                            profile_url,
+                            media_id,
+                            title=f"Fresh {index + 1}",
+                        ),
+                    )
+                    for index, media_id in enumerate(media_ids)
+                ],
+            )
+
+        def download_item(
+            self,
+            item,
+            platform,
+            output_dir,
+            *,
+            callback,
+            should_cancel,
+        ):
+            self.download_calls.append(item.media_id)
+            output_path = Path(output_dir) / f"{item.media_id}.mp4"
+            output_path.write_bytes(item.media_id.encode())
+            return DownloadOutcome(
+                output_paths=[str(output_path)],
+                title=item.title,
+                upload_date="2025-11-14",
+                author="Verified author",
+                media_type=MediaType.VIDEO,
+                selected_format="douyin-api-1080x1920-1",
+                resolution="1080x1920",
+            )
+
+    rediscovery_engine = RediscoveryEngine()
+    monkeypatch.setattr(
+        restarted_manager,
+        "_engine_for_job",
+        lambda job: rediscovery_engine,
+    )
+    try:
+        restarted = restarted_manager.get_job(job.id)
+        assert restarted.revision == restored_revision
+        assert restarted.status == JobStatus.INTERRUPTED
+        assert restarted.items[0].output_paths == [str(preserved_file)]
+
+        restarted_manager.retry_failed(job.id)
+        completed = wait_for_job(restarted_manager, job.id)
+
+        assert completed.status == JobStatus.COMPLETED
+        assert rediscovery_engine.discovery_urls == [profile_url]
+        assert rediscovery_engine.download_calls == [
+            "7677923079457231738",
+            "7677554129950241521",
+        ]
+        assert completed.items[0].status == ItemStatus.COMPLETED
+        assert completed.items[0].output_paths == [str(preserved_file)]
+        assert preserved_file.read_bytes() == b"preserved"
+    finally:
+        restarted_manager.shutdown()
+
+
+def test_restore_migrates_legacy_douyin_item_redirect_for_rediscovery(
+    tmp_path,
+) -> None:
+    state_dir = tmp_path / "state"
+    output_root = tmp_path / "downloads"
+    media_id = "7664225419386607205"
+    source_url = f"https://www.douyin.com/video/{media_id}"
+    legacy_message = LEGACY_DOUYIN_MEDIA_REDIRECT_MARKER
+    job = DownloadJob(
+        id="legacy-item-media-redirect",
+        source_url=source_url,
+        platform=Platform.DOUYIN,
+        source_kind=SourceKind.ITEM,
+        output_root=str(output_root),
+        status=JobStatus.FAILED,
+        error=legacy_message,
+        retryable=True,
+        discovery_complete=True,
+        items=[
+            DownloadItem(
+                id="target",
+                media_id=media_id,
+                source_url=source_url,
+                title="Target",
+                status=ItemStatus.FAILED,
+                error=legacy_message,
+                metadata={
+                    "item_identity_verified": True,
+                    "douyin_item_media": {
+                        "media_id": media_id,
+                        "video_uri": "v0200fg10000staleitemmedia",
+                        "direct_candidates": [
+                            {
+                                "video_uri": "v0200fg10000staleitemmedia",
+                                "width": 1080,
+                                "height": 1920,
+                                "urls": [
+                                    "https://v26-web.douyinvod.com/stale.mp4"
+                                ],
+                            }
+                        ],
+                    },
+                },
+            )
+        ],
+    )
+    JsonJobStore(state_dir).save(job)
+
+    manager = DownloadManager(
+        state_dir=state_dir,
+        default_output_root=output_root,
+        max_workers=1,
+    )
+    try:
+        restored = manager.get_job(job.id)
+
+        assert restored.status == JobStatus.INTERRUPTED
+        assert restored.discovery_complete is False
+        assert restored.retryable is True
+        assert restored.auth_message is None
+        assert restored.verification_url is None
+        assert restored.error == LEGACY_DOUYIN_MEDIA_REDIRECT_MESSAGE
+        assert restored.warning == LEGACY_DOUYIN_MEDIA_REDIRECT_MESSAGE
+        assert restored.items[0].status == ItemStatus.FAILED
+        assert restored.items[0].error == LEGACY_DOUYIN_MEDIA_REDIRECT_MESSAGE
+        assert "douyin_item_media" not in restored.items[0].metadata
+        assert "item_identity_verified" not in restored.items[0].metadata
+        assert DownloadManager._should_rediscover_on_retry(restored) is True
+        assert LEGACY_DOUYIN_MEDIA_REDIRECT_MARKER not in restored.model_dump_json()
+    finally:
+        manager.shutdown()
+
+
+def test_restore_retires_unbound_legacy_douyin_short_redirect_idempotently(
+    tmp_path,
+) -> None:
+    state_dir = tmp_path / "state"
+    output_root = tmp_path / "downloads"
+    short_url = "https://v.douyin.com/example/"
+    preserved_file = output_root / "preserved-short.mp4"
+    preserved_file.parent.mkdir(parents=True)
+    preserved_file.write_bytes(b"preserved-short")
+    legacy_message = LEGACY_DOUYIN_MEDIA_REDIRECT_MARKER
+    job = DownloadJob(
+        id="legacy-short-media-redirect",
+        source_url=short_url,
+        platform=Platform.DOUYIN,
+        source_kind=SourceKind.SHORT_LINK,
+        output_root=str(output_root),
+        status=JobStatus.PARTIAL,
+        error=legacy_message,
+        retryable=True,
+        discovery_complete=True,
+        items=[
+            DownloadItem(
+                id="completed",
+                media_id="7664225419386607205",
+                source_url="https://www.douyin.com/video/7664225419386607205",
+                title="Completed",
+                status=ItemStatus.COMPLETED,
+                output_paths=[str(preserved_file)],
+            ),
+            DownloadItem(
+                id="failed",
+                media_id="7677923079457231738",
+                source_url="https://www.douyin.com/video/7677923079457231738",
+                title="Failed",
+                status=ItemStatus.FAILED,
+                error=legacy_message,
+            ),
+            DownloadItem(
+                id="queued",
+                media_id="7677554129950241521",
+                source_url="https://www.douyin.com/video/7677554129950241521",
+                title="Queued",
+                status=ItemStatus.QUEUED,
+            ),
+        ],
+    )
+    JsonJobStore(state_dir).save(job)
+
+    manager = DownloadManager(
+        state_dir=state_dir,
+        default_output_root=output_root,
+        max_workers=1,
+    )
+    try:
+        restored = manager.get_job(job.id)
+        first_revision = restored.revision
+
+        assert restored.status == JobStatus.PARTIAL
+        assert restored.retryable is False
+        assert restored.discovery_complete is False
+        assert restored.error == LEGACY_DOUYIN_SHORT_REDIRECT_MESSAGE
+        assert restored.warning == LEGACY_DOUYIN_SHORT_REDIRECT_MESSAGE
+        assert restored.auth_message is None
+        assert restored.verification_url is None
+        assert restored.items[0].status == ItemStatus.COMPLETED
+        assert restored.items[0].output_paths == [str(preserved_file)]
+        assert restored.items[0].error is None
+        assert all(item.retryable is False for item in restored.items[1:])
+        assert all(
+            item.error == LEGACY_DOUYIN_SHORT_REDIRECT_MESSAGE
+            for item in restored.items[1:]
+        )
+        assert preserved_file.read_bytes() == b"preserved-short"
+        assert LEGACY_DOUYIN_MEDIA_REDIRECT_MARKER not in restored.model_dump_json()
+        with pytest.raises(ItemNotRetryableError):
+            manager.retry_failed(job.id)
+    finally:
+        manager.shutdown()
+
+    restarted_manager = DownloadManager(
+        state_dir=state_dir,
+        default_output_root=output_root,
+        max_workers=1,
+    )
+    try:
+        restarted = restarted_manager.get_job(job.id)
+        assert restarted.revision == first_revision
+        assert restarted.status == JobStatus.PARTIAL
+        assert restarted.items[0].output_paths == [str(preserved_file)]
+    finally:
+        restarted_manager.shutdown()
 
 
 def test_restore_removes_unsaved_numeric_items_from_direct_video_expansion(
@@ -4020,6 +4362,130 @@ def test_item_temporary_access_pauses_queue_and_retry_resumes_all(
         assert completed.auth_message is None
         assert completed.verification_url is None
         assert all(item.auth_message is None for item in completed.items)
+    finally:
+        manager.shutdown()
+
+
+def test_douyin_profile_redirect_interrupts_queue_and_rediscovery_resumes(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    profile_url = (
+        "https://www.douyin.com/user/"
+        "MS4wLjABAAAA9OBQVqfaEUOvYbk2U0bSMCmaGV9OiG5-k15gEXhWLu6"
+    )
+    media_ids = [
+        "7664225419386607205",
+        "7677923079457231738",
+        "7677554129950241521",
+    ]
+    redirect_error = (
+        "Douyin media redirect could not be trusted. The task was paused before "
+        "downloading later items. Redirect host: new-region-cdn.example"
+    )
+
+    class RedirectOnceEngine:
+        def __init__(self) -> None:
+            self.discovery_urls: list[str] = []
+            self.download_calls: list[str] = []
+            self.fail_first = True
+
+        def discover(self, url, platform, kind, *, should_cancel):
+            self.discovery_urls.append(url)
+            return DiscoveryResult(
+                author="Verified author",
+                items=[
+                    DownloadItem(
+                        id=f"item-{media_id}",
+                        media_id=media_id,
+                        source_url=f"https://www.douyin.com/video/{media_id}",
+                        title=f"Video {index}",
+                        author="Verified author",
+                        media_type=MediaType.VIDEO,
+                        metadata=complete_douyin_profile_metadata(
+                            profile_url,
+                            media_id,
+                            title=f"Video {index}",
+                        ),
+                    )
+                    for index, media_id in enumerate(media_ids, start=1)
+                ],
+            )
+
+        def download_item(
+            self,
+            item,
+            platform,
+            output_dir,
+            *,
+            callback,
+            should_cancel,
+        ):
+            self.download_calls.append(item.media_id)
+            if item.media_id == media_ids[1] and self.fail_first:
+                self.fail_first = False
+                raise TemporaryAccessError(redirect_error)
+            output_path = Path(output_dir) / f"{item.media_id}.mp4"
+            output_path.write_bytes(item.media_id.encode())
+            return DownloadOutcome(
+                output_paths=[str(output_path)],
+                title=item.title,
+                upload_date="2025-11-14",
+                author="Verified author",
+                media_type=MediaType.VIDEO,
+                selected_format="douyin-api-1080x1920-1",
+                resolution="1080x1920",
+            )
+
+    manager = DownloadManager(
+        state_dir=tmp_path / "state",
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    engine = RedirectOnceEngine()
+    monkeypatch.setattr(manager, "_engine_for_job", lambda job: engine)
+
+    try:
+        created = manager.create_job(profile_url, auto_start=True)
+        interrupted = wait_for_job(manager, created.id)
+
+        assert interrupted.status == JobStatus.INTERRUPTED
+        assert [item.status for item in interrupted.items] == [
+            ItemStatus.COMPLETED,
+            ItemStatus.FAILED,
+            ItemStatus.QUEUED,
+        ]
+        assert [item.attempts for item in interrupted.items] == [1, 1, 0]
+        assert engine.download_calls == media_ids[:2]
+        assert interrupted.error == redirect_error
+        assert interrupted.items[0].error is None
+        assert interrupted.items[1].error == redirect_error
+        assert interrupted.auth_message is None
+        assert interrupted.verification_url is None
+        assert all(item.auth_message is None for item in interrupted.items)
+
+        persisted = JsonJobStore(tmp_path / "state").get(created.id)
+        assert persisted.status == JobStatus.INTERRUPTED
+        assert persisted.error == redirect_error
+        assert persisted.items[0].status == ItemStatus.COMPLETED
+        assert persisted.items[2].status == ItemStatus.QUEUED
+
+        manager.retry_failed(created.id)
+        completed = wait_for_job(manager, created.id)
+
+        assert completed.status == JobStatus.COMPLETED
+        assert all(item.status == ItemStatus.COMPLETED for item in completed.items)
+        assert engine.discovery_urls == [profile_url, profile_url]
+        assert engine.download_calls == [
+            media_ids[0],
+            media_ids[1],
+            media_ids[1],
+            media_ids[2],
+        ]
+        assert completed.items[0].attempts == 1
+        assert completed.error is None
+        assert completed.auth_message is None
+        assert completed.verification_url is None
     finally:
         manager.shutdown()
 

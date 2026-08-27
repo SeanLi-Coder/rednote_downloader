@@ -111,6 +111,21 @@ LEGACY_DOUYIN_GENERIC_SIGNING_MESSAGE = (
     "failure. Retry the original link; Chrome verification is not required unless "
     "Douyin explicitly shows a CAPTCHA or login page."
 )
+LEGACY_DOUYIN_MEDIA_REDIRECT_MARKER = (
+    "Douyin media request redirected to an untrusted URL"
+)
+LEGACY_DOUYIN_MEDIA_REDIRECT_MESSAGE = (
+    "This task contains a Douyin media redirect failure recorded by an older "
+    "version, which did not preserve the redirect hostname. Retry the original "
+    "link to rediscover and verify the media with the current version. Existing "
+    "files were preserved."
+)
+LEGACY_DOUYIN_SHORT_REDIRECT_MESSAGE = (
+    "This saved Douyin short-link task contains a media redirect failure from an "
+    "older version, but its original resolved target was not preserved. Create a "
+    "new task from the original short link so the current version can bind and "
+    "verify its target. Existing files were preserved."
+)
 _LEGACY_DOUYIN_MARKDOWN_ITEM_RE = re.compile(
     r"(https://www\.douyin\.com/video/(\d+))\]\("
     r"(https://www\.douyin\.com/video/(\d+))"
@@ -239,6 +254,44 @@ class DownloadManager:
             if job.platform == Platform.DOUYIN and job.source_kind == SourceKind.PROFILE:
                 for item in job.items:
                     changed |= self._refresh_douyin_profile_item_from_cache(job, item)
+            legacy_media_redirect = self._has_legacy_douyin_media_redirect_error(job)
+            if legacy_media_redirect and job.platform == Platform.DOUYIN:
+                now = utc_now()
+                if job.source_kind == SourceKind.PROFILE:
+                    self._migrate_legacy_douyin_redirect_profile(job, now)
+                    migrated_incomplete_douyin_profile_queue = True
+                elif job.source_kind == SourceKind.ITEM:
+                    job.status = JobStatus.INTERRUPTED
+                    job.error = LEGACY_DOUYIN_MEDIA_REDIRECT_MESSAGE
+                    job.warning = LEGACY_DOUYIN_MEDIA_REDIRECT_MESSAGE
+                    job.auth_message = None
+                    job.verification_url = None
+                    job.active_item_id = None
+                    job.cancel_requested = False
+                    job.retryable = True
+                    job.discovery_complete = False
+                    job.finished_at = now
+                    for item in job.items:
+                        if not self._message_has_legacy_douyin_media_redirect(
+                            item.error
+                        ) and not self._message_has_legacy_douyin_media_redirect(
+                            item.auth_message
+                        ):
+                            continue
+                        item.status = ItemStatus.FAILED
+                        item.error = LEGACY_DOUYIN_MEDIA_REDIRECT_MESSAGE
+                        item.auth_message = None
+                        item.retryable = True
+                        item.metadata.pop("douyin_item_media", None)
+                        item.metadata.pop("item_identity_verified", None)
+                        item.updated_at = now
+                elif job.source_kind == SourceKind.SHORT_LINK:
+                    self._retire_legacy_douyin_redirect_short_link(job, now)
+                changed = job.source_kind in {
+                    SourceKind.PROFILE,
+                    SourceKind.ITEM,
+                    SourceKind.SHORT_LINK,
+                }
             legacy_signing_messages = (job.error or "", job.auth_message or "")
             if (
                 job.platform == Platform.DOUYIN
@@ -1426,6 +1479,66 @@ class DownloadManager:
         job.finished_at = now
 
     @staticmethod
+    def _migrate_legacy_douyin_redirect_profile(
+        job: DownloadJob,
+        now: datetime,
+    ) -> None:
+        preserved_items: list[DownloadItem] = []
+        for item in job.items:
+            if item.status == ItemStatus.COMPLETED and item.output_paths:
+                item.error = None
+                item.auth_message = None
+                item.metadata.pop(DOUYIN_PROFILE_REDISCOVERY_ITEM_MARKER, None)
+                preserved_items.append(item)
+                continue
+            if not item.output_paths:
+                continue
+            item.status = ItemStatus.FAILED
+            item.error = LEGACY_DOUYIN_MEDIA_REDIRECT_MESSAGE
+            item.auth_message = None
+            item.retryable = False
+            item.metadata[DOUYIN_PROFILE_REDISCOVERY_ITEM_MARKER] = True
+            item.updated_at = now
+            preserved_items.append(item)
+        job.items = preserved_items
+        job.status = JobStatus.INTERRUPTED
+        job.error = LEGACY_DOUYIN_MEDIA_REDIRECT_MESSAGE
+        job.warning = LEGACY_DOUYIN_MEDIA_REDIRECT_MESSAGE
+        job.auth_message = None
+        job.verification_url = None
+        job.active_item_id = None
+        job.cancel_requested = False
+        job.retryable = True
+        job.discovery_complete = False
+        job.finished_at = now
+
+    @staticmethod
+    def _retire_legacy_douyin_redirect_short_link(
+        job: DownloadJob,
+        now: datetime,
+    ) -> None:
+        for item in job.items:
+            item.auth_message = None
+            if item.status == ItemStatus.COMPLETED and item.output_paths:
+                item.error = None
+                continue
+            item.status = ItemStatus.FAILED
+            item.error = LEGACY_DOUYIN_SHORT_REDIRECT_MESSAGE
+            item.retryable = False
+            item.updated_at = now
+        job.refresh_counts()
+        job.status = JobStatus.PARTIAL if job.completed_items else JobStatus.FAILED
+        job.error = LEGACY_DOUYIN_SHORT_REDIRECT_MESSAGE
+        job.warning = LEGACY_DOUYIN_SHORT_REDIRECT_MESSAGE
+        job.auth_message = None
+        job.verification_url = None
+        job.active_item_id = None
+        job.cancel_requested = False
+        job.retryable = False
+        job.discovery_complete = False
+        job.finished_at = now
+
+    @staticmethod
     def _is_numeric_legacy_item(item: DownloadItem) -> bool:
         media_id = item.media_id or item.id
         if not media_id.isdigit():
@@ -1959,6 +2072,22 @@ class DownloadManager:
                     setattr(item, attribute, safe_value)
                     changed = True
         return changed
+
+    @staticmethod
+    def _message_has_legacy_douyin_media_redirect(value: str | None) -> bool:
+        return bool(
+            value and LEGACY_DOUYIN_MEDIA_REDIRECT_MARKER in value
+        )
+
+    @classmethod
+    def _has_legacy_douyin_media_redirect_error(cls, job: DownloadJob) -> bool:
+        messages = [job.error, job.warning, job.auth_message]
+        for item in job.items:
+            messages.extend((item.error, item.auth_message))
+        return any(
+            cls._message_has_legacy_douyin_media_redirect(value)
+            for value in messages
+        )
 
     @classmethod
     def _verification_url(cls, job: DownloadJob, fallback: str) -> str:

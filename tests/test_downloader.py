@@ -3182,7 +3182,7 @@ def test_douyin_live_photo_tries_later_mirror_after_unrecognized_redirect(
     assert ydl.responses[0].closed is True
     assert all(response.closed for response in ydl.responses)
     assert ffprobe_count == 2
-    assert selected.candidates[0] == regional_final
+    assert selected.candidates[:2] == [second_mirror, regional_final]
     assert selected.redirect_source_url == second_mirror
     assert (selected.width, selected.height) == (1080, 1920)
 
@@ -4559,25 +4559,29 @@ def _configure_verified_douyin_transfer(
     ffprobe_bit_rate: int = 10_000_000,
     selected_url: str = "https://v26-web.douyinvod.com/verified.mp4",
     final_url: str = "https://v26-web.douyinvod.com/final.mp4",
+    source_payload: bytes | None = None,
 ):
     class Headers:
+        def __init__(self, response_payload: bytes) -> None:
+            self.response_payload = response_payload
+
         def get(self, name: str, default=None):
             values = {
                 "Content-Type": "video/mp4",
-                "Content-Length": str(len(payload)),
+                "Content-Length": str(len(self.response_payload)),
             }
             return values.get(name, default)
 
     class AssetResponse:
-        headers = Headers()
-
-        def __init__(self) -> None:
+        def __init__(self, response_payload: bytes) -> None:
+            self.headers = Headers(response_payload)
+            self.payload = response_payload
             self.url = final_url
             self.offset = 0
             self.closed = False
 
         def read(self, size: int) -> bytes:
-            chunk = payload[self.offset : self.offset + size]
+            chunk = self.payload[self.offset : self.offset + size]
             self.offset += len(chunk)
             return chunk
 
@@ -4591,7 +4595,13 @@ def _configure_verified_douyin_transfer(
 
         def urlopen(self, request):
             self.requests.append(request)
-            response = AssetResponse()
+            response_payload = (
+                source_payload
+                if source_payload is not None
+                and request.url.startswith("https://api-play.amemv.com/")
+                else payload
+            )
+            response = AssetResponse(response_payload)
             self.responses.append(response)
             return response
 
@@ -4703,7 +4713,7 @@ def test_douyin_verified_transfer_rejects_lower_final_media_without_overwrite(
         engine.download_item(item, Platform.DOUYIN, tmp_path)
 
     assert expected.read_bytes() == b"existing-good-file"
-    assert len(direct_ydl.responses) == DOUYIN_TRANSFER_ATTEMPTS
+    assert len(direct_ydl.responses) == DOUYIN_TRANSFER_ATTEMPTS * 2
     assert all(response.closed for response in direct_ydl.responses)
     assert not list(tmp_path.glob("*.part"))
     assert not (tmp_path / ".parts").exists()
@@ -4741,10 +4751,48 @@ def test_douyin_verified_transfer_preserves_exact_bytes_and_reports_resolution(
     assert direct_ydl.created_options[0]["continuedl"] is False
     assert direct_ydl.responses[0].closed is True
     assert direct_ydl.requests[0].url == (
-        "https://v26-web.douyinvod.com/verified.mp4"
+        "https://api-play.amemv.com/aweme/v1/play/?video_id=fixture"
     )
     assert not list(tmp_path.glob("*.part"))
     assert not (tmp_path / ".parts").exists()
+
+
+def test_douyin_verified_transfer_falls_back_to_probed_final_after_source_changes(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    media_id = "7664225419386607205"
+    payload = b"\x00\x00\x00\x18ftypisom" + b"verified-original-bytes"
+    changed_payload = b"\x00\x00\x00\x18ftypisom" + b"changed-source-response"
+    assert len(changed_payload) == len(payload)
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    direct_ydl = _configure_verified_douyin_transfer(
+        monkeypatch,
+        engine,
+        media_id=media_id,
+        payload=payload,
+        source_payload=changed_payload,
+    )
+    item = DownloadItem(
+        id="douyin-item",
+        media_id=media_id,
+        source_url=f"https://www.douyin.com/video/{media_id}",
+        title="Douyin video",
+        media_type=MediaType.VIDEO,
+        metadata={"_job_id": "douyin-job"},
+    )
+
+    outcome = engine.download_item(item, Platform.DOUYIN, tmp_path)
+
+    path = Path(outcome.output_paths[0])
+    assert path.read_bytes() == payload
+    assert [request.url for request in direct_ydl.requests] == [
+        "https://api-play.amemv.com/aweme/v1/play/?video_id=fixture",
+        "https://v26-web.douyinvod.com/verified.mp4",
+    ]
+    assert len(direct_ydl.responses) == 2
+    assert all(response.closed for response in direct_ydl.responses)
+    assert not list(tmp_path.glob("*.part"))
 
 
 def test_douyin_verified_transfer_accepts_bound_regional_cdn_and_preserves_bytes(
@@ -4777,7 +4825,9 @@ def test_douyin_verified_transfer_accepts_bound_regional_cdn_and_preserves_bytes
     path = Path(outcome.output_paths[0])
     assert path.read_bytes() == payload
     assert outcome.resolution == "1440x2560"
-    assert direct_ydl.requests[0].url == final_url
+    assert direct_ydl.requests[0].url == (
+        "https://api-play.amemv.com/aweme/v1/play/?video_id=fixture"
+    )
     assert direct_ydl.responses[0].offset == len(payload)
     assert direct_ydl.responses[0].closed is True
     assert not list(tmp_path.glob("*.part"))
@@ -4826,7 +4876,9 @@ def test_douyin_verified_transfer_pauses_on_unknown_redirect_without_read_or_fil
         engine,
         media_id=media_id,
         payload=payload,
-        final_url="https://unrecognized-cdn.example/original.mp4",
+        final_url=(
+            "https://unrecognized-cdn.example/original.mp4?token=must-not-persist"
+        ),
     )
     item = DownloadItem(
         id="douyin-item",
@@ -4837,10 +4889,20 @@ def test_douyin_verified_transfer_pauses_on_unknown_redirect_without_read_or_fil
         metadata={"_job_id": "douyin-job"},
     )
 
-    with pytest.raises(TemporaryAccessError, match="redirect could not be trusted"):
+    with pytest.raises(
+        TemporaryAccessError,
+        match="redirect could not be trusted",
+    ) as error:
         engine.download_item(item, Platform.DOUYIN, tmp_path)
 
+    message = str(error.value)
+    assert "Redirect host: unrecognized-cdn.example" in message
+    assert "original.mp4" not in message
+    assert "must-not-persist" not in message
     assert len(direct_ydl.responses) == 1
+    assert direct_ydl.requests[0].url == (
+        "https://api-play.amemv.com/aweme/v1/play/?video_id=fixture"
+    )
     assert direct_ydl.responses[0].offset == 0
     assert direct_ydl.responses[0].closed is True
     assert not list(tmp_path.iterdir())

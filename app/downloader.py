@@ -2721,6 +2721,19 @@ class MediaDownloader:
                     selected_bit_rate = int(
                         float(selected.get("tbr") or 0) * 1_000
                     )
+                    redirect_source_url = str(
+                        selected.get("_douyin_probe_source_url") or ""
+                    ).strip()
+                    selected_candidates = list(
+                        dict.fromkeys(
+                            value
+                            for value in (
+                                redirect_source_url,
+                                str(selected["url"]),
+                            )
+                            if value
+                        )
+                    )
                     title = str(raw_result.get("title") or item.title or "").strip()
                     if (
                         not title
@@ -2729,7 +2742,7 @@ class MediaDownloader:
                     ):
                         title = "Untitled Douyin video"
                     selected_asset = RemoteAsset(
-                        candidates=[str(selected["url"])],
+                        candidates=selected_candidates,
                         index=1,
                         width=int(selected.get("width") or 0) or None,
                         height=int(selected.get("height") or 0) or None,
@@ -2752,10 +2765,7 @@ class MediaDownloader:
                             selected.get("_douyin_probe_prefix_sha256") or ""
                         )
                         or None,
-                        redirect_source_url=str(
-                            selected.get("_douyin_probe_source_url") or ""
-                        )
-                        or None,
+                        redirect_source_url=redirect_source_url or None,
                     )
                     path, chosen = self._download_first_available_asset(
                         ydl,
@@ -3318,7 +3328,12 @@ class MediaDownloader:
             str(best.get("requested_ratio") or "verified"),
             fallback="verified",
         )
-        best_urls = [str(best["url"])]
+        redirect_source_url = str(best.get("source_url") or "").strip()
+        best_urls = [
+            value
+            for value in (redirect_source_url, str(best["url"]))
+            if value
+        ]
         if requested_ratio in DOUYIN_PROBE_RATIOS:
             best_urls.append(self._douyin_ratio_url(video_uri, requested_ratio))
         elif requested_ratio.startswith("author-feed-"):
@@ -3343,7 +3358,7 @@ class MediaDownloader:
             audio_codec=str(best.get("acodec") or "").lower() or None,
             probe_prefix_size=int(best.get("probe_prefix_size") or 0) or None,
             probe_prefix_sha256=str(best.get("probe_prefix_sha256") or "") or None,
-            redirect_source_url=str(best.get("source_url") or "") or None,
+            redirect_source_url=redirect_source_url or None,
         )
 
     @staticmethod

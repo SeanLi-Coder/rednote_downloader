@@ -132,6 +132,9 @@ def test_index_injects_build_identity_and_disables_html_cache() -> None:
         "已保留的旧抖音文件",
         "FFprobe 未返回码率或完整媒体大小",
         "抖音画质探测跳转到了当前版本尚未识别的 CDN 主机",
+        "这是旧版本保存的抖音媒体跳转错误",
+        "旧版没有记录实际 CDN 主机",
+        "旧版抖音短链任务保存的跳转错误",
     ):
         assert classification_marker in static_response.text
     assert static_response.text.index(

@@ -721,7 +721,13 @@
       return "未找到 FFprobe，无法验证抖音或小红书视频的最高画质。请安装包含 FFprobe 的 FFmpeg，将其 bin 目录加入 PATH，然后完全停止并重启程序；macOS Homebrew 可运行 brew install ffmpeg。";
     }
     if (text.includes("Douyin media request redirected to an untrusted URL")) {
-      return "抖音最高画质媒体地址跳转到了非可信站点，程序已在读取文件前拦截，本次没有下载。请稍后从原视频链接重试。";
+      return "这是旧版本保存的抖音媒体跳转错误；旧版没有记录实际跳转主机，因此不能据此安全放行。请确认页面底部是当前版本，然后从原主页或原视频链接重新创建任务；新版会重新解析，并在再次拦截时显示具体 CDN 主机名。";
+    }
+    if (text.includes("This task contains a Douyin media redirect failure recorded by an older version")) {
+      return "这是旧版本保存的抖音媒体跳转错误，旧版没有记录实际 CDN 主机。已下载文件均已保留；点击重试会从原链接重新解析，新版若再次拦截会显示具体主机名，也不需要打开 Chrome 验证。";
+    }
+    if (text.includes("This saved Douyin short-link task contains a media redirect failure from an older version")) {
+      return "这是旧版抖音短链任务保存的跳转错误，但旧版没有保存短链当时解析到的目标，无法安全自动重试。已下载文件均已保留；请把原短链重新粘贴并新建任务，新版会先绑定目标再下载。";
     }
     if (text.includes("Media server returned a video below its declared") || text.includes("Downloaded video bitrate was below its verified highest-quality media endpoint") || text.includes("Downloaded video size did not match its verified highest-quality media endpoint") || text.includes("Downloaded video duration did not match its verified media metadata") || text.includes("verified highest-quality video has no duration fingerprint") || text.includes("verified highest-quality video has no bitrate or complete size fingerprint") || text.includes("Media response changed after quality verification")) {
       return "最终下载文件与已验证的最高画质不一致，可能被替换成低清流。程序已删除临时文件且不会覆盖已有文件；请稍后重试。";
