@@ -104,6 +104,7 @@ def test_douyin_lookalike_auth_urls_are_not_actionable(url: str) -> None:
 def test_item_metadata_profile_lookup_stops_at_target(monkeypatch) -> None:
     profile_id = "MS4wLjABAAAAexpected"
     media_id = "1111111111111111111"
+    video_uri = "v0200fg10000fixturevideoid"
     calls = []
 
     def fetch(profile_url, requested_profile_id, **kwargs):
@@ -113,7 +114,14 @@ def test_item_metadata_profile_lookup_stops_at_target(monkeypatch) -> None:
                 "aweme_id": media_id,
                 "author": {"sec_uid": profile_id, "nickname": "Test Author"},
                 "video": {
-                    "play_addr": {"uri": "v0200fg10000fixturevideoid"}
+                    "play_addr": {
+                        "uri": video_uri,
+                        "width": 1080,
+                        "height": 1920,
+                        "url_list": [
+                            "https://v26-web.douyinvod.com/item-target.mp4"
+                        ],
+                    }
                 },
             }
         ]
@@ -134,6 +142,7 @@ def test_douyin_signed_profile_discovery_returns_verified_complete_metadata(
     profile_url = f"https://www.douyin.com/user/{profile_id}"
     aweme_id = "1111111111111111111"
     video_uri = "v0200fg10000fixturevideoid"
+    video_url = "https://v26-web.douyinvod.com/signed-profile-1440.mp4"
     monkeypatch.setattr(
         "app.douyin.fetch_signed_profile_awemes",
         lambda *args, **kwargs: [
@@ -149,7 +158,12 @@ def test_douyin_signed_profile_discovery_returns_verified_complete_metadata(
                     "duration": 72_800,
                     "width": 1440,
                     "height": 2560,
-                    "play_addr": {"uri": video_uri},
+                    "play_addr": {
+                        "uri": video_uri,
+                        "width": 1440,
+                        "height": 2560,
+                        "url_list": [video_url],
+                    },
                 },
             }
         ],
@@ -165,8 +179,16 @@ def test_douyin_signed_profile_discovery_returns_verified_complete_metadata(
         "owner_id": profile_id,
         "media_kind": "video",
         "video_uri": video_uri,
-        "minimum_width": 1080,
-        "minimum_height": 1920,
+        "direct_candidates": [
+            {
+                "width": 1440,
+                "height": 2560,
+                "urls": [video_url],
+                "video_uri": video_uri,
+            }
+        ],
+        "minimum_width": 1440,
+        "minimum_height": 2560,
         "duration_ms": 72_800,
         "create_time": 1_756_656_000,
         "title": "Signed profile video",
@@ -362,7 +384,12 @@ def test_douyin_scroll_non_auth_content_does_not_request_verification(
                             "width": 1080,
                             "height": 1920,
                             "play_addr": {
-                                "uri": "v0200fg10000fixturevideoid"
+                                "uri": "v0200fg10000fixturevideoid",
+                                "width": 1080,
+                                "height": 1920,
+                                "url_list": [
+                                    "https://v26-web.douyinvod.com/browser-verified.mp4"
+                                ],
                             },
                         },
                     }
@@ -534,7 +561,16 @@ def test_douyin_minimal_metadata_accepts_265_and_bitrate_uris() -> None:
     from_265 = _minimal_aweme_metadata(
         {
             **base,
-            "video": {"play_addr_265": {"uri": "v0200fg10000265fixtureid"}},
+            "video": {
+                "play_addr_265": {
+                    "uri": "v0200fg10000265fixtureid",
+                    "width": 1080,
+                    "height": 1920,
+                    "url_list": [
+                        "https://v26-web.douyinvod.com/verified-265.mp4"
+                    ],
+                }
+            },
         },
         profile_id,
     )
@@ -542,7 +578,19 @@ def test_douyin_minimal_metadata_accepts_265_and_bitrate_uris() -> None:
         {
             **base,
             "video": {
-                "bit_rate": [{"play_addr": {"uri": "v0200fg10000bitratefixtureid"}}]
+                "bit_rate": [
+                    {
+                        "bit_rate": 2_000_000,
+                        "play_addr": {
+                            "uri": "v0200fg10000bitratefixtureid",
+                            "width": 1440,
+                            "height": 2560,
+                            "url_list": [
+                                "https://v11-weba.douyinvod.com/verified-bitrate.mp4"
+                            ],
+                        },
+                    }
+                ]
             },
         },
         profile_id,
@@ -550,9 +598,28 @@ def test_douyin_minimal_metadata_accepts_265_and_bitrate_uris() -> None:
 
     assert from_265 and from_265[1]["video_uri"] == "v0200fg10000265fixtureid"
     assert from_265[1]["media_kind"] == "video"
+    assert from_265[1]["direct_candidates"] == [
+        {
+            "width": 1080,
+            "height": 1920,
+            "urls": ["https://v26-web.douyinvod.com/verified-265.mp4"],
+            "video_uri": "v0200fg10000265fixtureid",
+            "codec_hint": "hevc",
+        }
+    ]
     assert from_bitrate and from_bitrate[1]["video_uri"] == (
         "v0200fg10000bitratefixtureid"
     )
+    assert from_bitrate[1]["direct_candidates"] == [
+        {
+            "width": 1440,
+            "height": 2560,
+            "urls": ["https://v11-weba.douyinvod.com/verified-bitrate.mp4"],
+            "video_uri": "v0200fg10000bitratefixtureid",
+            "bit_rate": 2_000_000,
+            "codec_hint": "h264",
+        }
+    ]
 
 
 def test_douyin_realistic_photo_post_uses_images_not_top_level_music_video() -> None:
@@ -632,6 +699,16 @@ def test_douyin_realistic_photo_post_uses_images_not_top_level_music_video() -> 
             "height": 1920,
             "candidates": [live_1080],
             "video_uri": "v0200fg10000livephotoasset",
+            "direct_candidates": [
+                {
+                    "width": 1080,
+                    "height": 1920,
+                    "urls": [live_1080],
+                    "video_uri": "v0200fg10000livephotoasset",
+                    "bit_rate": 2_000_000,
+                    "codec_hint": "hevc",
+                }
+            ],
         }
     ]
     assert "lower-1080" not in str(metadata)
@@ -680,6 +757,79 @@ def test_douyin_image_metadata_requires_trusted_complete_assets() -> None:
         media_id,
         profile_id,
     )
+
+
+@pytest.mark.parametrize("direct_candidates", [None, []])
+def test_douyin_video_metadata_requires_nonempty_direct_candidates(
+    direct_candidates,
+) -> None:
+    profile_id = "MS4wLjABAAAAexpected"
+    media_id = "1111111111111111111"
+    metadata = {
+        "media_id": media_id,
+        "owner_id": profile_id,
+        "media_kind": "video",
+        "video_uri": "v0200fg10000fixturevideoid",
+    }
+    if direct_candidates is not None:
+        metadata["direct_candidates"] = direct_candidates
+
+    assert not is_complete_profile_media_metadata(metadata, media_id, profile_id)
+
+
+def test_douyin_static_only_image_metadata_is_complete() -> None:
+    profile_id = "MS4wLjABAAAAexpected"
+    media_id = "7676078420824775161"
+    metadata = {
+        "media_id": media_id,
+        "owner_id": profile_id,
+        "media_kind": "image",
+        "image_assets": [
+            {
+                "index": 1,
+                "width": 1440,
+                "height": 2560,
+                "candidates": [
+                    "https://p3-pc-sign.douyinpic.com/static-only.webp"
+                ],
+            }
+        ],
+    }
+
+    assert is_complete_profile_media_metadata(metadata, media_id, profile_id)
+
+
+def test_douyin_live_photo_metadata_requires_direct_candidates() -> None:
+    profile_id = "MS4wLjABAAAAexpected"
+    media_id = "7676078420824775161"
+    metadata = {
+        "media_id": media_id,
+        "owner_id": profile_id,
+        "media_kind": "image",
+        "image_assets": [
+            {
+                "index": 1,
+                "width": 1440,
+                "height": 2560,
+                "candidates": [
+                    "https://p3-pc-sign.douyinpic.com/live-cover.webp"
+                ],
+            }
+        ],
+        "live_photo_assets": [
+            {
+                "index": 1,
+                "width": 1080,
+                "height": 1920,
+                "candidates": [
+                    "https://v26-web.douyinvod.com/live-without-direct.mp4"
+                ],
+                "video_uri": "v0200fg10000livephotoasset",
+            }
+        ],
+    }
+
+    assert not is_complete_profile_media_metadata(metadata, media_id, profile_id)
 
 
 def test_douyin_live_photo_rejects_multiple_highest_media_identities() -> None:
@@ -830,6 +980,7 @@ def test_douyin_missing_description_gets_non_numeric_display_title() -> None:
 
     assert result is not None
     assert result[1]["title"] == "Untitled Douyin image"
+    assert "live_photo_assets" not in result[1]
 
 
 def test_douyin_signed_profile_fails_closed_on_incomplete_media(monkeypatch) -> None:
@@ -860,19 +1011,35 @@ def test_douyin_signed_profile_fails_closed_on_incomplete_media(monkeypatch) -> 
         discover_profile(profile_url, use_browser_cookies=True)
 
 
-def test_douyin_minimal_metadata_caches_conservative_quality_floor() -> None:
+def test_douyin_minimal_metadata_preserves_verified_quality_floor() -> None:
     profile_id = "MS4wLjABAAAAexpected"
+    video_uri = "v0200fg10000fixturevideoid"
     result = _minimal_aweme_metadata(
         {
             "aweme_id": "1111111111111111111",
             "author": {"sec_uid": profile_id},
             "video": {
-                "play_addr": {"uri": "v0200fg10000fixturevideoid"},
+                "play_addr": {
+                    "uri": video_uri,
+                    "width": 1920,
+                    "height": 1080,
+                    "url_list": [
+                        "https://v26-web.douyinvod.com/verified-1080-landscape.mp4"
+                    ],
+                },
                 "bit_rate": [
                     {
+                        "bit_rate": 3_000_000,
                         "width": 2560,
                         "height": 1440,
-                            "play_addr": {"uri": "v0200fg10000fixturevideoid"},
+                        "play_addr": {
+                            "uri": video_uri,
+                            "width": 2560,
+                            "height": 1440,
+                            "url_list": [
+                                "https://v11-weba.douyinvod.com/verified-1440-landscape.mp4"
+                            ],
+                        },
                     }
                 ],
             },
@@ -881,8 +1048,20 @@ def test_douyin_minimal_metadata_caches_conservative_quality_floor() -> None:
     )
 
     assert result is not None
-    assert result[1]["minimum_width"] == 1920
-    assert result[1]["minimum_height"] == 1080
+    assert result[1]["minimum_width"] == 2560
+    assert result[1]["minimum_height"] == 1440
+    assert result[1]["direct_candidates"] == [
+        {
+            "width": 2560,
+            "height": 1440,
+            "urls": [
+                "https://v11-weba.douyinvod.com/verified-1440-landscape.mp4"
+            ],
+            "video_uri": video_uri,
+            "bit_rate": 3_000_000,
+            "codec_hint": "h264",
+        }
+    ]
 
 
 def test_douyin_quality_floor_does_not_inflate_native_720() -> None:
@@ -1056,6 +1235,7 @@ def test_douyin_discovery_waits_for_scrolled_api_page_before_stability_stop(
     profile_url = f"https://www.douyin.com/user/{profile_id}"
 
     def response_data(aweme_id: str, has_more: bool) -> dict:
+        video_uri = f"video-{aweme_id}"
         return {
             "has_more": int(has_more),
             "aweme_list": [
@@ -1063,7 +1243,16 @@ def test_douyin_discovery_waits_for_scrolled_api_page_before_stability_stop(
                     "aweme_id": aweme_id,
                     "desc": f"Video {aweme_id}",
                     "author": {"sec_uid": profile_id, "nickname": "Author"},
-                    "video": {"play_addr": {"uri": f"video-{aweme_id}"}},
+                    "video": {
+                        "play_addr": {
+                            "uri": video_uri,
+                            "width": 1080,
+                            "height": 1920,
+                            "url_list": [
+                                f"https://v26-web.douyinvod.com/{aweme_id}.mp4"
+                            ],
+                        }
+                    },
                 }
             ],
         }

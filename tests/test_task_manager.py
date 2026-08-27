@@ -254,6 +254,45 @@ def wait_for_job(manager: DownloadManager, job_id: str):
     return manager.get_job(job_id)
 
 
+def douyin_direct_candidate(
+    video_uri: str,
+    *,
+    width: int = 1440,
+    height: int = 2560,
+    url: str | None = None,
+) -> dict:
+    return {
+        "video_uri": video_uri,
+        "width": width,
+        "height": height,
+        "bit_rate": 20_000_000,
+        "codec_hint": "hevc",
+        "urls": [url or f"https://v26-web.douyinvod.com/{video_uri}.mp4"],
+    }
+
+
+def complete_douyin_item_metadata(
+    source_url: str,
+    media_id: str,
+    *,
+    video_uri: str = "verified-item-video-uri",
+    direct_url: str | None = None,
+) -> dict:
+    return {
+        "verification_url": source_url,
+        "item_identity_verified": True,
+        "douyin_item_media": {
+            "media_id": media_id,
+            "video_uri": video_uri,
+            "minimum_width": 1440,
+            "minimum_height": 2560,
+            "direct_candidates": [
+                douyin_direct_candidate(video_uri, url=direct_url)
+            ],
+        },
+    }
+
+
 def complete_douyin_profile_metadata(
     profile_url: str,
     media_id: str,
@@ -261,6 +300,7 @@ def complete_douyin_profile_metadata(
     title: str = "Verified profile video",
 ) -> dict:
     owner_id = profile_url.split("/user/", 1)[1].split("?", 1)[0]
+    video_uri = f"verified-profile-video-{media_id}"
     return {
         "profile_url": profile_url,
         "profile_owner_verified": True,
@@ -268,7 +308,8 @@ def complete_douyin_profile_metadata(
             "media_id": media_id,
             "owner_id": owner_id,
             "media_kind": "video",
-            "video_uri": f"verified-profile-video-{media_id}",
+            "video_uri": video_uri,
+            "direct_candidates": [douyin_direct_candidate(video_uri)],
             "title": title,
         },
     }
@@ -1437,14 +1478,11 @@ def test_retry_repairs_persisted_douyin_item_profile_expansion(
                         source_url=source_url,
                         title="Correct title",
                         media_type=MediaType.VIDEO,
-                        metadata={
-                            "verification_url": source_url,
-                            "item_identity_verified": True,
-                            "douyin_item_media": {
-                                "media_id": media_id,
-                                "video_uri": "verified-direct-video-uri",
-                            },
-                        },
+                        metadata=complete_douyin_item_metadata(
+                            source_url,
+                            media_id,
+                            video_uri="verified-direct-video-uri",
+                        ),
                     )
                 ],
             )
@@ -1920,14 +1958,11 @@ def test_restore_removes_unsaved_numeric_items_from_direct_video_expansion(
                         source_url=source_url,
                         title="Correct rediscovered title",
                         media_type=MediaType.VIDEO,
-                        metadata={
-                            "verification_url": source_url,
-                            "item_identity_verified": True,
-                            "douyin_item_media": {
-                                "media_id": target_id,
-                                "video_uri": "verified-video-uri",
-                            },
-                        },
+                        metadata=complete_douyin_item_metadata(
+                            source_url,
+                            target_id,
+                            video_uri="verified-video-uri",
+                        ),
                     )
                 ],
             )
@@ -2677,6 +2712,115 @@ def test_restore_repairs_even_one_owner_verified_numeric_placeholder(tmp_path) -
         manager.shutdown()
 
 
+@pytest.mark.parametrize("media_kind", ["video", "live_photo"])
+def test_restore_migrates_legacy_douyin_profile_media_without_direct_candidates(
+    tmp_path,
+    media_kind: str,
+) -> None:
+    state_dir = tmp_path / "state"
+    output_dir = tmp_path / "downloads"
+    output_dir.mkdir(parents=True)
+    profile_url = "https://www.douyin.com/user/verified-profile"
+    owner_id = "verified-profile"
+    media_id = "7670000000000000001"
+    preserved_path = output_dir / f"preserved-{media_kind}.bin"
+    preserved_path.write_bytes(b"preserved-before-direct-renditions")
+
+    if media_kind == "video":
+        cached_media = {
+            "media_id": media_id,
+            "owner_id": owner_id,
+            "media_kind": "video",
+            "video_uri": "legacy-profile-video-uri",
+            "title": "Legacy cached video",
+        }
+    else:
+        cached_media = {
+            "media_id": media_id,
+            "owner_id": owner_id,
+            "media_kind": "image",
+            "title": "Legacy cached Live Photo",
+            "image_assets": [
+                {
+                    "index": 1,
+                    "width": 1440,
+                    "height": 2560,
+                    "candidates": [
+                        "https://p3-sign.douyinpic.com/legacy-image.jpeg"
+                    ],
+                }
+            ],
+            "live_photo_assets": [
+                {
+                    "index": 1,
+                    "width": 1080,
+                    "height": 1920,
+                    "candidates": [
+                        "https://v26-web.douyinvod.com/legacy-live-photo.mp4"
+                    ],
+                    "video_uri": "legacy-live-video-uri",
+                    "duration_ms": 1800,
+                }
+            ],
+        }
+
+    job = DownloadJob(
+        id=f"legacy-profile-{media_kind}-without-direct",
+        source_url=profile_url,
+        platform=Platform.DOUYIN,
+        source_kind=SourceKind.PROFILE,
+        output_root=str(output_dir),
+        status=JobStatus.NEEDS_AUTH,
+        verification_url=profile_url,
+        items=[
+            DownloadItem(
+                id=media_id,
+                media_id=media_id,
+                source_url=f"https://www.douyin.com/video/{media_id}",
+                title=f"Legacy {media_kind}",
+                media_type=(
+                    MediaType.VIDEO
+                    if media_kind == "video"
+                    else MediaType.IMAGE
+                ),
+                status=ItemStatus.NEEDS_AUTH,
+                output_paths=[str(preserved_path)],
+                metadata={
+                    "profile_url": profile_url,
+                    "profile_owner_verified": True,
+                    "douyin_profile_media": cached_media,
+                },
+            )
+        ],
+    )
+    job.refresh_counts()
+    JsonJobStore(state_dir).save(job)
+
+    manager = DownloadManager(
+        state_dir=state_dir,
+        default_output_root=output_dir,
+        max_workers=1,
+    )
+    try:
+        restored = manager.get_job(job.id)
+
+        assert restored.status == JobStatus.INTERRUPTED
+        assert restored.discovery_complete is False
+        assert restored.retryable is True
+        assert restored.verification_url == profile_url
+        assert restored.error == DOUYIN_PROFILE_REDISCOVERY_MESSAGE
+        assert restored.total_items == 1
+        assert restored.items[0].status == ItemStatus.FAILED
+        assert restored.items[0].retryable is False
+        assert restored.items[0].output_paths == [str(preserved_path)]
+        assert restored.items[0].metadata[
+            DOUYIN_PROFILE_REDISCOVERY_ITEM_MARKER
+        ] is True
+        assert preserved_path.read_bytes() == b"preserved-before-direct-renditions"
+    finally:
+        manager.shutdown()
+
+
 def test_incomplete_owner_verified_profile_migration_preserves_files_and_is_idempotent(
     tmp_path,
 ) -> None:
@@ -2815,6 +2959,115 @@ def test_profile_rediscovery_marker_preserves_needs_auth_across_restart(
         manager.shutdown()
 
 
+def test_profile_rediscovery_marker_survives_partial_discovery_pause(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    state_dir = tmp_path / "state"
+    output_dir = tmp_path / "downloads"
+    output_dir.mkdir(parents=True)
+    profile_url = "https://www.douyin.com/user/verified-profile"
+    media_id = "7670000000000000001"
+    output_path = output_dir / "preserved-before-partial-feed.webp"
+    output_path.write_bytes(b"preserved-before-partial-feed")
+    job = DownloadJob(
+        id="profile-rediscovery-partial-feed",
+        source_url=profile_url,
+        platform=Platform.DOUYIN,
+        source_kind=SourceKind.PROFILE,
+        output_root=str(output_dir),
+        status=JobStatus.INTERRUPTED,
+        error=DOUYIN_PROFILE_REDISCOVERY_MESSAGE,
+        warning=DOUYIN_PROFILE_REDISCOVERY_MESSAGE,
+        verification_url=profile_url,
+        discovery_complete=False,
+        items=[
+            DownloadItem(
+                id=media_id,
+                media_id=media_id,
+                source_url=f"https://www.douyin.com/video/{media_id}",
+                title=f"Recovered Douyin files {media_id}",
+                status=ItemStatus.FAILED,
+                retryable=False,
+                output_paths=[str(output_path)],
+                metadata={
+                    "profile_url": profile_url,
+                    "profile_owner_verified": True,
+                    DOUYIN_PROFILE_REDISCOVERY_ITEM_MARKER: True,
+                },
+            )
+        ],
+    )
+    job.refresh_counts()
+    JsonJobStore(state_dir).save(job)
+
+    class PartialProfileEngine:
+        def __init__(self) -> None:
+            self.discovery_calls = 0
+            self.download_calls = 0
+
+        def discover(self, url, platform, kind, *, should_cancel):
+            self.discovery_calls += 1
+            return DiscoveryResult(
+                author="Verified author",
+                discovery_complete=False,
+                warning="Douyin feed pagination was temporarily incomplete",
+                items=[
+                    DownloadItem(
+                        id="fresh-target",
+                        media_id=media_id,
+                        source_url=f"https://www.douyin.com/video/{media_id}",
+                        title="Fresh verified title",
+                        media_type=MediaType.VIDEO,
+                        metadata=complete_douyin_profile_metadata(
+                            profile_url,
+                            media_id,
+                            title="Fresh verified title",
+                        ),
+                    )
+                ],
+            )
+
+        def download_item(self, *args, **kwargs):
+            self.download_calls += 1
+            raise AssertionError("partial recovery feed must not reach download")
+
+    manager = DownloadManager(
+        state_dir=state_dir,
+        default_output_root=output_dir,
+        max_workers=1,
+    )
+    engine = PartialProfileEngine()
+    monkeypatch.setattr(manager, "_engine_for_job", lambda restored_job: engine)
+    try:
+        restored = manager.get_job(job.id)
+        assert restored.items[0].metadata[
+            DOUYIN_PROFILE_REDISCOVERY_ITEM_MARKER
+        ] is True
+
+        manager.retry_failed(job.id)
+        paused = wait_for_job(manager, job.id)
+
+        assert paused.status == JobStatus.FAILED
+        assert paused.retryable is True
+        assert paused.discovery_complete is False
+        assert "partial author feed" in (paused.error or "")
+        assert paused.auth_message is None
+        assert paused.verification_url is None
+        assert paused.total_items == 1
+        assert paused.items[0].status == ItemStatus.FAILED
+        assert paused.items[0].retryable is False
+        assert paused.items[0].output_paths == [str(output_path)]
+        assert paused.items[0].metadata[
+            DOUYIN_PROFILE_REDISCOVERY_ITEM_MARKER
+        ] is True
+        assert output_path.read_bytes() == b"preserved-before-partial-feed"
+        assert engine.discovery_calls == 1
+        assert engine.download_calls == 0
+    finally:
+        manager.shutdown()
+
+
 def test_numeric_profile_rediscovery_migration_is_idempotent(tmp_path) -> None:
     state_dir = tmp_path / "state"
     output_dir = tmp_path / "downloads"
@@ -2925,6 +3178,184 @@ def test_restore_rebinds_douyin_item_verification_to_canonical_video(
         manager.shutdown()
 
 
+def test_restore_discards_legacy_douyin_item_cache_without_direct_candidates(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    media_id = "7664225419386607205"
+    source_url = f"https://www.douyin.com/video/{media_id}"
+    state_dir = tmp_path / "state"
+    legacy_video_uri = "legacy-item-video-uri"
+    job = DownloadJob(
+        id="legacy-direct-item-without-direct-candidates",
+        source_url=source_url,
+        platform=Platform.DOUYIN,
+        source_kind=SourceKind.ITEM,
+        output_root=str(tmp_path / "downloads"),
+        status=JobStatus.NEEDS_AUTH,
+        verification_url=source_url,
+        items=[
+            DownloadItem(
+                id="legacy-target",
+                media_id=media_id,
+                source_url=source_url,
+                status=ItemStatus.NEEDS_AUTH,
+                metadata={
+                    "verification_url": source_url,
+                    "item_identity_verified": True,
+                    "douyin_item_media": {
+                        "media_id": media_id,
+                        "video_uri": legacy_video_uri,
+                    },
+                },
+            )
+        ],
+    )
+    job.refresh_counts()
+    JsonJobStore(state_dir).save(job)
+
+    class RefreshedItemEngine:
+        def __init__(self) -> None:
+            self.discovery_calls = 0
+            self.download_calls = 0
+
+        def discover(self, url, platform, kind, *, should_cancel):
+            self.discovery_calls += 1
+            assert url == source_url
+            assert platform == Platform.DOUYIN
+            assert kind == SourceKind.ITEM
+            return DiscoveryResult(
+                author="Verified author",
+                items=[
+                    DownloadItem(
+                        id="fresh-target",
+                        media_id=media_id,
+                        source_url=source_url,
+                        title="Fresh verified target",
+                        media_type=MediaType.VIDEO,
+                        metadata=complete_douyin_item_metadata(
+                            source_url,
+                            media_id,
+                            video_uri="fresh-item-video-uri",
+                        ),
+                    )
+                ],
+            )
+
+        def download_item(
+            self,
+            item,
+            platform,
+            output_dir,
+            *,
+            callback,
+            should_cancel,
+        ):
+            self.download_calls += 1
+            assert item.metadata["douyin_item_media"]["video_uri"] != (
+                legacy_video_uri
+            )
+            return DownloadOutcome(
+                output_paths=[str(Path(output_dir) / "fresh-target.mp4")],
+                title=item.title,
+                author="Verified author",
+                media_type=MediaType.VIDEO,
+                resolution="1440x2560",
+            )
+
+    manager = DownloadManager(
+        state_dir=state_dir,
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    engine = RefreshedItemEngine()
+    monkeypatch.setattr(manager, "_engine_for_job", lambda restored_job: engine)
+    try:
+        restored = manager.get_job(job.id)
+
+        assert restored.status == JobStatus.INTERRUPTED
+        assert restored.discovery_complete is False
+        assert restored.verification_url == source_url
+        assert restored.items[0].status == ItemStatus.FAILED
+        assert restored.items[0].retryable is True
+        assert "douyin_item_media" not in restored.items[0].metadata
+        assert "item_identity_verified" not in restored.items[0].metadata
+
+        manager.retry_failed(job.id)
+        completed = wait_for_job(manager, job.id)
+
+        assert completed.status == JobStatus.COMPLETED
+        assert completed.items[0].title == "Fresh verified target"
+        assert completed.items[0].resolution == "1440x2560"
+        assert engine.discovery_calls == 1
+        assert engine.download_calls == 1
+    finally:
+        manager.shutdown()
+
+
+def test_fresh_douyin_item_without_direct_candidates_pauses_before_download(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    media_id = "7664225419386607205"
+    source_url = f"https://www.douyin.com/video/{media_id}"
+
+    class DefaultOnlyItemEngine:
+        def __init__(self) -> None:
+            self.discovery_calls = 0
+            self.download_calls = 0
+
+        def discover(self, url, platform, kind, *, should_cancel):
+            self.discovery_calls += 1
+            return DiscoveryResult(
+                author="Verified author",
+                items=[
+                    DownloadItem(
+                        id="default-only-target",
+                        media_id=media_id,
+                        source_url=source_url,
+                        title="Default-only target",
+                        media_type=MediaType.VIDEO,
+                        metadata={
+                            "verification_url": source_url,
+                            "item_identity_verified": True,
+                            "douyin_item_media": {
+                                "media_id": media_id,
+                                "video_uri": "default-only-video-uri",
+                            },
+                        },
+                    )
+                ],
+            )
+
+        def download_item(self, *args, **kwargs):
+            self.download_calls += 1
+            raise AssertionError("default-only item must not reach download")
+
+    manager = DownloadManager(
+        state_dir=tmp_path / "state",
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    engine = DefaultOnlyItemEngine()
+    monkeypatch.setattr(manager, "_engine_for_job", lambda job: engine)
+    try:
+        created = manager.create_job(source_url, auto_start=True)
+        paused = wait_for_job(manager, created.id)
+
+        assert paused.status == JobStatus.FAILED
+        assert paused.retryable is True
+        assert paused.discovery_complete is False
+        assert paused.items == []
+        assert paused.auth_message is None
+        assert paused.verification_url is None
+        assert "no verified author-feed direct rendition" in (paused.error or "")
+        assert engine.discovery_calls == 1
+        assert engine.download_calls == 0
+    finally:
+        manager.shutdown()
+
+
 def test_restore_discards_douyin_item_cache_bound_to_wrong_verification_url(
     monkeypatch,
     tmp_path,
@@ -2979,14 +3410,11 @@ def test_restore_discards_douyin_item_cache_bound_to_wrong_verification_url(
                         source_url=source_url,
                         title="Fresh target",
                         media_type=MediaType.VIDEO,
-                        metadata={
-                            "verification_url": source_url,
-                            "item_identity_verified": True,
-                            "douyin_item_media": {
-                                "media_id": media_id,
-                                "video_uri": "fresh-verified-video-uri",
-                            },
-                        },
+                        metadata=complete_douyin_item_metadata(
+                            source_url,
+                            media_id,
+                            video_uri="fresh-verified-video-uri",
+                        ),
                     )
                 ],
             )
@@ -3195,8 +3623,11 @@ def test_failed_douyin_item_retry_refreshes_expired_direct_urls(
                                 "minimum_height": 2560,
                                 "direct_candidates": [
                                     {
+                                        "video_uri": "verified-shaped-video-uri",
                                         "width": 1440,
                                         "height": 2560,
+                                        "bit_rate": 20_000_000,
+                                        "codec_hint": "hevc",
                                         "urls": [direct_url],
                                     }
                                 ],
@@ -3454,6 +3885,141 @@ def test_auth_retry_resumes_items_that_were_still_queued(monkeypatch, tmp_path) 
 
         assert resumed.status == JobStatus.COMPLETED
         assert all(item.status == ItemStatus.COMPLETED for item in resumed.items)
+    finally:
+        manager.shutdown()
+
+
+def test_item_temporary_access_pauses_queue_and_retry_resumes_all(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    class TemporaryFirstItemEngine:
+        def __init__(self) -> None:
+            self.download_calls: list[str] = []
+            self.fail_first = True
+
+        def discover(self, url, platform, kind, *, should_cancel):
+            return DiscoveryResult(
+                author="Temporary Access Author",
+                items=[
+                    DownloadItem(
+                        id="first",
+                        media_id="video-1",
+                        source_url="https://www.youtube.com/watch?v=abcdefghijk",
+                        title="First",
+                        media_type=MediaType.VIDEO,
+                    ),
+                    DownloadItem(
+                        id="second",
+                        media_id="video-2",
+                        source_url="https://www.youtube.com/watch?v=lmnopqrstuv",
+                        title="Second",
+                        media_type=MediaType.VIDEO,
+                    ),
+                ],
+            )
+
+        def download_item(
+            self,
+            item,
+            platform,
+            output_dir,
+            *,
+            callback,
+            should_cancel,
+        ):
+            self.download_calls.append(item.id)
+            output_dir = Path(output_dir)
+            preserved_path = output_dir / "first-preserved.webp"
+            if item.id == "first" and self.fail_first:
+                self.fail_first = False
+                preserved_path.write_bytes(b"preserved-before-temporary-limit")
+                callback(
+                    EngineEvent(
+                        event="asset_completed",
+                        output_paths=[str(preserved_path)],
+                    )
+                )
+                raise TemporaryAccessError(
+                    "Media was temporarily limited at "
+                    "https://cdn.example/media?token=must-not-persist"
+                )
+
+            final_path = output_dir / f"{item.id}.mp4"
+            final_path.write_bytes(f"completed-{item.id}".encode())
+            output_paths = [str(final_path)]
+            if item.id == "first":
+                output_paths.insert(0, str(preserved_path))
+            return DownloadOutcome(
+                output_paths=output_paths,
+                title=item.title,
+                upload_date="2025-11-14",
+                author="Temporary Access Author",
+                media_type=MediaType.VIDEO,
+                selected_format="bestvideo+bestaudio",
+                resolution="3840x2160",
+            )
+
+    manager = DownloadManager(
+        state_dir=tmp_path / "state",
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    engine = TemporaryFirstItemEngine()
+    monkeypatch.setattr(manager, "_engine_for_job", lambda job: engine)
+
+    try:
+        created = manager.create_job(
+            "https://www.youtube.com/@BlenderOfficial",
+            auto_start=True,
+        )
+        interrupted = wait_for_job(manager, created.id)
+
+        assert interrupted.status == JobStatus.INTERRUPTED
+        assert [item.status for item in interrupted.items] == [
+            ItemStatus.FAILED,
+            ItemStatus.QUEUED,
+        ]
+        assert [item.attempts for item in interrupted.items] == [1, 0]
+        assert engine.download_calls == ["first"]
+        assert interrupted.retryable is True
+        assert interrupted.active_item_id is None
+        assert interrupted.finished_at is not None
+        assert interrupted.items[0].retryable is True
+        assert interrupted.items[0].output_paths == [
+            str(Path(interrupted.output_dir) / "first-preserved.webp")
+        ]
+        assert interrupted.items[0].auth_message is None
+        assert interrupted.auth_message is None
+        assert interrupted.verification_url is None
+        assert "[redacted URL]" in (interrupted.error or "")
+        assert "must-not-persist" not in (interrupted.error or "")
+        assert interrupted.items[0].error == interrupted.error
+
+        persisted = JsonJobStore(tmp_path / "state").get(created.id)
+        assert persisted.status == JobStatus.INTERRUPTED
+        assert persisted.items[0].output_paths == interrupted.items[0].output_paths
+        assert persisted.error == interrupted.error
+        assert "must-not-persist" not in persisted.model_dump_json()
+
+        manager.retry_failed(created.id)
+        completed = wait_for_job(manager, created.id)
+
+        assert completed.status == JobStatus.COMPLETED
+        assert [item.status for item in completed.items] == [
+            ItemStatus.COMPLETED,
+            ItemStatus.COMPLETED,
+        ]
+        assert [item.attempts for item in completed.items] == [2, 1]
+        assert engine.download_calls == ["first", "first", "second"]
+        assert completed.items[0].output_paths == [
+            str(Path(completed.output_dir) / "first-preserved.webp"),
+            str(Path(completed.output_dir) / "first.mp4"),
+        ]
+        assert completed.error is None
+        assert completed.auth_message is None
+        assert completed.verification_url is None
+        assert all(item.auth_message is None for item in completed.items)
     finally:
         manager.shutdown()
 

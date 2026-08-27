@@ -374,8 +374,22 @@ def _highest_live_photo_asset(
         for candidate in candidates
         if candidate["width"] * candidate["height"] == highest_pixels
     ]
-    urls: list[str] = []
+    unique_highest_candidates: list[dict[str, Any]] = []
+    seen_renditions: set[tuple[int, int, tuple[str, ...]]] = set()
     for candidate in highest_candidates:
+        signature = (
+            candidate["width"],
+            candidate["height"],
+            tuple(candidate["urls"]),
+        )
+        if signature in seen_renditions:
+            continue
+        seen_renditions.add(signature)
+        unique_highest_candidates.append(candidate)
+        if len(unique_highest_candidates) >= 4:
+            break
+    urls: list[str] = []
+    for candidate in unique_highest_candidates:
         if candidate.get("video_uri") != video_uri:
             continue
         for value in candidate["urls"]:
@@ -393,6 +407,7 @@ def _highest_live_photo_asset(
         "height": candidates[0]["height"],
         "candidates": urls,
         "video_uri": video_uri,
+        "direct_candidates": unique_highest_candidates,
     }
     duration_ms = video.get("duration")
     if isinstance(duration_ms, int) and duration_ms > 0:
@@ -456,6 +471,16 @@ def _valid_cached_asset(asset: Any, *, image: bool) -> bool:
             type(duration_ms) is not int or duration_ms <= 0
         ):
             return False
+        direct_candidates = asset.get("direct_candidates")
+        if not (
+            isinstance(direct_candidates, list)
+            and 0 < len(direct_candidates) <= 4
+            and all(
+                _valid_direct_quality_candidate(value, video_uri)
+                for value in direct_candidates
+            )
+        ):
+            return False
     return True
 
 
@@ -468,6 +493,19 @@ def _valid_direct_quality_candidate(value: Any, video_uri: str) -> bool:
     except (TypeError, ValueError, OverflowError):
         return False
     urls = value.get("urls")
+    bit_rate = value.get("bit_rate")
+    if bit_rate is not None and (type(bit_rate) is not int or bit_rate <= 0):
+        return False
+    codec_hint = value.get("codec_hint")
+    if codec_hint is not None and codec_hint not in {
+        "h264",
+        "hevc",
+        "h265",
+        "vvc",
+        "h266",
+        "bytevc2",
+    }:
+        return False
     return (
         0 < width <= 16_384
         and 0 < height <= 16_384
@@ -500,7 +538,7 @@ def is_complete_profile_media_metadata(
         if not re.fullmatch(r"[A-Za-z0-9_-]{10,200}", video_uri):
             return False
         direct_candidates = cached.get("direct_candidates")
-        return direct_candidates is None or (
+        return (
             isinstance(direct_candidates, list)
             and 0 < len(direct_candidates) <= 4
             and all(

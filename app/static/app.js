@@ -506,6 +506,24 @@
     return localizeRuntimeMessage(firstDefined(item?.error_message, item?.error, item?.reason, item?.message, fallback), job);
   }
 
+  function localizedProbeDetails(text) {
+    const marker = "Probe details:";
+    if (!text.includes(marker)) return "";
+    return text
+      .split(marker, 2)[1]
+      .trim()
+      .replace(/[.。]+$/, "")
+      .replaceAll("author-feed", "作者直连")
+      .replaceAll("default", "原始档")
+      .replaceAll("media request or FFprobe timed out", "媒体请求或 FFprobe 超时")
+      .replaceAll("media endpoint network request failed", "媒体端点网络请求失败")
+      .replaceAll("media endpoint returned HTTP", "媒体端点返回 HTTP")
+      .replaceAll("media metadata could not be parsed", "无法解析媒体信息")
+      .replaceAll("media endpoint did not return video data", "媒体端点没有返回视频")
+      .replaceAll("media endpoint did not return an MP4 file", "媒体端点没有返回 MP4")
+      .replaceAll("FFprobe could not parse the media stream", "FFprobe 无法解析媒体流");
+  }
+
   function localizeRuntimeMessage(value, job = null) {
     let text = asText(value);
     if (text.includes("Chrome cookies could not be read") && text.includes("Fully quit Chrome")) {
@@ -566,6 +584,9 @@
     if (text.includes("Douyin temporarily limited the verified author-feed request") || text.includes("Douyin temporarily limited a signed request")) {
       return "抖音作者接口正在短时限流，程序已自动退避重试，仍未恢复。请等待一两分钟后重试；程序没有改下低清版本，也不需要先打开作者主页验证。";
     }
+    if (text.includes("Douyin media transfer was temporarily unavailable")) {
+      return "抖音原文件传输遇到临时网络错误或限流。程序已保留完成的文件并暂停后续队列，避免整页连续失败；请稍等后点击继续任务，不需要打开其他作品或作者主页验证。";
+    }
     if (text.includes("The site temporarily rate-limited the request")) {
       return "网站正在短时限流。请等待一两分钟后直接重试；没有明确验证码或登录页面时，不需要打开 Chrome 验证。";
     }
@@ -596,8 +617,46 @@
     if (text.includes("Douyin could not verify the author's highest-quality renditions")) {
       return "抖音暂时无法从该作者的已验证作品数据中确认最高画质。请在 Chrome 打开原视频完成验证码或登录后重试。";
     }
+    if (
+      text.includes("Douyin author-feed quality renditions were unavailable") ||
+      text.includes("Douyin author-feed data did not include a verified direct highest-quality rendition") ||
+      text.includes("Douyin highest-quality verification requires the verified author feed") ||
+      text.includes("This saved Douyin task predates author-feed highest-quality verification") ||
+      text.includes("This saved Douyin Live Photo task predates author-feed highest-quality verification") ||
+      text.includes("Douyin Live Photo has no structured author-feed quality renditions") ||
+      text.includes("Douyin item discovery returned no verified author-feed direct rendition")
+    ) {
+      return "当前任务缺少作者接口返回的最高画质直连，程序已暂停并拒绝只下载可能较低的原始档。请开启“自动读取 Chrome Cookie”，再从原始主页或视频链接创建一个新任务；已有文件不会删除。";
+    }
+    if (
+      text.includes("Downloaded video content did not match the verified Douyin media endpoint") ||
+      text.includes("Downloaded video codec did not match its verified media endpoint") ||
+      text.includes("Downloaded audio codec did not match its verified media endpoint") ||
+      text.includes("Downloaded video duration did not match its verified media metadata")
+    ) {
+      return "抖音最终返回的文件与刚才验证的目标视频指纹不一致，疑似链接过期、换档或串号，程序已丢弃临时文件。请从原链接重试；不会保留错误视频。";
+    }
+    if (
+      text.includes("Douyin authoritative author-feed quality source was temporarily unavailable") ||
+      text.includes("Douyin authoritative default quality source was temporarily unavailable")
+    ) {
+      const details = localizedProbeDetails(text);
+      return `抖音视频的作者直连或原始档遇到临时网络/限流问题。程序已暂停后续队列，避免把全部作品连续标失败，也没有改下低清版本；请稍等后点击继续任务${details ? `。本次原因：${details}` : ""}。`;
+    }
+    if (text.includes("Douyin Live Photo authoritative quality source was temporarily unavailable")) {
+      const details = localizedProbeDetails(text);
+      return `抖音 Live Photo 的作者直连或原始档遇到临时网络/限流问题。程序已暂停后续队列，避免把全部作品连续标失败，也没有改下低清版本；请稍等后点击继续任务${details ? `。本次原因：${details}` : ""}。`;
+    }
+    if (
+      text.includes("Douyin Live Photo author-feed quality source could not be verified") ||
+      text.includes("Douyin Live Photo default original-quality source could not be verified")
+    ) {
+      const details = localizedProbeDetails(text);
+      return `抖音 Live Photo 的作者直连或原始档没有通过完整性校验，程序没有下载可能降级的动态图${details ? `。本次原因：${details}` : ""}。`;
+    }
     if (text.includes("Douyin Live Photo highest quality could not be verified")) {
-      return "抖音 Live Photo 的全部清晰度档位本次未能验证完成。为避免误下低清版本，程序没有下载；请稍后重试。";
+      const details = localizedProbeDetails(text);
+      return `旧版策略中至少一个 Live Photo 派生档位未能验证，静态原图可能已经保存；更新并继续任务后会改用作者直连和原始档校验${details ? `。原失败原因：${details}` : ""}。`;
     }
     if (
       text.includes("Xiaohongshu profile discovery temporarily returned a blank browser response") ||
@@ -875,8 +934,15 @@
           const ratio = retryMatch[1] === "default" ? "原始档" : retryMatch[1];
           return `抖音 ${ratio} 画质探测遇到临时网络错误，正在重试（${retryMatch[2]}）`;
         }
+        const transferRetryMatch = phaseMessage.match(
+          /^Retrying Douyin media transfer after a temporary network error \((\d+\/\d+)\)$/
+        );
+        if (transferRetryMatch) {
+          return `抖音原文件传输遇到临时网络错误，正在重试（${transferRetryMatch[1]}）`;
+        }
         const phasePrefixes = [
           ["Checking Douyin Live Photo quality", "正在检测抖音 Live Photo 最高画质"],
+          ["Checking Douyin author-feed quality", "正在检测抖音作者直连画质"],
           ["Checking Douyin direct quality", "正在检测抖音直连候选画质"],
           ["Checking Douyin quality", "正在检测抖音最高画质"]
         ];

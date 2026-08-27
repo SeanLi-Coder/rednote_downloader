@@ -71,6 +71,11 @@ class RemoteAsset:
     video_uri: str | None = None
     duration: float | None = None
     bit_rate: int | None = None
+    quality_candidates: list[dict[str, Any]] | None = None
+    video_codec: str | None = None
+    audio_codec: str | None = None
+    probe_prefix_size: int | None = None
+    probe_prefix_sha256: str | None = None
 
 
 @dataclass(slots=True)

@@ -977,6 +977,35 @@ class DownloadManager:
                         job.refresh_counts()
                         self._commit_locked(job)
                     self._notify(self.get_job(job_id), "item_completed", item_id)
+                except TemporaryAccessError as exc:
+                    safe_message = safe_external_error_message(exc)
+                    with self._lock:
+                        job = self._require_job(job_id)
+                        item = self._find_item(job, item_id)
+                        cancelled = cancel_event.is_set() or job.cancel_requested
+                        if cancelled:
+                            self._mark_cancelled_locked(job)
+                        else:
+                            item.status = ItemStatus.FAILED
+                            item.error = safe_message
+                            item.auth_message = None
+                            item.retryable = True
+                            item.updated_at = utc_now()
+                            job.status = JobStatus.INTERRUPTED
+                            job.error = safe_message
+                            job.auth_message = None
+                            job.verification_url = None
+                            job.active_item_id = None
+                            job.finished_at = utc_now()
+                            job.retryable = True
+                            job.refresh_counts()
+                        self._commit_locked(job)
+                    self._notify(
+                        self.get_job(job_id),
+                        "cancelled" if cancelled else "interrupted",
+                        item_id,
+                    )
+                    return
                 except AuthenticationRequiredError as exc:
                     with self._lock:
                         job = self._require_job(job_id)
@@ -1612,6 +1641,15 @@ class DownloadManager:
             return
 
         if job.platform == Platform.DOUYIN and job.source_kind == SourceKind.PROFILE:
+            if (
+                cls._has_douyin_profile_rediscovery_pending(job)
+                and not result.discovery_complete
+            ):
+                raise TemporaryAccessError(
+                    "Douyin profile rediscovery returned only a partial author feed. "
+                    "The saved recovery markers were preserved; retry after a short "
+                    "wait before downloading any item."
+                )
             seen_media_ids: set[str] = set()
             invalid_profile_item = False
             for item in result.items:
@@ -1646,6 +1684,26 @@ class DownloadManager:
         ):
             raise DiscoveryError(DOUYIN_ITEM_EXPANSION_MESSAGE)
         item.source_url = canonical_url
+        cached = item.metadata.get("douyin_item_media")
+        cache_identity_is_bound = (
+            item.metadata.get("item_identity_verified") is True
+            and item.metadata.get("verification_url") == canonical_url
+            and isinstance(cached, dict)
+            and str(cached.get("media_id") or "").strip() == expected_id
+            and re.fullmatch(
+                r"[A-Za-z0-9_-]{10,200}",
+                str(cached.get("video_uri") or "").strip(),
+            )
+            is not None
+        )
+        if cache_identity_is_bound and not (
+            MediaDownloader._douyin_direct_candidates_from_cache(cached)
+        ):
+            raise TemporaryAccessError(
+                "Douyin item discovery returned no verified author-feed direct "
+                "rendition. Retry after a short wait; no default-only fallback was "
+                "queued."
+            )
         if cls._discard_invalid_douyin_item_cache(
             item,
             canonical_url,
@@ -1855,6 +1913,7 @@ class DownloadManager:
                 str(cached.get("video_uri") or "").strip(),
             )
             is not None
+            and bool(MediaDownloader._douyin_direct_candidates_from_cache(cached))
         )
         if valid:
             return False
