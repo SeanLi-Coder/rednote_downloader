@@ -73,6 +73,7 @@ DOUYIN_MAX_PROBE_FILE_BYTES = 8 * 1024 * 1024 * 1024
 DOUYIN_PROCESS_POLL_SECONDS = 0.1
 DOUYIN_MEDIA_PROBE_LOCK = threading.Lock()
 DOUYIN_MAX_MEDIA_REDIRECTS = 5
+DOUYIN_MAX_DURATION_MS = 7 * 24 * 60 * 60 * 1_000
 DOUYIN_DIRECT_MEDIA_DOMAINS = (
     "douyin.com",
     "douyinvod.com",
@@ -367,6 +368,12 @@ def _safe_media_id(value: str | None, fallback: str = "unknown-id") -> str:
     prefix_limit = MAX_MEDIA_ID_BYTES - len(hash_suffix.encode("ascii"))
     prefix = safe_component(sanitized, fallback="id", limit=prefix_limit)
     return f"{prefix}{hash_suffix}"
+
+
+def _normalized_douyin_duration_ms(value: Any) -> int | None:
+    if type(value) is int and 0 < value <= DOUYIN_MAX_DURATION_MS:
+        return value
+    return None
 
 
 def _filename_title_limit(requested_limit: int, media_id: str) -> int:
@@ -863,6 +870,11 @@ class MediaDownloader:
                 )
             if "direct_candidates" in enriched_media:
                 cached_media["direct_candidates"] = enriched_media["direct_candidates"]
+            enriched_duration_ms = _normalized_douyin_duration_ms(
+                enriched_media.get("duration_ms")
+            )
+            if enriched_duration_ms is not None:
+                cached_media["duration_ms"] = enriched_duration_ms
             if not self._douyin_direct_candidates_from_cache(cached_media):
                 raise TemporaryAccessError(
                     "Douyin author-feed data did not include a verified direct "
@@ -877,9 +889,10 @@ class MediaDownloader:
                 cached_media["minimum_width"], cached_media["minimum_height"] = (
                     combined_floor
                 )
-        duration = self._float_or_none(info.get("duration"))
-        if duration and duration > 0:
-            cached_media["duration_ms"] = int(round(duration * 1_000))
+        if "duration_ms" not in cached_media:
+            duration = self._float_or_none(info.get("duration"))
+            if duration and 0 < duration <= DOUYIN_MAX_DURATION_MS / 1_000:
+                cached_media["duration_ms"] = int(round(duration * 1_000))
         timestamp = self._float_or_none(info.get("timestamp"))
         if timestamp and timestamp > 0:
             cached_media["create_time"] = int(timestamp)
@@ -1861,8 +1874,8 @@ class MediaDownloader:
             result["_douyin_minimum_width"], result["_douyin_minimum_height"] = (
                 quality_floor
             )
-        duration_ms = cached.get("duration_ms")
-        if isinstance(duration_ms, int) and duration_ms > 0:
+        duration_ms = _normalized_douyin_duration_ms(cached.get("duration_ms"))
+        if duration_ms is not None:
             result["duration"] = duration_ms / 1_000
         create_time = cached.get("create_time")
         if isinstance(create_time, int) and create_time > 0:
@@ -1965,8 +1978,8 @@ class MediaDownloader:
             result["_douyin_minimum_width"], result["_douyin_minimum_height"] = (
                 quality_floor
             )
-        duration_ms = cached.get("duration_ms")
-        if isinstance(duration_ms, int) and duration_ms > 0:
+        duration_ms = _normalized_douyin_duration_ms(cached.get("duration_ms"))
+        if duration_ms is not None:
             result["duration"] = duration_ms / 1_000
         create_time = cached.get("create_time")
         if isinstance(create_time, int) and create_time > 0:
@@ -3973,6 +3986,9 @@ class MediaDownloader:
                         "urls": list(candidates),
                     }
                 ]
+            duration_ms = _normalized_douyin_duration_ms(
+                value.get("duration_ms")
+            )
             result.append(
                 RemoteAsset(
                     candidates=candidates,
@@ -3984,9 +4000,8 @@ class MediaDownloader:
                         str(value.get("video_uri") or "").strip() or None
                     ),
                     duration=(
-                        int(value["duration_ms"]) / 1_000
-                        if type(value.get("duration_ms")) is int
-                        and value["duration_ms"] > 0
+                        duration_ms / 1_000
+                        if duration_ms is not None
                         else None
                     ),
                     quality_candidates=quality_candidates,

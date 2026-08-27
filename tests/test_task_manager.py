@@ -323,6 +323,37 @@ def complete_douyin_profile_metadata(
     }
 
 
+@pytest.mark.parametrize(
+    "source_url",
+    [
+        "https://www.douyin.com/video/7649279395044040154",
+        (
+            "https://www.douyin.com/user/self?from_tab_name=main"
+            "&modal_id=7649279395044040154&showTab=favorite_collection"
+        ),
+    ],
+)
+def test_douyin_target_job_is_created_as_canonical_item(
+    source_url: str,
+    tmp_path,
+) -> None:
+    manager = DownloadManager(
+        state_dir=tmp_path / "state",
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    try:
+        created = manager.create_job(source_url, auto_start=False)
+
+        assert created.platform == Platform.DOUYIN
+        assert created.source_kind == SourceKind.ITEM
+        assert created.source_url == (
+            "https://www.douyin.com/video/7649279395044040154"
+        )
+    finally:
+        manager.shutdown()
+
+
 def test_douyin_item_discovery_blocks_unexpected_profile_expansion(
     monkeypatch, tmp_path
 ) -> None:
@@ -3958,9 +3989,11 @@ def test_failed_xiaohongshu_direct_retry_refreshes_discovery(
     assert DownloadManager._should_rediscover_on_retry(job) is True
 
 
-def test_failed_douyin_item_retry_refreshes_expired_direct_urls(
+@pytest.mark.parametrize("retry_method", ["retry_item", "retry_failed"])
+def test_failed_douyin_item_retry_refreshes_expired_direct_urls_after_restart(
     monkeypatch,
     tmp_path,
+    retry_method: str,
 ) -> None:
     media_id = "7638230489560727931"
     source_url = f"https://www.douyin.com/video/{media_id}"
@@ -3969,6 +4002,7 @@ def test_failed_douyin_item_retry_refreshes_expired_direct_urls(
         def __init__(self) -> None:
             self.discovery_calls = 0
             self.download_urls: list[str] = []
+            self.download_durations: list[int] = []
 
         def discover(self, url, platform, kind, *, should_cancel):
             self.discovery_calls += 1
@@ -3990,6 +4024,9 @@ def test_failed_douyin_item_retry_refreshes_expired_direct_urls(
                             "douyin_item_media": {
                                 "media_id": media_id,
                                 "video_uri": "verified-shaped-video-uri",
+                                "duration_ms": (
+                                    4_000 if self.discovery_calls == 1 else 4_573
+                                ),
                                 "minimum_width": 1440,
                                 "minimum_height": 2560,
                                 "direct_candidates": [
@@ -4020,9 +4057,14 @@ def test_failed_douyin_item_retry_refreshes_expired_direct_urls(
             direct_url = item.metadata["douyin_item_media"]["direct_candidates"][0][
                 "urls"
             ][0]
+            duration_ms = item.metadata["douyin_item_media"]["duration_ms"]
             self.download_urls.append(direct_url)
+            self.download_durations.append(duration_ms)
             if len(self.download_urls) == 1:
-                raise RuntimeError("signed direct URL expired")
+                raise RuntimeError(
+                    "media duration did not match the requested Douyin item"
+                )
+            assert duration_ms == 4_573
             return DownloadOutcome(
                 output_paths=[str(Path(output_dir) / "target.mp4")],
                 title=item.title,
@@ -4031,28 +4073,47 @@ def test_failed_douyin_item_retry_refreshes_expired_direct_urls(
                 resolution="1440x2560",
             )
 
-    manager = DownloadManager(
-        state_dir=tmp_path / "state",
+    state_dir = tmp_path / "state"
+    first_manager = DownloadManager(
+        state_dir=state_dir,
         default_output_root=tmp_path / "downloads",
         max_workers=1,
     )
     engine = RefreshingDirectEngine()
+    monkeypatch.setattr(first_manager, "_engine_for_job", lambda job: engine)
+    try:
+        created = first_manager.create_job(source_url, auto_start=True)
+        failed = wait_for_job(first_manager, created.id)
+        assert failed.status == JobStatus.FAILED
+    finally:
+        first_manager.shutdown()
+
+    manager = DownloadManager(
+        state_dir=state_dir,
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
     monkeypatch.setattr(manager, "_engine_for_job", lambda job: engine)
     try:
-        created = manager.create_job(source_url, auto_start=True)
-        failed = wait_for_job(manager, created.id)
-        assert failed.status == JobStatus.FAILED
-
-        manager.retry_failed(created.id)
+        restored = manager.get_job(created.id)
+        assert restored.status == JobStatus.FAILED
+        if retry_method == "retry_item":
+            manager.retry_item(created.id, "target")
+        else:
+            manager.retry_failed(created.id)
         completed = wait_for_job(manager, created.id)
 
         assert completed.status == JobStatus.COMPLETED
         assert completed.items[0].resolution == "1440x2560"
+        assert completed.items[0].metadata["douyin_item_media"][
+            "duration_ms"
+        ] == 4_573
         assert engine.discovery_calls == 2
         assert engine.download_urls == [
             "https://v26-web.douyinvod.com/signed-1.mp4",
             "https://v26-web.douyinvod.com/signed-2.mp4",
         ]
+        assert engine.download_durations == [4_000, 4_573]
     finally:
         manager.shutdown()
 

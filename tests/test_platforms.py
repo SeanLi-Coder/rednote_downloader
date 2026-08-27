@@ -129,6 +129,24 @@ def test_douyin_modal_video_url_is_canonicalized_as_single_item() -> None:
     assert info.url == "https://www.douyin.com/video/7664225419386607205"
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "https://www.douyin.com/video/7649279395044040154",
+        (
+            "https://www.douyin.com/user/self?from_tab_name=main"
+            "&modal_id=7649279395044040154&showTab=favorite_collection"
+        ),
+    ],
+)
+def test_douyin_target_urls_are_canonicalized_as_the_same_item(value: str) -> None:
+    info = identify_url(value)
+
+    assert info.platform == Platform.DOUYIN
+    assert info.kind == SourceKind.ITEM
+    assert info.url == "https://www.douyin.com/video/7649279395044040154"
+
+
 def test_douyin_video_url_drops_tracking_and_ignores_conflicting_modal_id() -> None:
     info = identify_url(
         "https://www.douyin.com/video/7664225419386607205"

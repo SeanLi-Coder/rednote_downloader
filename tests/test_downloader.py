@@ -18,6 +18,7 @@ from yt_dlp.networking.exceptions import HTTPError, TransportError
 from yt_dlp.utils import DownloadCancelled, DownloadError
 
 from app.downloader import (
+    DOUYIN_MAX_DURATION_MS,
     DOUYIN_MAX_MEDIA_REDIRECTS,
     DOUYIN_MAX_PROBE_FILE_BYTES,
     DOUYIN_REGIONAL_MEDIA_DOMAINS,
@@ -879,8 +880,23 @@ def test_douyin_item_discovery_without_chrome_cookie_fails_closed(
     assert DirectItemYoutubeDL.created_options[0]["noplaylist"] is True
 
 
+@pytest.mark.parametrize(
+    ("feed_duration_ms", "expected_duration_ms"),
+    [
+        (4_573, 4_573),
+        (None, 4_000),
+        (True, 4_000),
+        (4_573.0, 4_000),
+        ("4573", 4_000),
+        (0, 4_000),
+        (-1, 4_000),
+        (DOUYIN_MAX_DURATION_MS + 1, 4_000),
+    ],
+)
 def test_douyin_item_discovery_enriches_quality_from_bound_author_profile(
     monkeypatch,
+    feed_duration_ms,
+    expected_duration_ms: int,
 ) -> None:
     media_id = "7638230489560727931"
     owner_id = "MS4wLjABAAAAexpected-owner"
@@ -895,7 +911,7 @@ def test_douyin_item_discovery_enriches_quality_from_bound_author_profile(
                 "title": "Verified title",
                 "channel": "Verified author",
                 "channel_id": owner_id,
-                "duration": 27.5,
+                "duration": 4.0,
                 "formats": [
                     {
                         "url": (
@@ -914,6 +930,7 @@ def test_douyin_item_discovery_enriches_quality_from_bound_author_profile(
         calls.append((profile_id, target_id))
         return {
             "video_uri": video_uri,
+            "duration_ms": feed_duration_ms,
             "minimum_width": 1440,
             "minimum_height": 2560,
             "direct_candidates": [
@@ -940,6 +957,7 @@ def test_douyin_item_discovery_enriches_quality_from_bound_author_profile(
     cached = result.items[0].metadata["douyin_item_media"]
     assert cached["minimum_width"] == 1440
     assert cached["minimum_height"] == 2560
+    assert cached["duration_ms"] == expected_duration_ms
     assert cached["direct_candidates"][0]["urls"] == [direct_url]
 
 
@@ -1508,8 +1526,10 @@ def test_douyin_verified_profile_metadata_skips_per_item_detail() -> None:
         assert Path(ydl.prepare_filename(result)).name.startswith("2025-09-01-")
 
 
-def test_douyin_verified_item_metadata_skips_second_signed_detail() -> None:
-    media_id = "7664225419386607205"
+def test_douyin_verified_item_metadata_duration_reaches_quality_probes(
+    monkeypatch,
+) -> None:
+    media_id = "7649279395044040154"
     source_url = f"https://www.douyin.com/video/{media_id}"
     video_uri = "v0200fg10000fixturevideoid"
 
@@ -1543,7 +1563,7 @@ def test_douyin_verified_item_metadata_skips_second_signed_detail() -> None:
                         ],
                     }
                 ],
-                "duration_ms": 23_400,
+                "duration_ms": 4_573,
                 "create_time": 1_756_656_000,
                 "title": "Cached item video",
                 "author": "Verified author",
@@ -1555,7 +1575,7 @@ def test_douyin_verified_item_metadata_skips_second_signed_detail() -> None:
 
     assert result["id"] == media_id
     assert result["channel_id"] == "verified-owner"
-    assert result["duration"] == 23.4
+    assert result["duration"] == 4.573
     assert result["timestamp"] == 1_756_656_000
     assert result["upload_date"] == "20250901"
     assert result["_douyin_verified_cache_only"] is True
@@ -1564,6 +1584,33 @@ def test_douyin_verified_item_metadata_skips_second_signed_detail() -> None:
     assert parse_qs(urlsplit(result["formats"][0]["url"]).query)["video_id"] == [
         video_uri
     ]
+
+    expected_durations = []
+
+    def probe(ydl, url, *, ratio, expected_duration, callback, should_cancel):
+        expected_durations.append(expected_duration)
+        return {
+            "url": url,
+            "source_url": url,
+            "width": 1080,
+            "height": 1920,
+            "bit_rate": 4_643_369,
+            "filesize": 2_730_561,
+            "duration": 4.566667,
+            "vcodec": "hevc",
+            "acodec": "aac",
+        }
+
+    monkeypatch.setattr(engine, "_probe_douyin_ratio_with_retry", probe)
+
+    assert engine._add_douyin_probe_formats(
+        object(),
+        result,
+        expected_id=media_id,
+        verification_url=source_url,
+        should_cancel=lambda: False,
+    )
+    assert expected_durations == [4.573, 4.573]
 
 
 def test_douyin_profile_metadata_rejects_wrong_cached_owner() -> None:
