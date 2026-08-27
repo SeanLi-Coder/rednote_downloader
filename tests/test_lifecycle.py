@@ -361,7 +361,9 @@ def test_launcher_and_stop_tool_complete_managed_lifecycle(tmp_path: Path) -> No
             timeout=40,
         )
         output, _ = launcher_process.communicate(timeout=40)
-        assert stopped.returncode == 0, stopped.stderr
+        assert stopped.returncode == 0, (
+            f"{stopped.stderr}\nLauncher output:\n{output}"
+        )
         assert launcher_process.returncode == 0, output
         assert "Application shutdown complete" in output
         assert _wait_until(lambda: _port_is_free(port))

@@ -621,6 +621,22 @@ def _post_runtime_stop(
     )
 
 
+def _backend_pid_matches_process(
+    server_pid: object,
+    process_pid: int,
+    *,
+    platform_name: str | None = None,
+) -> bool:
+    if type(server_pid) is not int or server_pid <= 1:
+        return False
+    # A Windows venv executable may be a redirector whose PID differs from the
+    # Python process serving requests. The random instance ID and stop token
+    # still bind the authenticated endpoint to this launch operation.
+    if (platform_name or os.name) == "nt":
+        return True
+    return server_pid == process_pid
+
+
 def _request_managed_backend_stop(
     process: subprocess.Popen[Any],
     *,
@@ -636,7 +652,10 @@ def _request_managed_backend_stop(
             and health.get("status") == "ok"
             and health.get("app_id") == APP_ID
             and health.get("instance_id") == instance_id
-            and health.get("server_pid") == process.pid
+            and _backend_pid_matches_process(
+                health.get("server_pid"),
+                process.pid,
+            )
             and health.get("server_port") == port
             and _post_runtime_stop(
                 port,

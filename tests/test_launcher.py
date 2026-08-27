@@ -63,6 +63,48 @@ def test_backend_environment_contains_only_explicit_runtime_values(tmp_path) -> 
     assert environment[ENV_RUNTIME_DIR] == str(tmp_path)
 
 
+def test_backend_pid_requires_exact_match_on_posix() -> None:
+    assert (
+        launcher._backend_pid_matches_process(
+            12_345,
+            12_345,
+            platform_name="posix",
+        )
+        is True
+    )
+    assert (
+        launcher._backend_pid_matches_process(
+            54_321,
+            12_345,
+            platform_name="posix",
+        )
+        is False
+    )
+
+
+@pytest.mark.parametrize("server_pid", [None, True, 0, 1, "12345"])
+def test_backend_pid_rejects_invalid_windows_identity(server_pid) -> None:
+    assert (
+        launcher._backend_pid_matches_process(
+            server_pid,
+            12_345,
+            platform_name="nt",
+        )
+        is False
+    )
+
+
+def test_backend_pid_allows_windows_venv_redirector() -> None:
+    assert (
+        launcher._backend_pid_matches_process(
+            54_321,
+            12_345,
+            platform_name="nt",
+        )
+        is True
+    )
+
+
 def test_stop_request_terminates_only_the_owned_popen(monkeypatch) -> None:
     process = FakeProcess()
     stop_requested = threading.Event()
