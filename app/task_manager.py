@@ -621,6 +621,13 @@ class DownloadManager:
             elif self._has_douyin_profile_refresh_required(job):
                 targets = None
                 rediscover = True
+            elif (
+                job.platform == Platform.DOUYIN
+                and job.source_kind == SourceKind.PROFILE
+                and self._should_rediscover_on_retry(job)
+            ):
+                targets = None
+                rediscover = True
             elif self._has_xiaohongshu_binding_rediscovery_pending(job):
                 targets = None
                 rediscover = True
@@ -2394,12 +2401,37 @@ class DownloadManager:
         redirect_items = [
             item
             for item in job.items
-            if item.status in RETRYABLE_ITEM_STATUSES
+            if item.status not in {ItemStatus.COMPLETED, ItemStatus.SKIPPED}
             and (
                 cls._message_has_douyin_media_redirect(item.error)
                 or cls._message_has_douyin_media_redirect(item.auth_message)
             )
         ]
+        if not redirect_items and any(
+            cls._message_has_douyin_media_redirect(value)
+            for value in (job.error, job.warning, job.auth_message)
+        ):
+            active_item = next(
+                (
+                    item
+                    for item in job.items
+                    if item.id == job.active_item_id
+                    and item.status
+                    not in {ItemStatus.COMPLETED, ItemStatus.SKIPPED}
+                ),
+                None,
+            )
+            fallback_item = next(
+                (
+                    item
+                    for item in job.items
+                    if item.status
+                    not in {ItemStatus.COMPLETED, ItemStatus.SKIPPED}
+                ),
+                None,
+            )
+            if active_item or fallback_item:
+                redirect_items = [active_item or fallback_item]
         if not redirect_items:
             return False
         changed = False

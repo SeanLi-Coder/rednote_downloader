@@ -2062,9 +2062,16 @@ class MediaDownloader:
         return result
 
     @staticmethod
-    def _douyin_ratio_url(video_uri: str, ratio: str) -> str:
-        hostname = (
-            DOUYIN_DEFAULT_PROBE_HOST if ratio == "default" else DOUYIN_RATIO_PROBE_HOST
+    def _douyin_ratio_url(
+        video_uri: str,
+        ratio: str,
+        *,
+        hostname: str | None = None,
+    ) -> str:
+        hostname = hostname or (
+            DOUYIN_DEFAULT_PROBE_HOST
+            if ratio == "default"
+            else DOUYIN_RATIO_PROBE_HOST
         )
         query = urlencode(
             {
@@ -2076,6 +2083,73 @@ class MediaDownloader:
             }
         )
         return f"https://{hostname}/aweme/v1/play/?{query}"
+
+    @classmethod
+    def _douyin_default_probe_urls(cls, video_uri: str) -> list[str]:
+        return [
+            cls._douyin_ratio_url(
+                video_uri,
+                "default",
+                hostname=hostname,
+            )
+            for hostname in (
+                DOUYIN_DEFAULT_PROBE_HOST,
+                DOUYIN_RATIO_PROBE_HOST,
+            )
+        ]
+
+    def _probe_douyin_default_with_fallback(
+        self,
+        ydl: YoutubeDL,
+        video_uri: str,
+        *,
+        expected_duration: float | None,
+        callback: EventCallback | None,
+        should_cancel: CancelCallback,
+    ) -> dict[str, Any] | None:
+        failures: list[Exception] = []
+        candidate_urls = self._douyin_default_probe_urls(video_uri)
+        for candidate_url in candidate_urls:
+            try:
+                probe = self._probe_douyin_ratio_with_retry(
+                    ydl,
+                    candidate_url,
+                    ratio="default",
+                    expected_duration=expected_duration,
+                    callback=callback,
+                    should_cancel=should_cancel,
+                )
+            except (DownloadCancelled, MediaDownloadError):
+                raise
+            except Exception as exc:
+                failures.append(exc)
+                continue
+            if probe:
+                probe["source_candidates"] = list(
+                    dict.fromkeys([candidate_url, *candidate_urls])
+                )
+                return probe
+        if failures:
+            blocking = next(
+                (
+                    failure
+                    for failure in failures
+                    if isinstance(
+                        failure,
+                        (_DouyinRedirectRejected, _DouyinProbeIntegrityChanged),
+                    )
+                ),
+                next(
+                    (
+                        failure
+                        for failure in failures
+                        if self._should_pause_douyin_probe_error(failure)
+                    ),
+                    failures[-1],
+                ),
+            )
+            raise blocking
+        return None
 
     def _add_douyin_probe_formats(
         self,
@@ -2165,6 +2239,23 @@ class MediaDownloader:
                     break
                 errors.append(("media metadata could not be parsed", False))
             if direct_probe:
+                direct_probe["source_candidates"] = list(
+                    dict.fromkeys(
+                        [
+                            str(direct_probe.get("source_url") or ""),
+                            *(candidate.get("urls") or []),
+                        ]
+                    )
+                )
+                direct_probe["source_candidates"] = [
+                    value
+                    for value in direct_probe["source_candidates"]
+                    if value
+                    and self._is_trusted_douyin_asset_url(
+                        value,
+                        MediaType.VIDEO,
+                    )
+                ]
                 actual_width = int(direct_probe.get("width") or 0)
                 actual_height = int(direct_probe.get("height") or 0)
                 if (
@@ -2207,10 +2298,9 @@ class MediaDownloader:
                 )
             )
         try:
-            default_probe = self._probe_douyin_ratio_with_retry(
+            default_probe = self._probe_douyin_default_with_fallback(
                 ydl,
-                self._douyin_ratio_url(video_uri, "default"),
-                ratio="default",
+                video_uri,
                 expected_duration=expected_duration,
                 callback=callback,
                 should_cancel=should_cancel,
@@ -2256,22 +2346,22 @@ class MediaDownloader:
                 (label, reason) for label, reason, _ in unresolved_direct
             )
 
-        unique_probes: dict[tuple[int, int, str, str, int, int], dict[str, Any]] = {}
+        unique_probes: dict[tuple[Any, ...], dict[str, Any]] = {}
         unsupported_probes: list[dict[str, Any]] = []
         for probe in probes:
             video_codec = str(probe.get("vcodec") or "").lower()
             if video_codec in {"bytevc2", "h266", "vvc"}:
                 unsupported_probes.append(probe)
                 continue
-            signature = (
-                int(probe["width"]),
-                int(probe["height"]),
-                video_codec,
-                str(probe.get("acodec") or ""),
-                int(probe.get("bit_rate") or 0),
-                int(probe.get("filesize") or 0),
-            )
-            unique_probes.setdefault(signature, probe)
+            signature = self._douyin_probe_media_identity_key(probe)
+            existing_probe = unique_probes.get(signature)
+            if existing_probe is None:
+                unique_probes[signature] = probe
+            else:
+                self._merge_douyin_probe_source_candidates(
+                    existing_probe,
+                    probe,
+                )
 
         if unique_probes:
             best_supported_rank = max(
@@ -2361,6 +2451,10 @@ class MediaDownloader:
                         "probe_prefix_sha256"
                     ),
                     "_douyin_probe_source_url": probe.get("source_url"),
+                    "_douyin_probe_source_urls": list(
+                        probe.get("source_candidates") or []
+                    ),
+                    "_douyin_requested_ratio": probe.get("requested_ratio"),
                     "preference": -1,
                     "http_headers": dict(DOUYIN_MEDIA_HEADERS),
                 }
@@ -3055,6 +3149,7 @@ class MediaDownloader:
                 int(value.get("width") or 0) * int(value.get("height") or 0),
                 int(float(value.get("tbr") or 0) * 1_000),
                 int(value.get("filesize") or 0),
+                str(value.get("_douyin_requested_ratio") or "") == "default",
             ),
             default=None,
         )
@@ -3250,8 +3345,12 @@ class MediaDownloader:
                             for value in (
                                 redirect_source_url,
                                 str(selected["url"]),
+                                *(
+                                    selected.get("_douyin_probe_source_urls")
+                                    or []
+                                ),
                             )
-                            if value
+                            if isinstance(value, str) and value
                         )
                     )
                     title = str(raw_result.get("title") or item.title or "").strip()
@@ -3703,6 +3802,23 @@ class MediaDownloader:
             declared_width = int(rendition.get("width") or 0)
             declared_height = int(rendition.get("height") or 0)
             if direct_probe:
+                direct_probe["source_candidates"] = list(
+                    dict.fromkeys(
+                        [
+                            str(direct_probe.get("source_url") or ""),
+                            *(rendition.get("urls") or []),
+                        ]
+                    )
+                )
+                direct_probe["source_candidates"] = [
+                    value
+                    for value in direct_probe["source_candidates"]
+                    if value
+                    and self._is_trusted_douyin_asset_url(
+                        value,
+                        MediaType.VIDEO,
+                    )
+                ]
                 actual_width = int(direct_probe.get("width") or 0)
                 actual_height = int(direct_probe.get("height") or 0)
                 declared_too_high = bool(
@@ -3753,10 +3869,9 @@ class MediaDownloader:
                 )
             )
         try:
-            default_probe = self._probe_douyin_ratio_with_retry(
+            default_probe = self._probe_douyin_default_with_fallback(
                 ydl,
-                self._douyin_ratio_url(video_uri, "default"),
-                ratio="default",
+                video_uri,
                 expected_duration=asset.duration,
                 callback=callback,
                 should_cancel=should_cancel,
@@ -3824,8 +3939,18 @@ class MediaDownloader:
             )
         best = max(
             supported,
-            key=self._douyin_probe_quality_key,
+            key=lambda value: (
+                *self._douyin_probe_quality_key(value),
+                str(value.get("requested_ratio") or "") == "default",
+            ),
         )
+        best_identity = self._douyin_probe_media_identity_key(best)
+        for probe in supported:
+            if (
+                probe is not best
+                and self._douyin_probe_media_identity_key(probe) == best_identity
+            ):
+                self._merge_douyin_probe_source_candidates(best, probe)
         best_rank = self._douyin_probe_quality_key(best)
         if any(self._douyin_probe_quality_key(value) > best_rank for value in unsupported):
             raise MediaDownloadError(
@@ -3854,11 +3979,20 @@ class MediaDownloader:
         redirect_source_url = str(best.get("source_url") or "").strip()
         best_urls = [
             value
-            for value in (redirect_source_url, str(best["url"]))
-            if value
+            for value in (
+                redirect_source_url,
+                str(best["url"]),
+                *(best.get("source_candidates") or []),
+            )
+            if isinstance(value, str) and value
         ]
         if requested_ratio in DOUYIN_PROBE_RATIOS:
-            best_urls.append(self._douyin_ratio_url(video_uri, requested_ratio))
+            if requested_ratio == "default":
+                best_urls.extend(self._douyin_default_probe_urls(video_uri))
+            else:
+                best_urls.append(
+                    self._douyin_ratio_url(video_uri, requested_ratio)
+                )
         elif requested_ratio.startswith("author-feed-"):
             with contextlib.suppress(ValueError, IndexError):
                 rendition_index = int(requested_ratio.rsplit("-", 1)[1]) - 1
@@ -3891,6 +4025,51 @@ class MediaDownloader:
             int(value.get("bit_rate") or 0),
             int(value.get("filesize") or 0),
         )
+
+    @classmethod
+    def _douyin_probe_media_identity_key(
+        cls,
+        value: dict[str, Any],
+    ) -> tuple[Any, ...]:
+        duration = cls._float_or_none(value.get("duration"))
+        return (
+            int(value.get("width") or 0),
+            int(value.get("height") or 0),
+            str(value.get("vcodec") or "").lower(),
+            str(value.get("acodec") or "").lower(),
+            int(value.get("bit_rate") or 0),
+            int(value.get("filesize") or 0),
+            round(duration, 6) if duration is not None else None,
+            int(value.get("probe_prefix_size") or 0),
+            str(value.get("probe_prefix_sha256") or "").lower(),
+        )
+
+    @classmethod
+    def _merge_douyin_probe_source_candidates(
+        cls,
+        target: dict[str, Any],
+        source: dict[str, Any],
+    ) -> None:
+        candidates = [
+            value
+            for value in (
+                str(target.get("source_url") or ""),
+                str(target.get("url") or ""),
+                *(target.get("source_candidates") or []),
+                str(source.get("source_url") or ""),
+                str(source.get("url") or ""),
+                *(source.get("source_candidates") or []),
+            )
+            if isinstance(value, str)
+            and value
+            and (
+                cls._is_trusted_douyin_asset_url(value, MediaType.VIDEO)
+                or cls._is_douyin_regional_media_host(
+                    cls._strict_https_hostname(value)
+                )
+            )
+        ]
+        target["source_candidates"] = list(dict.fromkeys(candidates))
 
     @classmethod
     def _unresolved_douyin_direct_failures(
@@ -4343,6 +4522,7 @@ class MediaDownloader:
     ) -> tuple[Path, RemoteAsset]:
         errors: list[str] = []
         douyin_transient_errors: list[str] = []
+        douyin_redirect_errors: list[TemporaryAccessError] = []
         is_xiaohongshu_source = platform == Platform.XIAOHONGSHU
         is_douyin_source = platform == Platform.DOUYIN
         for asset in assets:
@@ -4649,7 +4829,17 @@ class MediaDownloader:
                     return path.resolve(), chosen
                 except DownloadCancelledError:
                     raise
-                except TemporaryAccessError:
+                except TemporaryAccessError as exc:
+                    if (
+                        is_douyin_source
+                        and "Douyin media redirect could not be trusted" in str(exc)
+                    ):
+                        douyin_redirect_errors.append(exc)
+                        errors.append(
+                            f"Candidate {candidate_index}: "
+                            f"{safe_external_error_message(exc)}"
+                        )
+                        continue
                     raise
                 except Exception as exc:
                     self._close_douyin_probe_error(exc)
@@ -4709,12 +4899,16 @@ class MediaDownloader:
                     require_quality_fingerprint=require_quality_fingerprint,
                     _douyin_transfer_attempt=_douyin_transfer_attempt + 1,
                 )
+            if douyin_redirect_errors:
+                raise douyin_redirect_errors[-1]
             raise TemporaryAccessError(
                 "Douyin media transfer was temporarily unavailable. The task was "
                 "paused before downloading later items; wait briefly and continue "
                 "the task. Completed files were preserved. Transfer details: "
                 f"{detail}"
             )
+        if douyin_redirect_errors:
+            raise douyin_redirect_errors[-1]
         detail = errors[-1] if errors else "No asset URLs were available"
         raise MediaDownloadError(
             f"All highest-available media URLs failed: {detail}"

@@ -4673,6 +4673,173 @@ def test_douyin_profile_redirect_interrupts_queue_and_rediscovery_resumes(
         manager.shutdown()
 
 
+def test_douyin_profile_start_job_rediscovers_markerless_interrupted_queue(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    state_dir = tmp_path / "state"
+    profile_url = "https://www.douyin.com/user/verified-profile"
+    media_id = "7677923079457231738"
+    job = DownloadJob(
+        id="markerless-interrupted-profile",
+        source_url=profile_url,
+        platform=Platform.DOUYIN,
+        source_kind=SourceKind.PROFILE,
+        output_root=str(tmp_path / "downloads"),
+        status=JobStatus.INTERRUPTED,
+        error="The application stopped before this task finished. Retry to continue.",
+        retryable=True,
+        discovery_complete=True,
+        items=[
+            DownloadItem(
+                id="failed-item",
+                media_id=media_id,
+                source_url=f"https://www.douyin.com/video/{media_id}",
+                status=ItemStatus.FAILED,
+                error="Interrupted when the application stopped",
+                retryable=True,
+                metadata=complete_douyin_profile_metadata(
+                    profile_url,
+                    media_id,
+                    title="Fresh profile item",
+                ),
+            )
+        ],
+    )
+    job.refresh_counts()
+    JsonJobStore(state_dir).save(job)
+
+    class RediscoveryEngine:
+        def __init__(self) -> None:
+            self.discovery_calls = 0
+            self.download_calls = 0
+
+        def discover(self, url, platform, kind, *, should_cancel):
+            self.discovery_calls += 1
+            assert url == profile_url
+            return DiscoveryResult(
+                author="Verified author",
+                items=[
+                    DownloadItem(
+                        id="fresh-item",
+                        media_id=media_id,
+                        source_url=f"https://www.douyin.com/video/{media_id}",
+                        title="Fresh profile item",
+                        author="Verified author",
+                        media_type=MediaType.VIDEO,
+                        metadata=complete_douyin_profile_metadata(
+                            profile_url,
+                            media_id,
+                            title="Fresh profile item",
+                        ),
+                    )
+                ],
+                discovery_complete=True,
+            )
+
+        def download_item(
+            self,
+            item,
+            platform,
+            output_dir,
+            *,
+            callback,
+            should_cancel,
+        ):
+            self.download_calls += 1
+            output_path = Path(output_dir) / f"{item.media_id}.mp4"
+            output_path.write_bytes(b"fresh")
+            return DownloadOutcome(
+                output_paths=[str(output_path)],
+                title=item.title,
+                upload_date="2026-08-27",
+                author="Verified author",
+                media_type=MediaType.VIDEO,
+                selected_format="douyin-api-1080x1920-1",
+                resolution="1080x1920",
+            )
+
+    manager = DownloadManager(
+        state_dir=state_dir,
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    engine = RediscoveryEngine()
+    monkeypatch.setattr(manager, "_engine_for_job", lambda restored: engine)
+    try:
+        manager.start_job(job.id)
+        completed = wait_for_job(manager, job.id)
+
+        assert completed.status == JobStatus.COMPLETED
+        assert engine.discovery_calls == 1
+        assert engine.download_calls == 1
+    finally:
+        manager.shutdown()
+
+
+def test_restore_marks_active_douyin_redirect_item_before_status_recovery(
+    tmp_path,
+) -> None:
+    state_dir = tmp_path / "state"
+    profile_url = "https://www.douyin.com/user/verified-profile"
+    media_id = "7677923079457231738"
+    redirect_error = (
+        "Douyin media redirect could not be trusted. The task was paused before "
+        "downloading later items. Redirect host: unavailable; Redirect host "
+        "fingerprint: de709a9bd45e; Redirect port: unavailable; Redirect reason: "
+        "unrecognized-host"
+    )
+    job = DownloadJob(
+        id="active-profile-redirect",
+        source_url=profile_url,
+        platform=Platform.DOUYIN,
+        source_kind=SourceKind.PROFILE,
+        output_root=str(tmp_path / "downloads"),
+        status=JobStatus.DOWNLOADING,
+        error=redirect_error,
+        active_item_id="active-item",
+        retryable=False,
+        discovery_complete=True,
+        items=[
+            DownloadItem(
+                id="active-item",
+                media_id=media_id,
+                source_url=f"https://www.douyin.com/video/{media_id}",
+                status=ItemStatus.DOWNLOADING,
+                error="Interrupted while processing the active item",
+                retryable=False,
+                metadata=complete_douyin_profile_metadata(
+                    profile_url,
+                    media_id,
+                    title="Active Live Photo",
+                ),
+            )
+        ],
+    )
+    job.refresh_counts()
+    JsonJobStore(state_dir).save(job)
+
+    manager = DownloadManager(
+        state_dir=state_dir,
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    try:
+        restored = manager.get_job(job.id)
+
+        assert restored.status == JobStatus.INTERRUPTED
+        assert restored.retryable is True
+        assert restored.discovery_complete is False
+        assert restored.items[0].status == ItemStatus.FAILED
+        assert restored.items[0].retryable is True
+        assert restored.items[0].metadata[
+            DOUYIN_PROFILE_REFRESH_REQUIRED_MARKER
+        ] is True
+        assert "de709a9bd45e" not in (restored.items[0].error or "")
+    finally:
+        manager.shutdown()
+
+
 def test_douyin_profile_retry_waits_for_complete_feed_then_retires_removed_item(
     monkeypatch,
     tmp_path,

@@ -2209,6 +2209,15 @@ def test_douyin_ratio_candidates_use_probed_resolution_not_requested_label(
     assert urlsplit(urls_by_ratio["default"]).hostname == "api-play-hl.amemv.com"
     assert set(urls_by_ratio) == {"default"}
     assert any("fixture-direct.mp4" in value for value in probed_urls)
+    default_format = next(
+        value
+        for value in added_formats
+        if value["width"] == 1440 and value["height"] == 2560
+    )
+    assert [
+        urlsplit(value).hostname
+        for value in default_format["_douyin_probe_source_urls"]
+    ] == ["api-play-hl.amemv.com", "api-play.amemv.com"]
 
     with YoutubeDL(
         {"quiet": True, **engine._download_format_options(Platform.DOUYIN)}
@@ -2218,6 +2227,175 @@ def test_douyin_ratio_candidates_use_probed_resolution_not_requested_label(
     assert selected["format_id"].startswith("douyin-api-1440x2560")
     assert (selected["width"], selected["height"]) == (1440, 2560)
     assert selected["vcodec"] == "h265"
+
+
+def test_douyin_default_probe_uses_second_official_origin_after_unknown_redirect(
+    monkeypatch,
+) -> None:
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    attempts: list[str] = []
+
+    def probe(ydl, url, **kwargs):
+        del ydl, kwargs
+        attempts.append(url)
+        if urlsplit(url).hostname == "api-play-hl.amemv.com":
+            raise _DouyinRedirectRejected(
+                "media endpoint redirected to an unrecognized Douyin CDN host"
+            )
+        return {
+            "url": "https://v5-dy-ov-experiment.zjcdn.com/default.mp4",
+            "width": 1080,
+            "height": 1920,
+            "bit_rate": 2_000_000,
+            "filesize": 2_500_000,
+            "duration": 2.0,
+            "vcodec": "hevc",
+            "acodec": "none",
+            "probe_prefix_size": 32,
+            "probe_prefix_sha256": "a" * 64,
+        }
+
+    monkeypatch.setattr(engine, "_probe_douyin_ratio_with_retry", probe)
+
+    result = engine._probe_douyin_default_with_fallback(
+        object(),
+        "v0200fg10000verifieddefault",
+        expected_duration=2.0,
+        callback=None,
+        should_cancel=lambda: False,
+    )
+
+    assert result and (result["width"], result["height"]) == (1080, 1920)
+    assert [urlsplit(value).hostname for value in attempts] == [
+        "api-play-hl.amemv.com",
+        "api-play.amemv.com",
+    ]
+    first, second = map(urlsplit, attempts)
+    assert (first.scheme, first.path, first.query, first.fragment) == (
+        second.scheme,
+        second.path,
+        second.query,
+        second.fragment,
+    )
+
+
+def test_douyin_default_probe_does_not_request_second_origin_after_success(
+    monkeypatch,
+) -> None:
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    attempts: list[str] = []
+
+    def probe(ydl, url, **kwargs):
+        del ydl, kwargs
+        attempts.append(url)
+        return {"url": url, "width": 1080, "height": 1920}
+
+    monkeypatch.setattr(engine, "_probe_douyin_ratio_with_retry", probe)
+
+    result = engine._probe_douyin_default_with_fallback(
+        object(),
+        "v0200fg10000verifieddefault",
+        expected_duration=2.0,
+        callback=None,
+        should_cancel=lambda: False,
+    )
+
+    assert result and result["width"] == 1080
+    assert [urlsplit(value).hostname for value in attempts] == [
+        "api-play-hl.amemv.com"
+    ]
+
+
+def test_douyin_equal_media_probes_merge_all_verified_transfer_sources(
+    monkeypatch,
+) -> None:
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    info = _douyin_raw_info()
+    direct_url = info["_douyin_direct_candidates"][0]["urls"][0]
+    direct_final = "https://v26-web.douyinvod.com/direct-final.mp4"
+    default_final = "https://edge.video.pstatp.com/default-final.mp4"
+
+    def probe(ydl, url, *, ratio, **kwargs):
+        del ydl, kwargs
+        return {
+            "url": default_final if ratio == "default" else direct_final,
+            "source_url": url,
+            "width": 1080,
+            "height": 1920,
+            "bit_rate": 2_000_000,
+            "filesize": 2_500_000,
+            "duration": 100.0,
+            "vcodec": "hevc",
+            "acodec": "aac",
+            "probe_prefix_size": 32,
+            "probe_prefix_sha256": "a" * 64,
+        }
+
+    monkeypatch.setattr(engine, "_probe_douyin_ratio_with_retry", probe)
+
+    assert engine._add_douyin_probe_formats(
+        object(),
+        info,
+        expected_id="1111111111111111111",
+        verification_url="https://www.douyin.com/video/1111111111111111111",
+        should_cancel=lambda: False,
+    )
+
+    added_formats = [
+        value
+        for value in info["formats"]
+        if value["format_id"].startswith("douyin-api-")
+    ]
+    assert len(added_formats) == 1
+    sources = added_formats[0]["_douyin_probe_source_urls"]
+    assert direct_url in sources
+    assert direct_final in sources
+    assert default_final in sources
+    assert {urlsplit(value).hostname for value in sources} >= {
+        "api-play-hl.amemv.com",
+        "api-play.amemv.com",
+    }
+
+
+def test_douyin_equal_quality_different_media_prefers_authoritative_default(
+    monkeypatch,
+) -> None:
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    info = _douyin_raw_info()
+
+    def probe(ydl, url, *, ratio, **kwargs):
+        del ydl, kwargs
+        is_default = ratio == "default"
+        return {
+            "url": url,
+            "source_url": url,
+            "width": 1080,
+            "height": 1920,
+            "bit_rate": 2_000_000,
+            "filesize": 2_500_000,
+            "duration": 100.0,
+            "vcodec": "hevc",
+            "acodec": "aac",
+            "probe_prefix_size": 32,
+            "probe_prefix_sha256": ("b" if is_default else "a") * 64,
+        }
+
+    monkeypatch.setattr(engine, "_probe_douyin_ratio_with_retry", probe)
+
+    assert engine._add_douyin_probe_formats(
+        object(),
+        info,
+        expected_id="1111111111111111111",
+        verification_url="https://www.douyin.com/video/1111111111111111111",
+        should_cancel=lambda: False,
+    )
+
+    selected = engine._highest_verified_douyin_format(info)
+    assert selected is not None
+    assert selected["_douyin_requested_ratio"] == "default"
+    assert urlsplit(selected["_douyin_probe_source_url"]).hostname == (
+        "api-play-hl.amemv.com"
+    )
 
 
 def test_douyin_verified_cache_without_direct_never_probes_default(
@@ -4027,9 +4205,10 @@ def test_douyin_redirect_rejection_skips_internal_retries_and_pauses_upstream(
             should_cancel=lambda: False,
         )
 
-    assert len(attempts) == 2
+    assert len(attempts) == 3
     assert attempts[0] == "https://v26-web.douyinvod.com/direct.mp4"
     assert "api-play-hl.amemv.com" in attempts[1]
+    assert "api-play.amemv.com" in attempts[2]
     assert delays == []
 
 
@@ -4597,9 +4776,122 @@ def test_douyin_live_photo_selects_verified_default_over_lower_direct(
     assert parse_qs(urlsplit(selected.candidates[1]).query)["ratio"] == [
         "default"
     ]
+    assert [urlsplit(value).hostname for value in selected.candidates[1:3]] == [
+        "api-play-hl.amemv.com",
+        "api-play.amemv.com",
+    ]
     assert selected.format_id == (
         "douyin-highest-live-photo-default-1080x1920"
     )
+
+
+def test_douyin_live_photo_equal_media_keeps_direct_and_default_sources(
+    monkeypatch,
+) -> None:
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    direct_url = "https://v26-web.douyinvod.com/direct.mp4"
+    direct_final = "https://v26-web.douyinvod.com/direct-final.mp4"
+    default_final = "https://edge.video.pstatp.com/default-final.mp4"
+    asset = RemoteAsset(
+        candidates=[direct_url],
+        index=1,
+        width=1080,
+        height=1920,
+        video_uri="v0200fg10000verifiedlivephoto",
+        duration=2.0,
+        quality_candidates=[
+            {
+                "width": 1080,
+                "height": 1920,
+                "bit_rate": 2_000_000,
+                "urls": [direct_url],
+            }
+        ],
+    )
+
+    def probe(ydl, url, *, ratio, **kwargs):
+        del ydl, kwargs
+        return {
+            "url": default_final if ratio == "default" else direct_final,
+            "source_url": url,
+            "width": 1080,
+            "height": 1920,
+            "bit_rate": 2_000_000,
+            "filesize": 2_500_000,
+            "duration": 2.0,
+            "vcodec": "hevc",
+            "acodec": "none",
+            "probe_prefix_size": 32,
+            "probe_prefix_sha256": "a" * 64,
+        }
+
+    monkeypatch.setattr(engine, "_probe_douyin_ratio_with_retry", probe)
+
+    selected = engine._select_highest_douyin_live_photo_asset(
+        object(),
+        asset,
+        callback=None,
+        should_cancel=lambda: False,
+    )
+
+    assert selected.format_id == "douyin-highest-live-photo-default-1080x1920"
+    assert direct_url in selected.candidates
+    assert direct_final in selected.candidates
+    assert default_final in selected.candidates
+    assert {urlsplit(value).hostname for value in selected.candidates} >= {
+        "api-play-hl.amemv.com",
+        "api-play.amemv.com",
+    }
+
+
+def test_douyin_live_photo_missing_direct_bitrate_remains_fail_closed(
+    monkeypatch,
+) -> None:
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    direct_url = "https://v26-web.douyinvod.com/direct.mp4"
+    asset = RemoteAsset(
+        candidates=[direct_url],
+        index=1,
+        width=1080,
+        height=1920,
+        video_uri="v0200fg10000verifiedlivephoto",
+        duration=2.0,
+        quality_candidates=[
+            {
+                "width": 1080,
+                "height": 1920,
+                "urls": [direct_url],
+            }
+        ],
+    )
+
+    def probe(ydl, url, *, ratio, **kwargs):
+        del ydl, kwargs
+        if ratio == "author-feed-1":
+            raise TimeoutError("direct rendition temporarily unavailable")
+        return {
+            "url": url,
+            "source_url": url,
+            "width": 1080,
+            "height": 1920,
+            "bit_rate": 2_000_000,
+            "filesize": 2_500_000,
+            "duration": 2.0,
+            "vcodec": "hevc",
+            "acodec": "none",
+            "probe_prefix_size": 32,
+            "probe_prefix_sha256": "a" * 64,
+        }
+
+    monkeypatch.setattr(engine, "_probe_douyin_ratio_with_retry", probe)
+
+    with pytest.raises(TemporaryAccessError, match="author-feed-1"):
+        engine._select_highest_douyin_live_photo_asset(
+            object(),
+            asset,
+            callback=None,
+            should_cancel=lambda: False,
+        )
 
 
 def test_douyin_live_photo_higher_default_dominates_expired_lower_direct(
@@ -5578,6 +5870,7 @@ def _configure_verified_douyin_transfer(
     selected_url: str = "https://v26-web.douyinvod.com/verified.mp4",
     final_url: str = "https://v26-web.douyinvod.com/final.mp4",
     source_payload: bytes | None = None,
+    final_url_by_request: dict[str, str] | None = None,
 ):
     class Headers:
         def __init__(self, response_payload: bytes) -> None:
@@ -5591,10 +5884,10 @@ def _configure_verified_douyin_transfer(
             return values.get(name, default)
 
     class AssetResponse:
-        def __init__(self, response_payload: bytes) -> None:
+        def __init__(self, response_payload: bytes, response_url: str) -> None:
             self.headers = Headers(response_payload)
             self.payload = response_payload
-            self.url = final_url
+            self.url = response_url
             self.offset = 0
             self.closed = False
 
@@ -5619,7 +5912,10 @@ def _configure_verified_douyin_transfer(
                 and request.url.startswith("https://api-play.amemv.com/")
                 else payload
             )
-            response = AssetResponse(response_payload)
+            response = AssetResponse(
+                response_payload,
+                (final_url_by_request or {}).get(request.url, final_url),
+            )
             self.responses.append(response)
             return response
 
@@ -5816,6 +6112,54 @@ def test_douyin_verified_transfer_falls_back_to_probed_final_after_source_change
     assert not list(tmp_path.glob("*.part"))
 
 
+def test_douyin_verified_transfer_tries_next_bound_candidate_after_unknown_redirect(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    media_id = "7664225419386607205"
+    payload = b"\x00\x00\x00\x18ftypisom" + b"verified-original-bytes"
+    source_url = (
+        "https://api-play.amemv.com/aweme/v1/play/?video_id=fixture"
+    )
+    selected_url = "https://v26-web.douyinvod.com/verified.mp4"
+    unknown_url = (
+        "https://unrecognized-cdn.vendor-cdn.net/original.mp4"
+        "?token=must-not-persist"
+    )
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    _inject_fake_douyin_media_opener(monkeypatch, engine)
+    direct_ydl = _configure_verified_douyin_transfer(
+        monkeypatch,
+        engine,
+        media_id=media_id,
+        payload=payload,
+        selected_url=selected_url,
+        final_url=selected_url,
+        final_url_by_request={source_url: unknown_url},
+    )
+    item = DownloadItem(
+        id="douyin-item",
+        media_id=media_id,
+        source_url=f"https://www.douyin.com/video/{media_id}",
+        title="Douyin video",
+        media_type=MediaType.VIDEO,
+        metadata={"_job_id": "douyin-job"},
+    )
+
+    outcome = engine.download_item(item, Platform.DOUYIN, tmp_path)
+
+    path = Path(outcome.output_paths[0])
+    assert path.read_bytes() == payload
+    assert [request.url for request in direct_ydl.requests] == [
+        source_url,
+        selected_url,
+    ]
+    assert direct_ydl.responses[0].offset == 0
+    assert direct_ydl.responses[1].offset == len(payload)
+    assert all(response.closed for response in direct_ydl.responses)
+    assert not list(tmp_path.glob("*.part"))
+
+
 def test_douyin_verified_transfer_accepts_bound_regional_cdn_and_preserves_bytes(
     monkeypatch,
     tmp_path,
@@ -5937,12 +6281,15 @@ def test_douyin_verified_transfer_pauses_on_unknown_redirect_without_read_or_fil
     assert "reason: unrecognized-host" in message
     assert "original.mp4" not in message
     assert "must-not-persist" not in message
-    assert len(direct_ydl.responses) == 1
+    assert len(direct_ydl.responses) == 2
     assert direct_ydl.requests[0].url == (
         "https://api-play.amemv.com/aweme/v1/play/?video_id=fixture"
     )
-    assert direct_ydl.responses[0].offset == 0
-    assert direct_ydl.responses[0].closed is True
+    assert direct_ydl.requests[1].url == (
+        "https://v26-web.douyinvod.com/verified.mp4"
+    )
+    assert all(response.offset == 0 for response in direct_ydl.responses)
+    assert all(response.closed for response in direct_ydl.responses)
     assert not list(tmp_path.iterdir())
 
 

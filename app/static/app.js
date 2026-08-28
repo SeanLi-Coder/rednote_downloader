@@ -15,6 +15,7 @@
     emptyState: document.querySelector("#empty-state"),
     failureCount: document.querySelector("#failure-count"),
     activeCount: document.querySelector("#active-count"),
+    activeCountLabel: document.querySelector("#active-count-label"),
     buildInfo: document.querySelector("#build-info"),
     filterTabs: document.querySelector("#filter-tabs"),
     formError: document.querySelector("#form-error"),
@@ -233,6 +234,21 @@
       success: Math.max(0, success || 0),
       total: total === null ? null : Math.max(0, total)
     };
+  }
+
+  function activeCountLabel(job, activeCount) {
+    if (activeCount <= 0) return "处理中";
+    const jobStatus = canonicalStatus(job);
+    if (
+      rawStatus(job) === "interrupted" ||
+      rawStatus(job) === "partial" ||
+      jobStatus === "failed"
+    ) {
+      return job?.retryable === false ? "未处理" : "等待继续";
+    }
+    if (jobStatus === "needs_auth") return "等待验证";
+    if (jobStatus === "cancelled") return "未处理";
+    return "处理中";
   }
 
   function normalizePercent(value, fractionHint = false) {
@@ -598,6 +614,15 @@
 
   function douyinRedirectMessage(text, phase) {
     const diagnostic = douyinRedirectDiagnostic(text);
+    const isDefaultProbe = /Probe details:\s*default:/i.test(text);
+    const isAuthorFeedProbe = /Probe details:\s*author-feed-\d+:/i.test(text);
+    const fallbackText = isDefaultProbe
+      ? "程序已自动尝试两个官方同画质入口，仍未完成验证。"
+      : isAuthorFeedProbe
+        ? "程序已自动尝试该同档的作者直连镜像，仍未完成验证。"
+        : phase === "原文件下载"
+          ? "程序已自动尝试本作品其余已验证的同画质入口，仍未能完成传输。"
+          : "";
     if (diagnostic.legacyInvalidHost) {
       return `这是旧版本保存的抖音${phase}地址校验结果：“invalid-host”不是实际域名，旧记录没有保留具体失败类别。这个被拦截的媒体响应没有保存，此前已完成的文件会保留，并暂停了后续队列；请从原链接重试，若再次被拦截会显示具体原因。请先检查代理或 VPN，不需要打开 Chrome 验证。`;
     }
@@ -616,7 +641,7 @@
         : diagnostic.reason
           ? "若关闭代理后仍出现，请从原链接重试；新版再次拦截时会显示可反馈的校验指纹"
           : "若关闭代理后仍出现，请从原链接重试";
-      return `抖音${phase}跳转到了尚未识别的媒体 CDN${fingerprintText}。程序在读取文件前已拦截，这个媒体响应没有保存；此前已完成的文件会保留，并暂停了后续队列。请先检查代理或 VPN 后重试；${feedbackText}，不要发送带签名的完整媒体链接，也不需要打开 Chrome 验证。`;
+      return `抖音${phase}跳转到了尚未识别的媒体 CDN${fingerprintText}。${fallbackText}程序在读取文件前已拦截，这个媒体响应没有保存；此前已完成的文件会保留，并暂停了后续队列。请先检查代理或 VPN 后重试；${feedbackText}，不要发送带签名的完整媒体链接，也不需要打开 Chrome 验证。`;
     }
     if (diagnostic.reason === "nonstandard-port") {
       const family = douyinCdnFamily(diagnostic.host);
@@ -696,6 +721,12 @@
     }
     if (text.includes("Douyin media transfer was temporarily unavailable")) {
       return "抖音原文件传输遇到临时网络错误或限流。程序已保留完成的文件并暂停后续队列，避免整页连续失败；请稍等后点击继续任务，不需要打开其他作品或作者主页验证。";
+    }
+    if (
+      text.includes("media endpoint redirected to an unrecognized Douyin CDN host") &&
+      text.includes("Probe details:")
+    ) {
+      return douyinRedirectMessage(text, "画质探测");
     }
     if (text.includes("Douyin media redirect could not be trusted")) {
       return douyinRedirectMessage(text, "原文件下载");
@@ -1040,6 +1071,18 @@
 
   function progressDescription(job, counts) {
     if (job?.cancel_requested) return "正在等待当前网络请求或合并步骤安全停止…";
+    const status = canonicalStatus(job);
+    const processed = counts.total !== null && counts.total > 0
+      ? `已处理 ${Math.min(counts.total, counts.success + counts.failed)} / ${counts.total} 个作品`
+      : "";
+    if (rawStatus(job) === "interrupted" || rawStatus(job) === "partial" || status === "failed") {
+      if (job?.retryable === false) {
+        return processed ? `任务已停止；${processed}` : "任务已停止，请查看失败原因";
+      }
+      return processed ? `已暂停，等待继续；${processed}` : "任务暂时失败，可查看提示后重试";
+    }
+    if (status === "needs_auth") return "等待验证，完成后即可继续";
+    if (status === "cancelled") return "任务已取消，已下载文件会保留";
     const current = firstDefined(job?.current_item, job?.current_title, job?.message, job?.detail);
     if (typeof current === "string" && current.trim()) return current;
     const activeItem = getItems(job).find((item) => {
@@ -1080,13 +1123,9 @@
       return `正在处理：${itemTitle(activeItem, index)}`;
     }
     if (counts.total !== null && counts.total > 0) {
-      return `已处理 ${Math.min(counts.total, counts.success + counts.failed)} / ${counts.total} 个作品`;
+      return processed;
     }
-    const status = canonicalStatus(job);
     if (status === "completed") return "所有作品处理完成";
-    if (status === "failed") return "任务未能完成，可查看失败明细";
-    if (status === "needs_auth") return "验证完成后即可继续";
-    if (status === "cancelled") return "任务已取消，已下载文件会保留";
     return "正在解析主页内容…";
   }
 
@@ -1227,6 +1266,9 @@
     elements.successCount.textContent = String(counts.success);
     elements.failureCount.textContent = String(counts.failed);
     elements.activeCount.textContent = String(counts.active);
+    if (elements.activeCountLabel) {
+      elements.activeCountLabel.textContent = activeCountLabel(job, counts.active);
+    }
     elements.totalCount.textContent = counts.total === null ? "—" : String(counts.total);
 
     elements.authAlert.hidden = !needsAuth;

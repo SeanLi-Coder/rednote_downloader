@@ -38,8 +38,9 @@ def test_douyin_redirect_messages_execute_with_safe_legacy_and_reason_parsing() 
         (
             "Douyin media redirect could not be trusted. Redirect host: "
             "unavailable; Redirect host fingerprint: 0123456789ab; "
-            "Redirect reason: unrecognized-host",
-            "校验指纹：0123456789ab",
+            "Redirect reason: unrecognized-host. Probe details: default: "
+            "media endpoint redirected to an unrecognized Douyin CDN host",
+            "已自动尝试两个官方同画质入口",
         ),
         (
             "Douyin media redirect could not be trusted. Redirect host: "
@@ -140,6 +141,70 @@ def test_douyin_redirect_messages_execute_with_safe_legacy_and_reason_parsing() 
     assert "无法判断" in messages[9]
     assert "代理或 VPN" in messages[9]
     assert "不需要打开 Chrome 验证" in messages[9]
+
+
+def test_interrupted_job_labels_queued_items_as_waiting_to_continue() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is unavailable")
+    source = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(
+        encoding="utf-8"
+    )
+    tail = "  initialize();\n})();\n"
+    assert tail in source
+    source = source.replace(
+        tail,
+        "  window.__activeCountLabel = activeCountLabel;\n"
+        "  window.__getCounts = getCounts;\n"
+        "  window.__progressDescription = progressDescription;\n})();\n",
+    )
+    job = {
+        "id": "paused-douyin-profile",
+        "status": "interrupted",
+        "platform": "douyin",
+        "source_kind": "profile",
+        "author": "Verified author",
+        "total_items": 152,
+        "completed_items": 0,
+        "failed_items": 1,
+        "discovery_complete": False,
+        "items": [
+            {"id": "failed", "status": "failed", "retryable": True},
+            *[
+                {"id": f"queued-{index}", "status": "queued"}
+                for index in range(151)
+            ],
+        ],
+    }
+    harness = (
+        "globalThis.window = {};\n"
+        "globalThis.document = {querySelector: () => null};\n"
+        f"const __job = {json.dumps(job)};\n"
+    )
+    trailer = (
+        "\nconst __counts = window.__getCounts(__job);\n"
+        "process.stdout.write(JSON.stringify({"
+        "label: window.__activeCountLabel(__job, __counts.active), "
+        "count: String(__counts.active), "
+        "progress: window.__progressDescription(__job, __counts)}));\n"
+    )
+
+    completed = subprocess.run(
+        [node],
+        input=harness + source + trailer,
+        text=True,
+        encoding="utf-8",
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == {
+        "label": "等待继续",
+        "count": "151",
+        "progress": "已暂停，等待继续；已处理 1 / 152 个作品",
+    }
 
 
 def test_nonretryable_failed_item_keeps_visible_error_without_retrying() -> None:
