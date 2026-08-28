@@ -12,7 +12,27 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 NODE_EXECUTION_TIMEOUT_SECONDS = 30
 
 
-def test_douyin_redirect_messages_execute_with_safe_legacy_and_reason_parsing() -> None:
+def _run_node_script(
+    node: str,
+    script: str,
+    tmp_path: Path,
+    filename: str,
+) -> subprocess.CompletedProcess[str]:
+    script_path = tmp_path / filename
+    script_path.write_text(script, encoding="utf-8")
+    return subprocess.run(
+        [node, str(script_path)],
+        text=True,
+        encoding="utf-8",
+        capture_output=True,
+        check=False,
+        timeout=NODE_EXECUTION_TIMEOUT_SECONDS,
+    )
+
+
+def test_douyin_redirect_messages_execute_with_safe_legacy_and_reason_parsing(
+    tmp_path: Path,
+) -> None:
     node = shutil.which("node")
     if node is None:
         pytest.skip("Node.js is unavailable")
@@ -131,14 +151,11 @@ def test_douyin_redirect_messages_execute_with_safe_legacy_and_reason_parsing() 
         "__cases.map(value => window.__localizeRuntimeMessage(value))));\n"
     )
 
-    completed = subprocess.run(
-        [node],
-        input=harness + source + trailer,
-        text=True,
-        encoding="utf-8",
-        capture_output=True,
-        check=False,
-        timeout=NODE_EXECUTION_TIMEOUT_SECONDS,
+    completed = _run_node_script(
+        node,
+        harness + source + trailer,
+        tmp_path,
+        "douyin-redirect-messages.js",
     )
 
     assert completed.returncode == 0, completed.stderr
@@ -166,7 +183,9 @@ def test_douyin_redirect_messages_execute_with_safe_legacy_and_reason_parsing() 
     assert "不需要打开 Chrome 验证" in messages[9]
 
 
-def test_interrupted_job_labels_queued_items_as_waiting_to_continue() -> None:
+def test_interrupted_job_labels_queued_items_as_waiting_to_continue(
+    tmp_path: Path,
+) -> None:
     node = shutil.which("node")
     if node is None:
         pytest.skip("Node.js is unavailable")
@@ -212,14 +231,11 @@ def test_interrupted_job_labels_queued_items_as_waiting_to_continue() -> None:
         "progress: window.__progressDescription(__job, __counts)}));\n"
     )
 
-    completed = subprocess.run(
-        [node],
-        input=harness + source + trailer,
-        text=True,
-        encoding="utf-8",
-        capture_output=True,
-        check=False,
-        timeout=NODE_EXECUTION_TIMEOUT_SECONDS,
+    completed = _run_node_script(
+        node,
+        harness + source + trailer,
+        tmp_path,
+        "interrupted-job-labels.js",
     )
 
     assert completed.returncode == 0, completed.stderr
@@ -230,7 +246,9 @@ def test_interrupted_job_labels_queued_items_as_waiting_to_continue() -> None:
     }
 
 
-def test_nonretryable_failed_item_keeps_visible_error_without_retrying() -> None:
+def test_nonretryable_failed_item_keeps_visible_error_without_retrying(
+    tmp_path: Path,
+) -> None:
     node = shutil.which("node")
     if node is None:
         pytest.skip("Node.js is unavailable")
@@ -264,14 +282,11 @@ def test_nonretryable_failed_item_keeps_visible_error_without_retrying() -> None
         "retryable: window.__isRetryableItem(__item)}));\n"
     )
 
-    completed = subprocess.run(
-        [node],
-        input=harness + source + trailer,
-        text=True,
-        encoding="utf-8",
-        capture_output=True,
-        check=False,
-        timeout=NODE_EXECUTION_TIMEOUT_SECONDS,
+    completed = _run_node_script(
+        node,
+        harness + source + trailer,
+        tmp_path,
+        "nonretryable-failed-item.js",
     )
 
     assert completed.returncode == 0, completed.stderr
