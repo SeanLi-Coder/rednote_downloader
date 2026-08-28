@@ -320,6 +320,8 @@ pytest
 
 普通 `pytest` 不访问外部网站，因此它只能证明各平台逻辑在 macOS、Linux 和 Windows 上兼容，不能证明某个时刻的抖音真实媒体入口在另一台机器也可用。仓库另有 `Portable Douyin live smoke` workflow：它在 GitHub 托管的全新 macOS 与 Ubuntu runner 上，不读取 Chrome Cookie、不使用仓库 secret，直接调用生产 `MediaDownloader` 下载两个固定公开样本，并验证 1080×1920 与 1440×2560 最高档、完整文件、独立 FFprobe 时长、只产生一个目标文件且没有 `.parts` 残留。每次还会记录实际 codec、大小和 SHA-256，便于比较不同地区的 CDN 响应；这些易随平台重新封装而变化的值只用于诊断，不作为错误的固定白名单。
 
+2026-08-28 的首次[独立机器运行](https://github.com/SeanLi-Coder/rednote_downloader/actions/runs/33162556129)已在 GitHub macOS 14 ARM64 与 Ubuntu 24.04 x86_64 两台 runner 上全部通过。两个 runner 与本机取得的 1080×1920、2,730,561 bytes 文件，以及 1440×2560、12,363,747 bytes 文件，其 codec、时长、字节数和 SHA-256 均逐项一致；两边都明确记录 `cookie_browser=null`、`cookie_fallback_used=false`、单文件落盘且无临时残留。
+
 该 smoke test 有意从已经公开且绑定作者、作品 ID 的稳定 `video_uri` 开始，所以覆盖真实官方入口、CDN 安全跳转、最高画质探测、完整传输和落盘校验，但不冒充 Chrome Cookie、签名发现或 CAPTCHA 测试。后面三项必须使用运行工具那台机器自己的 Chrome 状态；项目不会为了 CI 导出用户 Cookie，也不会放宽空 Cookie 的认证要求。GitHub 数据中心 IP 若被抖音临时限流，workflow 会如实失败，而不是改下低清文件。
 
 本机也可以运行同一条无 Cookie 测试：
