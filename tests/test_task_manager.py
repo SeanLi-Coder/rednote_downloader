@@ -29,7 +29,10 @@ from app.models import (
 )
 from app.storage import JsonJobStore
 from app.task_manager import (
+    DOUYIN_PROFILE_REFRESH_REQUIRED_MARKER,
     DOUYIN_PROFILE_REDISCOVERY_ITEM_MARKER,
+    DOUYIN_PROFILE_REMOVED_ITEM_MARKER,
+    DOUYIN_PROFILE_REMOVED_PARTIAL_ITEM_MESSAGE,
     DOUYIN_PROFILE_REDISCOVERY_MESSAGE,
     DOUYIN_UNVERIFIABLE_QUEUE_ERROR,
     LEGACY_DOUYIN_MEDIA_REDIRECT_MARKER,
@@ -2211,6 +2214,81 @@ def test_restore_migrates_legacy_douyin_item_redirect_for_rediscovery(
             "Douyin media redirect could not be trusted"
             not in restored.model_dump_json()
         )
+    finally:
+        manager.shutdown()
+
+
+def test_restore_marks_current_douyin_profile_redirect_for_safe_refresh(
+    tmp_path,
+) -> None:
+    state_dir = tmp_path / "state"
+    profile_url = "https://www.douyin.com/user/verified-profile"
+    media_id = "7677923079457231738"
+    redirect_error = (
+        "Douyin media redirect could not be trusted. The task was paused before "
+        "downloading later items. Redirect host: unavailable; Redirect host "
+        "fingerprint: unavailable; Redirect port: unavailable; Redirect reason: "
+        "nonstandard-port"
+    )
+    generic_job_error = "1 item(s) failed"
+    job = DownloadJob(
+        id="current-profile-media-redirect",
+        source_url=profile_url,
+        platform=Platform.DOUYIN,
+        source_kind=SourceKind.PROFILE,
+        output_root=str(tmp_path / "downloads"),
+        status=JobStatus.INTERRUPTED,
+        error=generic_job_error,
+        retryable=False,
+        discovery_complete=True,
+        items=[
+            DownloadItem(
+                id="failed-live-photo",
+                media_id=media_id,
+                source_url=f"https://www.douyin.com/video/{media_id}",
+                status=ItemStatus.FAILED,
+                error=redirect_error,
+                retryable=False,
+                output_paths=[str(tmp_path / "downloads" / "image-01.webp")],
+                metadata=complete_douyin_profile_metadata(
+                    profile_url,
+                    media_id,
+                    title="Failed Live Photo",
+                ),
+            ),
+            DownloadItem(
+                id="queued-next",
+                media_id="7677554129950241521",
+                source_url="https://www.douyin.com/video/7677554129950241521",
+                status=ItemStatus.QUEUED,
+                metadata=complete_douyin_profile_metadata(
+                    profile_url,
+                    "7677554129950241521",
+                    title="Queued next",
+                ),
+            ),
+        ],
+    )
+    job.refresh_counts()
+    JsonJobStore(state_dir).save(job)
+
+    manager = DownloadManager(
+        state_dir=state_dir,
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    try:
+        restored = manager.get_job(job.id)
+
+        assert restored.status == JobStatus.INTERRUPTED
+        assert restored.retryable is True
+        assert restored.discovery_complete is False
+        assert restored.items[0].metadata[
+            DOUYIN_PROFILE_REFRESH_REQUIRED_MARKER
+        ] is True
+        assert restored.items[0].output_paths == job.items[0].output_paths
+        assert restored.items[1].status == ItemStatus.QUEUED
+        assert restored.error == generic_job_error
     finally:
         manager.shutdown()
 
@@ -4595,6 +4673,186 @@ def test_douyin_profile_redirect_interrupts_queue_and_rediscovery_resumes(
         manager.shutdown()
 
 
+def test_douyin_profile_retry_waits_for_complete_feed_then_retires_removed_item(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    profile_url = "https://www.douyin.com/user/verified-live-photo-profile"
+    media_ids = [str(7670000000000000000 + index) for index in range(1, 5)]
+    redirect_error = (
+        "Douyin media redirect could not be trusted. The task was paused before "
+        "downloading later items. Redirect host: pstatp.com; Redirect host "
+        "fingerprint: unavailable; Redirect port: 8443; Redirect reason: "
+        "nonstandard-port"
+    )
+
+    class RemovedLivePhotoEngine:
+        def __init__(self) -> None:
+            self.discovery_calls = 0
+            self.download_calls: list[str] = []
+            self.preserved_paths: list[str] = []
+
+        def profile_item(self, media_id: str) -> DownloadItem:
+            return DownloadItem(
+                id=f"item-{media_id}",
+                media_id=media_id,
+                source_url=f"https://www.douyin.com/video/{media_id}",
+                title=f"Verified item {media_id}",
+                author="Verified author",
+                media_type=MediaType.IMAGE,
+                metadata=complete_douyin_profile_metadata(
+                    profile_url,
+                    media_id,
+                    title=f"Verified item {media_id}",
+                ),
+            )
+
+        def discover(self, url, platform, kind, *, should_cancel):
+            self.discovery_calls += 1
+            assert url == profile_url
+            if self.discovery_calls == 1:
+                visible_ids = media_ids
+                discovery_complete = True
+            elif self.discovery_calls == 2:
+                visible_ids = media_ids[1:2]
+                discovery_complete = False
+            else:
+                visible_ids = media_ids[1:3]
+                discovery_complete = True
+            return DiscoveryResult(
+                author="Verified author",
+                items=[self.profile_item(media_id) for media_id in visible_ids],
+                discovery_complete=discovery_complete,
+                warning=(
+                    None
+                    if discovery_complete
+                    else "Douyin feed pagination was temporarily incomplete"
+                ),
+            )
+
+        def download_item(
+            self,
+            item,
+            platform,
+            output_dir,
+            *,
+            callback,
+            should_cancel,
+        ):
+            self.download_calls.append(item.media_id)
+            if item.media_id == media_ids[0]:
+                self.preserved_paths = []
+                for index in range(1, 5):
+                    path = Path(output_dir) / f"preserved-{index:02d}.webp"
+                    path.write_bytes(f"preserved-{index}".encode())
+                    self.preserved_paths.append(str(path))
+                callback(
+                    EngineEvent(
+                        event="asset_completed",
+                        output_paths=list(self.preserved_paths),
+                    )
+                )
+                raise TemporaryAccessError(redirect_error)
+            output_path = Path(output_dir) / f"{item.media_id}.mp4"
+            output_path.write_bytes(item.media_id.encode())
+            return DownloadOutcome(
+                output_paths=[str(output_path)],
+                title=item.title,
+                upload_date="2025-08-27",
+                author="Verified author",
+                media_type=MediaType.VIDEO,
+                selected_format="douyin-api-1080x1920-1",
+                resolution="1080x1920",
+            )
+
+    manager = DownloadManager(
+        state_dir=tmp_path / "state",
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    engine = RemovedLivePhotoEngine()
+    monkeypatch.setattr(manager, "_engine_for_job", lambda job: engine)
+
+    try:
+        created = manager.create_job(profile_url, auto_start=True)
+        interrupted = wait_for_job(manager, created.id)
+
+        assert interrupted.status == JobStatus.INTERRUPTED
+        assert interrupted.discovery_complete is False
+        assert interrupted.items[0].metadata[
+            DOUYIN_PROFILE_REFRESH_REQUIRED_MARKER
+        ] is True
+        assert interrupted.items[0].output_paths == engine.preserved_paths
+        preserved_bytes = {
+            path: Path(path).read_bytes() for path in engine.preserved_paths
+        }
+
+        manager.start_job(created.id)
+        partial_refresh = wait_for_job(manager, created.id)
+
+        assert partial_refresh.status == JobStatus.FAILED
+        assert partial_refresh.discovery_complete is False
+        assert "partial author feed" in (partial_refresh.error or "")
+        assert len(partial_refresh.items) == 4
+        assert engine.download_calls == [media_ids[0]]
+        assert partial_refresh.items[0].metadata[
+            DOUYIN_PROFILE_REFRESH_REQUIRED_MARKER
+        ] is True
+
+        manager.retry_item(created.id, partial_refresh.items[0].id)
+        completed_refresh = wait_for_job(manager, created.id)
+
+        assert completed_refresh.status == JobStatus.PARTIAL
+        assert completed_refresh.discovery_complete is True
+        assert completed_refresh.total_items == 3
+        assert completed_refresh.completed_items == 2
+        assert completed_refresh.failed_items == 1
+        assert {item.media_id for item in completed_refresh.items} == set(
+            media_ids[:3]
+        )
+        removed_item = next(
+            item
+            for item in completed_refresh.items
+            if item.media_id == media_ids[0]
+        )
+        assert removed_item.status == ItemStatus.FAILED
+        assert removed_item.retryable is False
+        assert removed_item.error == DOUYIN_PROFILE_REMOVED_PARTIAL_ITEM_MESSAGE
+        assert removed_item.output_paths == engine.preserved_paths
+        assert DOUYIN_PROFILE_REFRESH_REQUIRED_MARKER not in removed_item.metadata
+        assert removed_item.metadata[DOUYIN_PROFILE_REMOVED_ITEM_MARKER] is True
+        assert "douyin_profile_media" not in removed_item.metadata
+        assert engine.download_calls == [media_ids[0], *media_ids[1:3]]
+        for path, expected in preserved_bytes.items():
+            assert Path(path).read_bytes() == expected
+        with pytest.raises(ItemNotRetryableError):
+            manager.retry_failed(created.id)
+    finally:
+        manager.shutdown()
+
+    restored_manager = DownloadManager(
+        state_dir=tmp_path / "state",
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    try:
+        restored = restored_manager.get_job(created.id)
+        assert restored.status == JobStatus.PARTIAL
+        assert restored.discovery_complete is True
+        assert restored.completed_items == 2
+        assert restored.failed_items == 1
+        restored_removed = next(
+            item for item in restored.items if item.media_id == media_ids[0]
+        )
+        assert restored_removed.status == ItemStatus.FAILED
+        assert restored_removed.retryable is False
+        assert restored_removed.error == DOUYIN_PROFILE_REMOVED_PARTIAL_ITEM_MESSAGE
+        assert restored_removed.metadata[DOUYIN_PROFILE_REMOVED_ITEM_MARKER] is True
+        assert DOUYIN_PROFILE_REDISCOVERY_ITEM_MARKER not in restored_removed.metadata
+    finally:
+        restored_manager.shutdown()
+
+
 def test_auth_single_retry_does_not_start_other_queued_items(
     monkeypatch, tmp_path
 ) -> None:
@@ -4783,6 +5041,153 @@ def test_douyin_profile_rediscovery_queues_matched_recovery_and_skips_missing() 
     assert retired.retryable is False
     assert retired.title == f"Recovered Douyin files {missing_id}"
     assert DOUYIN_PROFILE_REDISCOVERY_ITEM_MARKER not in retired.metadata
+
+
+def test_complete_douyin_profile_refresh_retires_only_missing_unfinished_items() -> None:
+    previous = [
+        DownloadItem(
+            id="partial-missing",
+            media_id="7670000000000000001",
+            source_url="https://www.douyin.com/video/7670000000000000001",
+            status=ItemStatus.FAILED,
+            output_paths=["/downloads/image-01.webp", "/downloads/image-02.webp"],
+            metadata={
+                DOUYIN_PROFILE_REFRESH_REQUIRED_MARKER: True,
+                "douyin_profile_media": {"signed_url": "must-be-discarded"},
+            },
+        ),
+        DownloadItem(
+            id="queued-missing",
+            media_id="7670000000000000002",
+            source_url="https://www.douyin.com/video/7670000000000000002",
+            status=ItemStatus.QUEUED,
+        ),
+        DownloadItem(
+            id="completed-missing",
+            media_id="7670000000000000003",
+            source_url="https://www.douyin.com/video/7670000000000000003",
+            status=ItemStatus.COMPLETED,
+            output_paths=["/downloads/completed.mp4"],
+        ),
+    ]
+
+    merged = DownloadManager._merge_discovered_items(
+        previous,
+        [],
+        retire_missing_douyin_profile_items=True,
+    )
+
+    assert [item.id for item in merged] == [
+        "partial-missing",
+        "completed-missing",
+    ]
+    partial, completed = merged
+    assert partial.status == ItemStatus.FAILED
+    assert partial.retryable is False
+    assert partial.error == DOUYIN_PROFILE_REMOVED_PARTIAL_ITEM_MESSAGE
+    assert partial.output_paths == previous[0].output_paths
+    assert DOUYIN_PROFILE_REFRESH_REQUIRED_MARKER not in partial.metadata
+    assert partial.metadata[DOUYIN_PROFILE_REMOVED_ITEM_MARKER] is True
+    assert "douyin_profile_media" not in partial.metadata
+    assert completed.status == ItemStatus.COMPLETED
+    assert completed.output_paths == ["/downloads/completed.mp4"]
+
+
+def test_partial_profile_refresh_never_retires_missing_items() -> None:
+    previous = DownloadItem(
+        id="partial-missing",
+        media_id="7670000000000000001",
+        source_url="https://www.douyin.com/video/7670000000000000001",
+        status=ItemStatus.FAILED,
+        output_paths=["/downloads/image-01.webp"],
+        metadata={DOUYIN_PROFILE_REFRESH_REQUIRED_MARKER: True},
+    )
+
+    merged = DownloadManager._merge_discovered_items([previous], [])
+
+    assert len(merged) == 1
+    assert merged[0].status == ItemStatus.FAILED
+    assert merged[0].retryable is True
+    assert merged[0].output_paths == previous.output_paths
+    assert merged[0].metadata[DOUYIN_PROFILE_REFRESH_REQUIRED_MARKER] is True
+
+
+def test_removed_profile_item_is_requeued_if_it_reappears() -> None:
+    media_id = "7670000000000000001"
+    previous = DownloadItem(
+        id="removed-item",
+        media_id=media_id,
+        source_url=f"https://www.douyin.com/video/{media_id}",
+        status=ItemStatus.FAILED,
+        retryable=False,
+        output_paths=["/downloads/preserved.webp"],
+        metadata={DOUYIN_PROFILE_REMOVED_ITEM_MARKER: True},
+    )
+    fresh = DownloadItem(
+        id="fresh-item",
+        media_id=media_id,
+        source_url=f"https://www.douyin.com/video/{media_id}",
+        status=ItemStatus.QUEUED,
+        metadata={"profile_owner_verified": True},
+    )
+
+    merged = DownloadManager._merge_discovered_items([previous], [fresh])
+
+    assert len(merged) == 1
+    assert merged[0].id == "fresh-item"
+    assert merged[0].status == ItemStatus.QUEUED
+    assert merged[0].retryable is True
+    assert merged[0].output_paths == previous.output_paths
+    assert DOUYIN_PROFILE_REMOVED_ITEM_MARKER not in merged[0].metadata
+
+
+def test_partial_douyin_refresh_blocks_generic_retryable_cached_queue(
+    tmp_path,
+) -> None:
+    profile_url = "https://www.douyin.com/user/verified-profile"
+    media_id = "7670000000000000001"
+    job = DownloadJob(
+        id="generic-failed-profile-refresh",
+        source_url=profile_url,
+        platform=Platform.DOUYIN,
+        source_kind=SourceKind.PROFILE,
+        output_root=str(tmp_path),
+        status=JobStatus.FAILED,
+        items=[
+            DownloadItem(
+                id="generic-failed",
+                media_id=media_id,
+                source_url=f"https://www.douyin.com/video/{media_id}",
+                status=ItemStatus.FAILED,
+                error="Generic media transfer failure",
+                retryable=True,
+                metadata=complete_douyin_profile_metadata(
+                    profile_url,
+                    media_id,
+                    title="Generic failed item",
+                ),
+            )
+        ],
+    )
+    partial_result = DiscoveryResult(
+        author="Verified author",
+        items=[
+            DownloadItem(
+                id="fresh-item",
+                media_id=media_id,
+                source_url=f"https://www.douyin.com/video/{media_id}",
+                metadata=complete_douyin_profile_metadata(
+                    profile_url,
+                    media_id,
+                    title="Fresh item",
+                ),
+            )
+        ],
+        discovery_complete=False,
+    )
+
+    with pytest.raises(TemporaryAccessError, match="partial author feed"):
+        DownloadManager._validate_discovery_result(job, partial_result)
 
 
 def test_completed_profile_refresh_uses_fresh_verified_display_metadata() -> None:

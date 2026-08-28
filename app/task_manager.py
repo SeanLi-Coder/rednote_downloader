@@ -86,9 +86,16 @@ DOUYIN_PROFILE_REDISCOVERY_MESSAGE = (
     "retry the original profile to discover it again. Existing files were preserved."
 )
 DOUYIN_PROFILE_REDISCOVERY_ITEM_MARKER = "_douyin_profile_rediscovery_pending"
+DOUYIN_PROFILE_REFRESH_REQUIRED_MARKER = "_douyin_profile_refresh_required"
+DOUYIN_PROFILE_REMOVED_ITEM_MARKER = "_douyin_profile_removed_after_refresh"
 DOUYIN_PROFILE_RETIRED_ITEM_MESSAGE = (
     "This preserved legacy entry was not returned by the refreshed Douyin profile. "
     "It was skipped and will not be downloaded again; existing files were preserved."
+)
+DOUYIN_PROFILE_REMOVED_PARTIAL_ITEM_MESSAGE = (
+    "This partially downloaded Douyin profile entry was not returned by a complete "
+    "verified profile refresh. It is no longer available for automatic retry; "
+    "existing files were preserved."
 )
 DOUYIN_PROFILE_METADATA_ERROR = (
     "Douyin profile discovery temporarily returned incomplete verified media "
@@ -297,6 +304,11 @@ class DownloadManager:
                     SourceKind.ITEM,
                     SourceKind.SHORT_LINK,
                 }
+            elif (
+                job.platform == Platform.DOUYIN
+                and job.source_kind == SourceKind.PROFILE
+            ):
+                changed |= self._mark_douyin_profile_redirect_refresh_required(job)
             legacy_signing_messages = (job.error or "", job.auth_message or "")
             if (
                 job.platform == Platform.DOUYIN
@@ -606,6 +618,9 @@ class DownloadManager:
             elif self._has_douyin_profile_rediscovery_pending(job):
                 targets = None
                 rediscover = True
+            elif self._has_douyin_profile_refresh_required(job):
+                targets = None
+                rediscover = True
             elif self._has_xiaohongshu_binding_rediscovery_pending(job):
                 targets = None
                 rediscover = True
@@ -677,6 +692,10 @@ class DownloadManager:
                 self._find_item(job, item_id)
                 self._submit_locked(job, None, rediscover=True)
                 return self.get_job(job_id)
+            if self._has_douyin_profile_refresh_required(job):
+                self._find_item(job, item_id)
+                self._submit_locked(job, None, rediscover=True)
+                return self.get_job(job_id)
             item = self._find_item(job, item_id)
             if item.status not in RETRYABLE_ITEM_STATUSES or not item.retryable:
                 raise ItemNotRetryableError(
@@ -723,6 +742,7 @@ class DownloadManager:
             profile_can_continue = rediscover and all(
                 item.status == ItemStatus.COMPLETED
                 or item.metadata.get(DOUYIN_PROFILE_REDISCOVERY_ITEM_MARKER) is True
+                or item.metadata.get(DOUYIN_PROFILE_REFRESH_REQUIRED_MARKER) is True
                 for item in job.items
             )
             if job.items and not targets and not profile_can_continue:
@@ -898,6 +918,11 @@ class DownloadManager:
                     job.items = self._merge_discovered_items(
                         previous_items,
                         result.items,
+                        retire_missing_douyin_profile_items=(
+                            job.platform == Platform.DOUYIN
+                            and job.source_kind == SourceKind.PROFILE
+                            and result.discovery_complete
+                        ),
                     )
                     if (
                         job.platform == Platform.DOUYIN
@@ -1048,6 +1073,14 @@ class DownloadManager:
                             item.error = safe_message
                             item.auth_message = None
                             item.retryable = True
+                            if (
+                                job.platform == Platform.DOUYIN
+                                and job.source_kind == SourceKind.PROFILE
+                            ):
+                                item.metadata[
+                                    DOUYIN_PROFILE_REFRESH_REQUIRED_MARKER
+                                ] = True
+                                job.discovery_complete = False
                             item.updated_at = utc_now()
                             job.status = JobStatus.INTERRUPTED
                             job.error = safe_message
@@ -1701,6 +1734,7 @@ class DownloadManager:
             return False
         return any(
             item.metadata.get("profile_owner_verified") is True
+            and item.metadata.get(DOUYIN_PROFILE_REMOVED_ITEM_MARKER) is not True
             and not cls._is_complete_douyin_profile_item(job, item)
             for item in job.items
         )
@@ -1759,14 +1793,29 @@ class DownloadManager:
             return
 
         if job.platform == Platform.DOUYIN and job.source_kind == SourceKind.PROFILE:
+            has_retryable_unfinished_item = any(
+                item.retryable
+                and item.status not in {ItemStatus.COMPLETED, ItemStatus.SKIPPED}
+                for item in job.items
+            )
             if (
-                cls._has_douyin_profile_rediscovery_pending(job)
+                (
+                    cls._has_douyin_profile_rediscovery_pending(job)
+                    or any(
+                        item.metadata.get(
+                            DOUYIN_PROFILE_REFRESH_REQUIRED_MARKER
+                        )
+                        is True
+                        for item in job.items
+                    )
+                    or has_retryable_unfinished_item
+                )
                 and not result.discovery_complete
             ):
                 raise TemporaryAccessError(
-                    "Douyin profile rediscovery returned only a partial author feed. "
-                    "The saved recovery markers were preserved; retry after a short "
-                    "wait before downloading any item."
+                    "Douyin profile retry returned only a partial author feed. "
+                    "Previously queued media entries were not reused; retry after a "
+                    "short wait before downloading any item."
                 )
             seen_media_ids: set[str] = set()
             invalid_profile_item = False
@@ -2096,6 +2145,16 @@ class DownloadManager:
             for marker in LEGACY_DOUYIN_MEDIA_REDIRECT_MARKERS[1:]
         )
 
+    @staticmethod
+    def _message_has_douyin_media_redirect(value: str | None) -> bool:
+        return bool(
+            value
+            and any(
+                marker in value
+                for marker in LEGACY_DOUYIN_MEDIA_REDIRECT_MARKERS
+            )
+        )
+
     @classmethod
     def _has_legacy_douyin_media_redirect_error(cls, job: DownloadJob) -> bool:
         messages = [job.error, job.warning, job.auth_message]
@@ -2171,8 +2230,22 @@ class DownloadManager:
         )
 
     @staticmethod
+    def _has_douyin_profile_refresh_required(job: DownloadJob) -> bool:
+        return (
+            job.platform == Platform.DOUYIN
+            and job.source_kind == SourceKind.PROFILE
+            and any(
+                item.metadata.get(DOUYIN_PROFILE_REFRESH_REQUIRED_MARKER) is True
+                for item in job.items
+            )
+        )
+
+    @staticmethod
     def _merge_discovered_items(
-        previous: list[DownloadItem], discovered: list[DownloadItem]
+        previous: list[DownloadItem],
+        discovered: list[DownloadItem],
+        *,
+        retire_missing_douyin_profile_items: bool = False,
     ) -> list[DownloadItem]:
         previous_by_media_id = {
             item.media_id: item for item in previous if item.media_id
@@ -2200,7 +2273,10 @@ class DownloadManager:
             recovery_pending = (
                 old.metadata.get(DOUYIN_PROFILE_REDISCOVERY_ITEM_MARKER) is True
             )
-            if recovery_pending:
+            removed_after_refresh = (
+                old.metadata.get(DOUYIN_PROFILE_REMOVED_ITEM_MARKER) is True
+            )
+            if recovery_pending or removed_after_refresh:
                 fresh.attempts = old.attempts
                 fresh.created_at = old.created_at
                 fresh.output_paths = list(old.output_paths)
@@ -2210,6 +2286,8 @@ class DownloadManager:
                 fresh.retryable = True
                 old_metadata = dict(old.metadata)
                 old_metadata.pop(DOUYIN_PROFILE_REDISCOVERY_ITEM_MARKER, None)
+                old_metadata.pop(DOUYIN_PROFILE_REFRESH_REQUIRED_MARKER, None)
+                old_metadata.pop(DOUYIN_PROFILE_REMOVED_ITEM_MARKER, None)
                 fresh.metadata = {**old_metadata, **fresh.metadata}
                 merged.append(fresh)
                 continue
@@ -2238,7 +2316,9 @@ class DownloadManager:
             fresh.error = old.error
             fresh.auth_message = old.auth_message
             fresh.retryable = old.retryable
-            fresh.metadata = {**old.metadata, **fresh.metadata}
+            old_metadata = dict(old.metadata)
+            old_metadata.pop(DOUYIN_PROFILE_REFRESH_REQUIRED_MARKER, None)
+            fresh.metadata = {**old_metadata, **fresh.metadata}
             if (
                 not fresh_is_douyin
                 and old.title
@@ -2278,6 +2358,26 @@ class DownloadManager:
                 retained.updated_at = utc_now()
                 merged.append(retained)
                 continue
+            if (
+                retire_missing_douyin_profile_items
+                and retained.status
+                not in {ItemStatus.COMPLETED, ItemStatus.SKIPPED}
+            ):
+                if not retained.output_paths:
+                    continue
+                retained.metadata.pop(
+                    DOUYIN_PROFILE_REFRESH_REQUIRED_MARKER,
+                    None,
+                )
+                retained.metadata.pop("douyin_profile_media", None)
+                retained.metadata[DOUYIN_PROFILE_REMOVED_ITEM_MARKER] = True
+                retained.status = ItemStatus.FAILED
+                retained.error = DOUYIN_PROFILE_REMOVED_PARTIAL_ITEM_MESSAGE
+                retained.auth_message = None
+                retained.retryable = False
+                retained.updated_at = utc_now()
+                merged.append(retained)
+                continue
             if retained.status != ItemStatus.COMPLETED and retained.retryable:
                 retained.status = ItemStatus.FAILED
                 retained.error = "Item was not found when the profile was refreshed"
@@ -2285,6 +2385,38 @@ class DownloadManager:
             merged.append(retained)
 
         return merged
+
+    @classmethod
+    def _mark_douyin_profile_redirect_refresh_required(
+        cls,
+        job: DownloadJob,
+    ) -> bool:
+        redirect_items = [
+            item
+            for item in job.items
+            if item.status in RETRYABLE_ITEM_STATUSES
+            and (
+                cls._message_has_douyin_media_redirect(item.error)
+                or cls._message_has_douyin_media_redirect(item.auth_message)
+            )
+        ]
+        if not redirect_items:
+            return False
+        changed = False
+        for item in redirect_items:
+            if item.metadata.get(DOUYIN_PROFILE_REFRESH_REQUIRED_MARKER) is not True:
+                item.metadata[DOUYIN_PROFILE_REFRESH_REQUIRED_MARKER] = True
+                changed = True
+            if not item.retryable:
+                item.retryable = True
+                changed = True
+        if not job.retryable:
+            job.retryable = True
+            changed = True
+        if job.discovery_complete:
+            job.discovery_complete = False
+            changed = True
+        return changed
 
     def _require_job(self, job_id: str) -> DownloadJob:
         try:

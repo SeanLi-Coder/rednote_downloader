@@ -72,6 +72,30 @@ def test_douyin_redirect_messages_execute_with_safe_legacy_and_reason_parsing() 
             "(host: legacy-cdn.vendor-cdn.net)",
             "主机名可能包含敏感标识",
         ),
+        (
+            "Douyin media redirect could not be trusted. Redirect host: "
+            "pstatp.com; Redirect host fingerprint: unavailable; Redirect port: "
+            "8443; Redirect reason: nonstandard-port",
+            "CDN 域名族：pstatp.com，端口：8443",
+        ),
+        (
+            "media endpoint redirected to an unrecognized Douyin CDN host "
+            "(host: unavailable; host-fingerprint: unavailable; reason: "
+            "nonstandard-port)",
+            "端口：旧记录未保存",
+        ),
+        (
+            "This partially downloaded Douyin profile entry was not returned by "
+            "a complete verified profile refresh. It is no longer available for "
+            "automatic retry; existing files were preserved.",
+            "余下可见作品会继续下载",
+        ),
+        (
+            "Douyin profile retry returned only a partial author feed. Previously "
+            "queued media entries were not reused; retry after a short wait before "
+            "downloading any item.",
+            "没有下载低清文件",
+        ),
     ]
     harness = (
         "globalThis.window = {};\n"
@@ -113,3 +137,56 @@ def test_douyin_redirect_messages_execute_with_safe_legacy_and_reason_parsing() 
     assert "检查代理" not in known_unbound_message
     assert "legacy-cdn.vendor-cdn.net" not in messages[8]
     assert "把这个主机名发给开发者" not in messages[8]
+    assert "无法判断" in messages[9]
+    assert "代理或 VPN" in messages[9]
+    assert "不需要打开 Chrome 验证" in messages[9]
+
+
+def test_nonretryable_failed_item_keeps_visible_error_without_retrying() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is unavailable")
+    source = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(
+        encoding="utf-8"
+    )
+    tail = "  initialize();\n})();\n"
+    assert tail in source
+    assert 'if (state.filter === "failed") return isFailed(item);' in source
+    source = source.replace(
+        tail,
+        "  window.__itemError = itemError;\n"
+        "  window.__isRetryableItem = isRetryableItem;\n})();\n",
+    )
+    item = {
+        "status": "failed",
+        "retryable": False,
+        "error": (
+            "This partially downloaded Douyin profile entry was not returned by "
+            "a complete verified profile refresh."
+        ),
+    }
+    harness = (
+        "globalThis.window = {};\n"
+        "globalThis.document = {querySelector: () => null};\n"
+        f"const __item = {json.dumps(item)};\n"
+    )
+    trailer = (
+        "\nprocess.stdout.write(JSON.stringify({"
+        "error: window.__itemError(__item, {}), "
+        "retryable: window.__isRetryableItem(__item)}));\n"
+    )
+
+    completed = subprocess.run(
+        [node],
+        input=harness + source + trailer,
+        text=True,
+        encoding="utf-8",
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    result = json.loads(completed.stdout)
+    assert "余下可见作品会继续下载" in result["error"]
+    assert result["retryable"] is False

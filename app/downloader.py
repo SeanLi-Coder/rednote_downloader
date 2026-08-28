@@ -16,6 +16,7 @@ import time
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from http.cookiejar import CookieJar
 from pathlib import Path
 from typing import Any, Callable, Iterable
 from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlsplit, urlunsplit
@@ -216,6 +217,10 @@ _DOUYIN_REDIRECT_HOST_PATTERNS = (
     re.compile(r"(\(host:\s*)([^;)\r\n]+)", re.IGNORECASE),
     re.compile(r"(Redirect host:\s*)([^;\r\n]+)", re.IGNORECASE),
 )
+_DOUYIN_REDIRECT_PORT_PATTERNS = (
+    re.compile(r"(\bport:\s*)([^;)\r\n]+)", re.IGNORECASE),
+    re.compile(r"(Redirect port:\s*)([^;\r\n]+)", re.IGNORECASE),
+)
 _WINDOWS_RESERVED = {
     "CON",
     "PRN",
@@ -247,11 +252,13 @@ class _DouyinRedirectRejected(_DouyinProbeRejected):
         *,
         redirect_host: str | None = None,
         redirect_host_fingerprint: str | None = None,
+        redirect_port: int | None = None,
         redirect_reason: str | None = None,
     ) -> None:
         super().__init__(message)
         self.redirect_host = redirect_host
         self.redirect_host_fingerprint = redirect_host_fingerprint
+        self.redirect_port = redirect_port
         self.redirect_reason = redirect_reason
 
 
@@ -307,13 +314,23 @@ def _sanitize_douyin_redirect_diagnostic(message: str) -> str:
     def safe_host(match: re.Match[str]) -> str:
         family = (
             _safe_douyin_redirect_family(match.group(2))
-            if reason == "unverified-source-binding"
+            if reason in {"unverified-source-binding", "nonstandard-port"}
             else None
         )
         return f"{match.group(1)}{family or 'unavailable'}"
 
+    def safe_port(match: re.Match[str]) -> str:
+        raw_port = match.group(2).strip()
+        try:
+            port = int(raw_port) if len(raw_port) <= 5 and raw_port.isdigit() else 0
+        except ValueError:
+            port = 0
+        return f"{match.group(1)}{port if 1 <= port <= 65_535 else 'unavailable'}"
+
     for pattern in _DOUYIN_REDIRECT_HOST_PATTERNS:
         message = pattern.sub(safe_host, message)
+    for pattern in _DOUYIN_REDIRECT_PORT_PATTERNS:
+        message = pattern.sub(safe_port, message)
     return message
 
 
@@ -1404,23 +1421,43 @@ class MediaDownloader:
         reason: str,
     ) -> _DouyinRedirectRejected:
         hostname, _ = cls._douyin_redirect_diagnostic(value)
+        if reason == "nonstandard-port":
+            try:
+                hostname = (
+                    (urlsplit(value).hostname or "").lower().rstrip(".") or None
+                )
+            except (TypeError, ValueError):
+                hostname = None
         visible_hostname = (
             cls._douyin_regional_media_family(hostname)
-            if reason == "unverified-source-binding"
+            if reason in {"unverified-source-binding", "nonstandard-port"}
             else None
         )
         host_fingerprint = None
-        if hostname and reason == "unrecognized-host":
+        if hostname and (
+            reason == "unrecognized-host"
+            or (reason == "nonstandard-port" and not visible_hostname)
+        ):
             host_fingerprint = hashlib.sha256(
                 hostname.encode("ascii")
             ).hexdigest()[:12]
+        redirect_port = None
+        if reason == "nonstandard-port":
+            try:
+                parsed_port = urlsplit(value).port
+            except (TypeError, ValueError):
+                parsed_port = None
+            if type(parsed_port) is int and 1 <= parsed_port <= 65_535:
+                redirect_port = parsed_port
         return _DouyinRedirectRejected(
             "media endpoint redirected to an unrecognized Douyin CDN host "
             f"(host: {visible_hostname or 'unavailable'}; "
             f"host-fingerprint: {host_fingerprint or 'unavailable'}; "
+            f"port: {redirect_port or 'unavailable'}; "
             f"reason: {reason})",
             redirect_host=visible_hostname,
             redirect_host_fingerprint=host_fingerprint,
+            redirect_port=redirect_port,
             redirect_reason=reason,
         )
 
@@ -1450,12 +1487,36 @@ class MediaDownloader:
                 "secure Douyin redirect validation requires the yt-dlp requests handler"
             )
         headers = handler._get_headers(request)
+        isolated_cookie_jar = getattr(
+            handler,
+            "_douyin_isolated_media_cookie_jar",
+            None,
+        )
+        if not isinstance(isolated_cookie_jar, CookieJar):
+            isolated_cookie_jar = CookieJar()
+            setattr(
+                handler,
+                "_douyin_isolated_media_cookie_jar",
+                isolated_cookie_jar,
+            )
+        else:
+            isolated_cookie_jar.clear()
         session = handler._get_instance(
-            cookiejar=handler._get_cookiejar(request),
+            cookiejar=isolated_cookie_jar,
             legacy_ssl_support=request.extensions.get("legacy_ssl"),
         )
         current_url = request.url
-        current_headers = dict(headers)
+        current_headers = {
+            key: value
+            for key, value in headers.items()
+            if key.lower()
+            not in {
+                "authorization",
+                "cookie",
+                "host",
+                "proxy-authorization",
+            }
+        }
         request_timeout = handler._calculate_timeout(request)
         redirect_deadline = time.monotonic() + request_timeout
         for redirect_count in range(DOUYIN_MAX_MEDIA_REDIRECTS + 1):
@@ -1562,7 +1623,12 @@ class MediaDownloader:
                         key: value
                         for key, value in current_headers.items()
                         if key.lower()
-                        not in {"authorization", "cookie", "proxy-authorization"}
+                        not in {
+                            "authorization",
+                            "cookie",
+                            "host",
+                            "proxy-authorization",
+                        }
                     }
                 current_url = target_url
                 continue
@@ -4365,6 +4431,7 @@ class MediaDownloader:
                                 f"host: {exc.redirect_host or 'unavailable'}; Redirect "
                                 "host fingerprint: "
                                 f"{exc.redirect_host_fingerprint or 'unavailable'}; "
+                                f"Redirect port: {exc.redirect_port or 'unavailable'}; "
                                 f"reason: {exc.redirect_reason or 'unrecognized-host'}"
                             ) from exc
                     else:
@@ -4398,6 +4465,8 @@ class MediaDownloader:
                             f"{redirect_error.redirect_host or 'unavailable'}; "
                             "Redirect host fingerprint: "
                             f"{redirect_error.redirect_host_fingerprint or 'unavailable'}; "
+                            "Redirect port: "
+                            f"{redirect_error.redirect_port or 'unavailable'}; "
                             "Redirect reason: "
                             f"{redirect_error.redirect_reason}"
                         )

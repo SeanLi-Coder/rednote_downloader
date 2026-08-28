@@ -501,8 +501,13 @@
   }
 
   function itemError(item, job) {
-    if (!isRetryableItem(item)) return "";
-    const fallback = canonicalStatus(item) === "cancelled" ? "下载已取消，可以重新尝试" : "下载失败，请重试";
+    const status = canonicalStatus(item);
+    if (!isFailed(item) && status !== "cancelled" && rawStatus(item) !== "skipped") return "";
+    const fallback = status === "cancelled"
+      ? "下载已取消，可以重新尝试"
+      : item?.retryable === false
+        ? "该记录不能自动重试，请查看具体原因"
+        : "下载失败，请重试";
     return localizeRuntimeMessage(firstDefined(item?.error_message, item?.error, item?.reason, item?.message, fallback), job);
   }
 
@@ -568,6 +573,11 @@
     const fingerprint = (
       text.match(/(?:Redirect host fingerprint:\s*|host-fingerprint:\s*)([0-9a-f]{12})/i)?.[1] || ""
     ).toLowerCase();
+    const rawPort = text.match(/(?:Redirect port:\s*|\bport:\s*)(\d{1,5})/i)?.[1] || "";
+    const parsedPort = Number(rawPort);
+    const port = Number.isInteger(parsedPort) && parsedPort >= 1 && parsedPort <= 65535
+      ? parsedPort
+      : null;
     const reason = text.match(/(?:Redirect reason:\s*|reason:\s*)([a-z0-9-]+)/i)?.[1]?.toLowerCase() || "";
     const labels = rawHost.split(".");
     const isSafeHostname = (
@@ -579,6 +589,7 @@
     return {
       host: isSafeHostname ? rawHost : "",
       fingerprint,
+      port,
       legacyInvalidHost: rawHost === "invalid-host" && !reason,
       reason,
       reasonText: douyinRedirectReasonLabels[reason] || "具体类别未知",
@@ -607,6 +618,15 @@
           : "若关闭代理后仍出现，请从原链接重试";
       return `抖音${phase}跳转到了尚未识别的媒体 CDN${fingerprintText}。程序在读取文件前已拦截，这个媒体响应没有保存；此前已完成的文件会保留，并暂停了后续队列。请先检查代理或 VPN 后重试；${feedbackText}，不要发送带签名的完整媒体链接，也不需要打开 Chrome 验证。`;
     }
+    if (diagnostic.reason === "nonstandard-port") {
+      const family = douyinCdnFamily(diagnostic.host);
+      const familyText = family ? `CDN 域名族：${family}` : "CDN 域名族：未识别";
+      const portText = diagnostic.port ? `端口：${diagnostic.port}` : "端口：旧记录未保存";
+      const fingerprintText = diagnostic.fingerprint
+        ? `，校验指纹：${diagnostic.fingerprint}`
+        : "";
+      return `抖音${phase}地址使用了尚未验证的非标准 HTTPS 端口（${familyText}，${portText}${fingerprintText}）。程序在读取文件前已拦截，没有保存这个媒体响应；此前已完成的文件会保留，并暂停后续队列。仅凭这个结果无法判断是已失效的旧媒体地址、尚未确认的 CDN，还是代理或 VPN 改写。请从原主页或原视频链接继续或重试以刷新作品；若关闭代理后仍复现，只需反馈这里显示的域名族、端口或校验指纹，不要发送带签名的完整媒体链接，也不需要打开 Chrome 验证。`;
+    }
     return `抖音${phase}的重定向地址未通过安全校验。原因：${diagnostic.reasonText}。程序在读取文件前已拦截，这个媒体响应没有保存；此前已完成的文件会保留，并暂停了后续队列。请检查代理或 VPN 是否改写了媒体地址，稍后从原链接重试，不需要打开 Chrome 验证。`;
   }
 
@@ -626,6 +646,9 @@
     }
     if (text.includes("preserved legacy entry was not returned by the refreshed Douyin profile")) {
       return "这条旧记录在重新解析主页时已不存在或不可见，程序已跳过且不会反复下载；以前保存的文件仍保留在磁盘中。";
+    }
+    if (text.includes("partially downloaded Douyin profile entry was not returned by a complete verified profile refresh")) {
+      return "这条作品在完整刷新主页后已不存在或当前不可见，程序不会再使用它的旧媒体地址。此前成功保存的图片或视频仍保留；该记录已设为不可自动重试，余下可见作品会继续下载。";
     }
     if (text.includes("Douyin profile task contains legacy entries without complete verified author and media metadata")) {
       return "这是旧版本留下的不完整抖音主页队列。程序已移除未保存的数字占位项；点击继续任务会从原主页重新解析，已有文件不会被删除。";
@@ -647,6 +670,7 @@
       text.includes("Douyin returned incomplete profile media metadata") ||
       text.includes("Douyin profile media metadata is incomplete") ||
       text.includes("Douyin returned incomplete profile titles or ownership metadata") ||
+      text.includes("Douyin profile retry returned only a partial author feed") ||
       text.includes("Douyin profile discovery temporarily returned no verified media items") ||
       text.includes("Douyin profile discovery temporarily timed out or was rate-limited") ||
       text.includes("Douyin profile discovery temporarily returned no verified profile-owned media") ||
@@ -1072,7 +1096,7 @@
       .map((item, index) => ({ item, index }))
       .filter(({ item }) => {
         if (state.filter === "success") return canonicalStatus(item) === "completed";
-        if (state.filter === "failed") return isRetryableItem(item);
+        if (state.filter === "failed") return isFailed(item);
         return true;
       });
 

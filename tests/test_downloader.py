@@ -5,6 +5,7 @@ import hashlib
 import sys
 import threading
 import time
+from http.cookiejar import CookieJar
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
@@ -2854,15 +2855,19 @@ def test_douyin_redirect_diagnostic_is_specific_and_never_persists_url_secrets(
     assert host == expected_host
     assert reason == expected_reason
     assert rejection.redirect_reason == expected_reason
-    if expected_reason == "unrecognized-host":
+    if expected_reason in {"unrecognized-host", "nonstandard-port"}:
+        diagnostic_host = expected_host or "media.vendor-cdn.net"
         expected_fingerprint = hashlib.sha256(
-            expected_host.encode("ascii")
+            diagnostic_host.encode("ascii")
         ).hexdigest()[:12]
         assert rejection.redirect_host is None
         assert rejection.redirect_host_fingerprint == expected_fingerprint
         assert "host: unavailable" in message
         assert f"host-fingerprint: {expected_fingerprint}" in message
-        assert expected_host not in message
+        assert diagnostic_host not in message
+        if expected_reason == "nonstandard-port":
+            assert rejection.redirect_port == 8443
+            assert "port: 8443" in message
     else:
         assert rejection.redirect_host is None
         assert rejection.redirect_host_fingerprint is None
@@ -2935,6 +2940,62 @@ def test_douyin_known_unbound_redirect_only_persists_allowlist_family() -> None:
     assert "host: pstatp.com" in message
     assert hostname not in message
     assert "secret-token" not in message
+
+
+@pytest.mark.parametrize(
+    ("url", "expected_family", "expect_fingerprint"),
+    [
+        (
+            "https://secret-token.edge.pstatp.com:8443/original.mp4?token=secret",
+            "pstatp.com",
+            False,
+        ),
+        (
+            "https://secret-token.vendor-cdn.net:9443/original.mp4?token=secret",
+            None,
+            True,
+        ),
+    ],
+)
+def test_douyin_nonstandard_port_diagnostic_preserves_only_safe_details(
+    url: str,
+    expected_family: str | None,
+    expect_fingerprint: bool,
+) -> None:
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+
+    rejection = engine._douyin_redirect_rejection(url, "nonstandard-port")
+    message = str(rejection)
+    sanitized = safe_external_error_message(message)
+
+    assert rejection.redirect_host == expected_family
+    assert rejection.redirect_port in {8443, 9443}
+    assert bool(rejection.redirect_host_fingerprint) is expect_fingerprint
+    assert f"port: {rejection.redirect_port}" in message
+    assert "reason: nonstandard-port" in message
+    assert "secret-token" not in message
+    assert "original.mp4" not in message
+    assert "token=secret" not in message
+    assert sanitized == message
+
+
+def test_external_error_redaction_rejects_untrusted_redirect_port_text() -> None:
+    sanitized = safe_external_error_message(
+        "Douyin media redirect could not be trusted. Redirect host: "
+        "edge.pstatp.com; Redirect port: secret-token; Redirect reason: "
+        "nonstandard-port"
+    )
+
+    assert "Redirect host: pstatp.com" in sanitized
+    assert "Redirect port: unavailable" in sanitized
+    assert "secret-token" not in sanitized
+
+    oversized = safe_external_error_message(
+        "Douyin media redirect could not be trusted. Redirect host: "
+        "edge.pstatp.com; Redirect port: "
+        f"{'9' * 5_000}; Redirect reason: nonstandard-port"
+    )
+    assert "Redirect port: unavailable" in oversized
 
 
 def test_douyin_redirect_policy_distinguishes_known_unbound_and_unknown_hosts() -> None:
@@ -3204,11 +3265,17 @@ def test_douyin_cross_origin_redirect_strips_sensitive_headers_and_keeps_range(
         _FakeRequestsResponse(target_url, payload=b"verified-media"),
     ]
     session = _QueuedRequestsSession(responses)
+    instance_options: list[dict] = []
     engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
 
     with YoutubeDL({"quiet": True, "proxy": ""}) as ydl:
         handler = ydl._request_director.handlers["Requests"]
-        monkeypatch.setattr(handler, "_get_instance", lambda **kwargs: session)
+
+        def get_isolated_instance(**kwargs):
+            instance_options.append(kwargs)
+            return session
+
+        monkeypatch.setattr(handler, "_get_instance", get_isolated_instance)
         response = engine._open_douyin_media_response(
             ydl,
             Request(
@@ -3216,6 +3283,7 @@ def test_douyin_cross_origin_redirect_strips_sensitive_headers_and_keeps_range(
                 headers={
                     "Authorization": "Bearer secret",
                     "Cookie": "session=secret",
+                    "Host": "v26-web.douyinvod.com",
                     "Proxy-Authorization": "Basic secret",
                     "Range": "bytes=0-262143",
                 },
@@ -3231,18 +3299,63 @@ def test_douyin_cross_origin_redirect_strips_sensitive_headers_and_keeps_range(
     second_headers = {
         key.lower(): value for key, value in session.requests[1]["headers"].items()
     }
-    assert first_headers["authorization"] == "Bearer secret"
-    assert first_headers["cookie"] == "session=secret"
-    assert first_headers["proxy-authorization"] == "Basic secret"
     assert first_headers["range"] == "bytes=0-262143"
     assert {
         "authorization",
         "cookie",
+        "host",
+        "proxy-authorization",
+    }.isdisjoint(first_headers)
+    assert {
+        "authorization",
+        "cookie",
+        "host",
         "proxy-authorization",
     }.isdisjoint(second_headers)
     assert second_headers["range"] == "bytes=0-262143"
     assert responses[0].closed is True
     assert responses[1].raw.closed is True
+    assert len(instance_options) == 1
+    isolated_cookie_jar = instance_options[0]["cookiejar"]
+    assert isinstance(isolated_cookie_jar, CookieJar)
+    assert list(isolated_cookie_jar) == []
+    assert isolated_cookie_jar is not handler.cookiejar
+
+
+def test_douyin_media_open_reuses_one_isolated_session_per_ydl(
+    monkeypatch,
+) -> None:
+    first_url = "https://v26-web.douyinvod.com/first.mp4"
+    second_url = "https://v26-web.douyinvod.com/second.mp4"
+    responses = [
+        _FakeRequestsResponse(first_url, payload=b"first"),
+        _FakeRequestsResponse(second_url, payload=b"second"),
+    ]
+    session = _QueuedRequestsSession(responses)
+    created_options: list[dict] = []
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+
+    with YoutubeDL({"quiet": True, "proxy": ""}) as ydl:
+        handler = ydl._request_director.handlers["Requests"]
+
+        def create_instance(**kwargs):
+            created_options.append(kwargs)
+            return session
+
+        monkeypatch.setattr(handler, "_create_instance", create_instance)
+        for url in (first_url, second_url):
+            response = engine._open_douyin_media_response(
+                ydl,
+                Request(url),
+                redirect_rejection_reason=lambda value: None,
+            )
+            response.close()
+
+    assert len(created_options) == 1
+    assert len(session.requests) == 2
+    isolated_cookie_jar = created_options[0]["cookiejar"]
+    assert isinstance(isolated_cookie_jar, CookieJar)
+    assert list(isolated_cookie_jar) == []
 
 
 def test_douyin_safe_redirect_does_not_request_rejected_target() -> None:
