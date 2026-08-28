@@ -23,5 +23,9 @@ class TemporaryAccessError(DownloaderCoreError):
     pass
 
 
+class DouyinMediaRefreshRequiredError(TemporaryAccessError):
+    """A verified Douyin source must be rediscovered before one safe retry."""
+
+
 class MediaDownloadError(DownloaderCoreError):
     pass

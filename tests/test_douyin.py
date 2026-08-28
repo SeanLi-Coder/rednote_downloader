@@ -101,14 +101,71 @@ def test_douyin_lookalike_auth_urls_are_not_actionable(url: str) -> None:
     assert not _is_explicit_douyin_auth_url(url)
 
 
-def test_item_metadata_profile_lookup_stops_at_target(monkeypatch) -> None:
+def test_item_metadata_profile_lookup_uses_exact_detail_when_preferred(
+    monkeypatch,
+) -> None:
     profile_id = "MS4wLjABAAAAexpected"
     media_id = "1111111111111111111"
     video_uri = "v0200fg10000fixturevideoid"
     calls = []
 
-    def fetch(profile_url, requested_profile_id, **kwargs):
-        calls.append((profile_url, requested_profile_id, kwargs))
+    def fetch_detail(requested_media_id, **kwargs):
+        calls.append((requested_media_id, kwargs))
+        return {
+            "aweme_id": media_id,
+            "author": {"sec_uid": profile_id, "nickname": "Test Author"},
+            "video": {
+                "play_addr": {
+                    "uri": video_uri,
+                    "width": 1080,
+                    "height": 1920,
+                    "url_list": [
+                        "https://v26-web.douyinvod.com/item-target.mp4"
+                    ],
+                }
+            },
+        }
+
+    monkeypatch.setattr("app.douyin.fetch_signed_aweme_detail", fetch_detail)
+    monkeypatch.setattr(
+        "app.douyin.fetch_signed_profile_awemes",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("The profile feed must not be requested after detail success")
+        ),
+    )
+
+    result = discover_item_metadata_from_profile(
+        profile_id,
+        media_id,
+        prefer_exact_detail=True,
+    )
+
+    assert result and result["media_id"] == media_id
+    assert len(calls) == 1
+    assert calls[0][0] == media_id
+    assert calls[0][1]["expected_sec_uid"] == profile_id
+    assert calls[0][1]["verification_url"] == (
+        f"https://www.douyin.com/user/{profile_id}"
+    )
+
+
+def test_item_metadata_profile_lookup_uses_targeted_feed_by_default(
+    monkeypatch,
+) -> None:
+    profile_id = "MS4wLjABAAAAexpected"
+    media_id = "1111111111111111111"
+    video_uri = "v0200fg10000fixturevideoid"
+    feed_calls = []
+
+    monkeypatch.setattr(
+        "app.douyin.fetch_signed_aweme_detail",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("Exact detail must not replace author-feed enrichment")
+        ),
+    )
+
+    def fetch_feed(profile_url, requested_profile_id, **kwargs):
+        feed_calls.append((profile_url, requested_profile_id, kwargs))
         return [
             {
                 "aweme_id": media_id,
@@ -126,13 +183,62 @@ def test_item_metadata_profile_lookup_stops_at_target(monkeypatch) -> None:
             }
         ]
 
-    monkeypatch.setattr("app.douyin.fetch_signed_profile_awemes", fetch)
+    monkeypatch.setattr("app.douyin.fetch_signed_profile_awemes", fetch_feed)
 
     result = discover_item_metadata_from_profile(profile_id, media_id)
 
     assert result and result["media_id"] == media_id
-    assert len(calls) == 1
-    assert calls[0][2]["target_aweme_id"] == media_id
+    assert len(feed_calls) == 1
+    assert feed_calls[0][2]["target_aweme_id"] == media_id
+
+
+def test_item_metadata_preferred_detail_falls_back_to_targeted_feed(
+    monkeypatch,
+) -> None:
+    profile_id = "MS4wLjABAAAAexpected"
+    media_id = "1111111111111111111"
+    video_uri = "v0200fg10000fixturevideoid"
+    feed_calls = []
+
+    monkeypatch.setattr(
+        "app.douyin.fetch_signed_aweme_detail",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            TemporaryAccessError("detail endpoint was temporarily limited")
+        ),
+    )
+
+    def fetch_feed(profile_url, requested_profile_id, **kwargs):
+        feed_calls.append((profile_url, requested_profile_id, kwargs))
+        return [
+            {
+                "aweme_id": media_id,
+                "author": {"sec_uid": profile_id, "nickname": "Test Author"},
+                "video": {
+                    "play_addr": {
+                        "uri": video_uri,
+                        "width": 1440,
+                        "height": 2560,
+                        "url_list": [
+                            "https://v26-web.douyinvod.com/feed-target.mp4"
+                        ],
+                    }
+                },
+            }
+        ]
+
+    monkeypatch.setattr("app.douyin.fetch_signed_profile_awemes", fetch_feed)
+
+    result = discover_item_metadata_from_profile(
+        profile_id,
+        media_id,
+        prefer_exact_detail=True,
+    )
+
+    assert result and result["media_id"] == media_id
+    assert result["minimum_width"] == 1440
+    assert result["minimum_height"] == 2560
+    assert len(feed_calls) == 1
+    assert feed_calls[0][2]["target_aweme_id"] == media_id
 
 
 def test_douyin_signed_profile_discovery_returns_verified_complete_metadata(

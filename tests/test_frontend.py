@@ -40,7 +40,7 @@ def test_douyin_redirect_messages_execute_with_safe_legacy_and_reason_parsing() 
             "unavailable; Redirect host fingerprint: 0123456789ab; "
             "Redirect reason: unrecognized-host. Probe details: default: "
             "media endpoint redirected to an unrecognized Douyin CDN host",
-            "已自动尝试两个官方同画质入口",
+            "已自动尝试四条官方同画质路由",
         ),
         (
             "Douyin media redirect could not be trusted. Redirect host: "
@@ -78,6 +78,28 @@ def test_douyin_redirect_messages_execute_with_safe_legacy_and_reason_parsing() 
             "pstatp.com; Redirect host fingerprint: unavailable; Redirect port: "
             "8443; Redirect reason: nonstandard-port",
             "CDN 域名族：pstatp.com，端口：8443",
+        ),
+        (
+            "Probe details: default: media endpoint redirected to an "
+            "unrecognized Douyin CDN host (host: unavailable; "
+            "host-fingerprint: 38c1b2b0b3d0; port: 33443; reason: "
+            "nonstandard-port)",
+            "当前版本会在任务执行时从原任务链接自动刷新当前作品一次",
+        ),
+        (
+            "Refreshing this Douyin item from the original task link after a "
+            "blocked media route",
+            "只刷新当前作品并自动重试",
+        ),
+        (
+            "Douyin automatic item refresh was skipped because Chrome Cookie is "
+            "disabled for this task",
+            "程序遵守该设置，没有读取 Chrome Cookie",
+        ),
+        (
+            "Douyin automatic item refresh returned media below the previously "
+            "verified quality floor",
+            "分辨率、编码或码率低于任务此前已验证的质量档",
         ),
         (
             "media endpoint redirected to an unrecognized Douyin CDN host "

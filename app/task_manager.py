@@ -9,6 +9,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 from .downloader import (
@@ -20,10 +21,15 @@ from .downloader import (
     safe_component,
     safe_external_error_message,
 )
-from .douyin import is_complete_profile_media_metadata
+from .douyin import (
+    discover_item_metadata_from_profile,
+    is_complete_profile_media_metadata,
+    quality_floor_dimensions,
+)
 from .errors import (
     AuthenticationRequiredError,
     DiscoveryError,
+    DouyinMediaRefreshRequiredError,
     DownloadCancelledError,
     MediaDownloadError,
     TemporaryAccessError,
@@ -1033,15 +1039,35 @@ class DownloadManager:
                 try:
                     if binding_error:
                         raise MediaDownloadError(binding_error)
-                    outcome = engine.download_item(
-                        item_snapshot,
-                        platform,
-                        output_dir,
-                        callback=lambda event, current=item_id: self._on_engine_event(
-                            job_id, current, event
-                        ),
-                        should_cancel=cancel_event.is_set,
-                    )
+                    automatic_refresh_used = False
+                    while True:
+                        try:
+                            outcome = engine.download_item(
+                                item_snapshot,
+                                platform,
+                                output_dir,
+                                callback=(
+                                    lambda event, current=item_id: (
+                                        self._on_engine_event(
+                                            job_id,
+                                            current,
+                                            event,
+                                        )
+                                    )
+                                ),
+                                should_cancel=cancel_event.is_set,
+                            )
+                            break
+                        except DouyinMediaRefreshRequiredError:
+                            if automatic_refresh_used or platform != Platform.DOUYIN:
+                                raise
+                            automatic_refresh_used = True
+                            item_snapshot = self._refresh_douyin_media_during_run(
+                                job_id,
+                                item_id,
+                                engine,
+                                cancel_event,
+                            )
                     with self._lock:
                         job = self._require_job(job_id)
                         item = self._find_item(job, item_id)
@@ -1236,6 +1262,430 @@ class DownloadManager:
                 job.refresh_counts()
                 self._commit_locked(job)
             self._notify(self.get_job(job_id), "failed")
+
+    def _refresh_douyin_media_during_run(
+        self,
+        job_id: str,
+        item_id: str,
+        engine: MediaDownloader,
+        cancel_event: threading.Event,
+    ) -> DownloadItem:
+        if cancel_event.is_set():
+            raise DownloadCancelledError("Task cancelled")
+        self._on_engine_event(
+            job_id,
+            item_id,
+            EngineEvent(
+                event="probing",
+                message=(
+                    "Refreshing this Douyin item from the original task link "
+                    "after a blocked media route"
+                ),
+            ),
+        )
+        job_snapshot = self.get_job(job_id)
+        if (
+            job_snapshot.platform != Platform.DOUYIN
+            or job_snapshot.source_kind
+            not in {SourceKind.PROFILE, SourceKind.ITEM}
+        ):
+            raise DouyinMediaRefreshRequiredError(
+                "Douyin media refresh requires an original profile or video link"
+            )
+        current_item = self._find_item(job_snapshot, item_id)
+        current_media_id = str(current_item.media_id or "").strip()
+        if not current_media_id:
+            raise DouyinMediaRefreshRequiredError(
+                "Douyin media refresh could not verify the current item identity"
+            )
+        refresh_author = str(current_item.author or job_snapshot.author or "").strip()
+        refresh_cookie_fallback = False
+        if job_snapshot.source_kind == SourceKind.PROFILE:
+            if not engine.config.cookie_browser:
+                raise TemporaryAccessError(
+                    "Douyin automatic item refresh was skipped because Chrome "
+                    "Cookie is disabled for this task. Continue with Chrome Cookie "
+                    "enabled to request a fresh, identity-bound media address."
+                )
+            profile_id = MediaDownloader._douyin_profile_id(
+                job_snapshot.source_url
+            )
+            if not profile_id:
+                raise TemporaryAccessError(
+                    "Douyin automatic media refresh could not verify the profile "
+                    "identity"
+                )
+            previous_metadata = current_item.metadata.get("douyin_profile_media")
+            if not isinstance(previous_metadata, dict):
+                raise TemporaryAccessError(
+                    "Douyin automatic item refresh could not verify the previous "
+                    "quality floor"
+                )
+            try:
+                refreshed_metadata = discover_item_metadata_from_profile(
+                    profile_id,
+                    current_media_id,
+                    cookie_profile=engine.config.cookie_profile,
+                    prefer_exact_detail=True,
+                    should_cancel=cancel_event.is_set,
+                )
+                if (
+                    refreshed_metadata
+                    and is_complete_profile_media_metadata(
+                        refreshed_metadata,
+                        current_media_id,
+                        profile_id,
+                    )
+                    and not self._douyin_refresh_preserves_quality(
+                        previous_metadata,
+                        refreshed_metadata,
+                    )
+                ):
+                    refreshed_metadata = discover_item_metadata_from_profile(
+                        profile_id,
+                        current_media_id,
+                        cookie_profile=engine.config.cookie_profile,
+                        should_cancel=cancel_event.is_set,
+                    )
+            except (
+                AuthenticationRequiredError,
+                DownloadCancelledError,
+                TemporaryAccessError,
+            ):
+                raise
+            except Exception as exc:
+                raise TemporaryAccessError(
+                    "Douyin automatic item refresh did not pass identity or "
+                    "integrity validation. The task was paused without downloading "
+                    "a fallback."
+                ) from exc
+            if not refreshed_metadata or not is_complete_profile_media_metadata(
+                refreshed_metadata,
+                current_media_id,
+                profile_id,
+            ):
+                raise TemporaryAccessError(
+                    "Douyin automatic item refresh did not return complete verified "
+                    "metadata. The old media address was not reused."
+                )
+            if not self._douyin_refresh_preserves_quality(
+                previous_metadata,
+                refreshed_metadata,
+            ):
+                raise TemporaryAccessError(
+                    "Douyin automatic item refresh returned media below the "
+                    "previously verified quality floor. The old address was not "
+                    "reused and the lower-quality response was not downloaded."
+                )
+            fresh_current = current_item.model_copy(deep=True)
+            fresh_current.metadata["douyin_profile_media"] = dict(
+                refreshed_metadata
+            )
+            fresh_current.metadata["profile_url"] = job_snapshot.source_url
+            fresh_current.metadata["profile_owner_verified"] = True
+            refreshed_title = str(refreshed_metadata.get("title") or "").strip()
+            if refreshed_title not in {
+                "Untitled Douyin video",
+                "Untitled Douyin image",
+            }:
+                fresh_current.title = refreshed_title or fresh_current.title
+            refresh_author = str(
+                refreshed_metadata.get("author") or refresh_author
+            ).strip()
+            fresh_current.author = refresh_author or fresh_current.author
+            create_time = refreshed_metadata.get("create_time")
+            if type(create_time) is int and create_time > 0:
+                fresh_current.upload_date = MediaDownloader._douyin_upload_date(
+                    create_time
+                )
+            fresh_current.media_type = (
+                MediaType.IMAGE
+                if refreshed_metadata.get("media_kind") == "image"
+                else MediaType.VIDEO
+            )
+            if not self._is_complete_douyin_profile_item(
+                job_snapshot,
+                fresh_current,
+            ):
+                raise TemporaryAccessError(
+                    "Douyin automatic item refresh returned media from a different "
+                    "profile or item"
+                )
+        else:
+            try:
+                result = engine.discover(
+                    job_snapshot.source_url,
+                    job_snapshot.platform,
+                    job_snapshot.source_kind,
+                    should_cancel=cancel_event.is_set,
+                )
+                self._validate_discovery_result(job_snapshot, result)
+            except (
+                AuthenticationRequiredError,
+                DownloadCancelledError,
+                TemporaryAccessError,
+            ):
+                raise
+            except Exception as exc:
+                raise TemporaryAccessError(
+                    "Douyin automatic media refresh did not pass identity or "
+                    "integrity validation. The task was paused without downloading "
+                    "a fallback."
+                ) from exc
+            fresh_current = next(
+                (
+                    value
+                    for value in result.items
+                    if str(value.media_id or "").strip() == current_media_id
+                ),
+                None,
+            )
+            if fresh_current is None:
+                raise TemporaryAccessError(
+                    "Douyin automatic media refresh did not return the current item. "
+                    "The task was paused without reusing its old media address."
+                )
+            refresh_author = str(
+                fresh_current.author or result.author or refresh_author
+            ).strip()
+            refresh_cookie_fallback = result.cookie_fallback_used
+        if cancel_event.is_set():
+            raise DownloadCancelledError("Task cancelled")
+
+        with self._lock:
+            job = self._require_job(job_id)
+            old_current = self._find_item(job, item_id)
+            if str(old_current.media_id or "").strip() != current_media_id:
+                raise TemporaryAccessError(
+                    "Douyin item identity changed during automatic media refresh"
+                )
+            old_current.source_url = fresh_current.source_url
+            old_current.title = fresh_current.title
+            old_current.upload_date = fresh_current.upload_date
+            old_current.author = fresh_current.author
+            old_current.extractor_key = fresh_current.extractor_key
+            old_current.playlist_index = fresh_current.playlist_index
+            old_current.media_type = fresh_current.media_type
+            if job.source_kind == SourceKind.ITEM:
+                old_current.metadata = dict(fresh_current.metadata)
+            else:
+                old_current.metadata = {
+                    **old_current.metadata,
+                    **fresh_current.metadata,
+                }
+            refreshed_item = old_current
+            if job.source_kind == SourceKind.ITEM:
+                bound, _ = self._bind_douyin_item_metadata(job, refreshed_item)
+                if not bound:
+                    raise TemporaryAccessError(
+                        "Douyin automatic media refresh returned a different item"
+                    )
+            else:
+                refreshed_item.metadata["profile_url"] = job.source_url
+                refreshed_item.metadata["profile_owner_verified"] = True
+            refreshed_item.metadata.pop(
+                DOUYIN_PROFILE_REFRESH_REQUIRED_MARKER,
+                None,
+            )
+            refreshed_item.status = ItemStatus.DOWNLOADING
+            refreshed_item.error = None
+            refreshed_item.auth_message = None
+            refreshed_item.updated_at = utc_now()
+            if refresh_author:
+                job.author = refresh_author
+            job.cookie_fallback_used |= refresh_cookie_fallback
+            job.status = JobStatus.DOWNLOADING
+            job.active_item_id = refreshed_item.id
+            self._commit_locked(job)
+            refreshed_snapshot = refreshed_item.model_copy(deep=True)
+            refreshed_snapshot.metadata["_job_id"] = job_id
+            if job.source_kind == SourceKind.PROFILE:
+                refreshed_snapshot.metadata["profile_url"] = job.source_url
+        self._notify(
+            self.get_job(job_id),
+            "media_refreshed",
+            refreshed_snapshot.id,
+        )
+        return refreshed_snapshot
+
+    @staticmethod
+    def _douyin_refresh_preserves_quality(
+        previous: dict[str, Any],
+        refreshed: dict[str, Any],
+    ) -> bool:
+        media_kind = previous.get("media_kind")
+        if media_kind != refreshed.get("media_kind"):
+            return False
+        if media_kind == "video":
+            if str(previous.get("video_uri") or "").strip() != str(
+                refreshed.get("video_uri") or ""
+            ).strip():
+                return False
+            previous_floor = quality_floor_dimensions(
+                [previous, *(previous.get("direct_candidates") or [])],
+                cap_full_hd=False,
+            )
+            refreshed_floor = quality_floor_dimensions(
+                [refreshed, *(refreshed.get("direct_candidates") or [])],
+                cap_full_hd=False,
+            )
+            if previous_floor is None or refreshed_floor is None:
+                return False
+            previous_short, previous_long = sorted(previous_floor)
+            refreshed_short, refreshed_long = sorted(refreshed_floor)
+            if (
+                refreshed_short < previous_short
+                or refreshed_long < previous_long
+            ):
+                return False
+            if (
+                refreshed_short > previous_short
+                or refreshed_long > previous_long
+            ):
+                return True
+
+            def codec_family(value: Any) -> str:
+                normalized = str(value or "").strip().lower()
+                if normalized in {"h265", "hevc", "bytevc1"}:
+                    return "hevc"
+                if normalized in {"h266", "vvc", "bytevc2"}:
+                    return "vvc"
+                return normalized
+
+            previous_candidates = previous.get("direct_candidates")
+            refreshed_candidates = refreshed.get("direct_candidates")
+            if not isinstance(previous_candidates, list) or not isinstance(
+                refreshed_candidates,
+                list,
+            ):
+                return False
+            for previous_candidate in previous_candidates:
+                if not isinstance(previous_candidate, dict):
+                    return False
+                try:
+                    previous_size = tuple(
+                        sorted(
+                            (
+                                int(previous_candidate.get("width") or 0),
+                                int(previous_candidate.get("height") or 0),
+                            )
+                        )
+                    )
+                    previous_bit_rate = int(
+                        previous_candidate.get("bit_rate") or 0
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    return False
+                previous_codec = codec_family(
+                    previous_candidate.get("codec_hint")
+                )
+                matched = False
+                for refreshed_candidate in refreshed_candidates:
+                    if not isinstance(refreshed_candidate, dict):
+                        continue
+                    try:
+                        refreshed_size = tuple(
+                            sorted(
+                                (
+                                    int(refreshed_candidate.get("width") or 0),
+                                    int(refreshed_candidate.get("height") or 0),
+                                )
+                            )
+                        )
+                        refreshed_bit_rate = int(
+                            refreshed_candidate.get("bit_rate") or 0
+                        )
+                    except (TypeError, ValueError, OverflowError):
+                        continue
+                    if refreshed_size[0] < previous_size[0] or (
+                        refreshed_size[1] < previous_size[1]
+                    ):
+                        continue
+                    if refreshed_size != previous_size:
+                        matched = True
+                        break
+                    if previous_codec and codec_family(
+                        refreshed_candidate.get("codec_hint")
+                    ) != previous_codec:
+                        continue
+                    if previous_bit_rate > 0 and (
+                        refreshed_bit_rate < previous_bit_rate
+                    ):
+                        continue
+                    matched = True
+                    break
+                if not matched:
+                    return False
+            return True
+        if media_kind != "image":
+            return False
+
+        def indexed_assets(values: Any) -> dict[int, dict[str, Any]] | None:
+            if values is None:
+                return {}
+            if not isinstance(values, list):
+                return None
+            result: dict[int, dict[str, Any]] = {}
+            for value in values:
+                if not isinstance(value, dict):
+                    return None
+                try:
+                    index = int(value.get("index") or 0)
+                    width = int(value.get("width") or 0)
+                    height = int(value.get("height") or 0)
+                except (TypeError, ValueError, OverflowError):
+                    return None
+                if index <= 0 or width <= 0 or height <= 0 or index in result:
+                    return None
+                result[index] = value
+            return result
+
+        previous_images = indexed_assets(previous.get("image_assets"))
+        refreshed_images = indexed_assets(refreshed.get("image_assets"))
+        if previous_images is None or refreshed_images is None:
+            return False
+        for index, previous_asset in previous_images.items():
+            refreshed_asset = refreshed_images.get(index)
+            if refreshed_asset is None:
+                return False
+            previous_size = tuple(
+                sorted((int(previous_asset["width"]), int(previous_asset["height"])))
+            )
+            refreshed_size = tuple(
+                sorted((int(refreshed_asset["width"]), int(refreshed_asset["height"])))
+            )
+            if (
+                refreshed_size[0] < previous_size[0]
+                or refreshed_size[1] < previous_size[1]
+            ):
+                return False
+
+        previous_live = indexed_assets(previous.get("live_photo_assets"))
+        refreshed_live = indexed_assets(refreshed.get("live_photo_assets"))
+        if previous_live is None or refreshed_live is None:
+            return False
+        for index, previous_asset in previous_live.items():
+            refreshed_asset = refreshed_live.get(index)
+            if refreshed_asset is None:
+                return False
+            if not DownloadManager._douyin_refresh_preserves_quality(
+                {
+                    "media_kind": "video",
+                    "video_uri": previous_asset.get("video_uri"),
+                    "minimum_width": previous_asset.get("width"),
+                    "minimum_height": previous_asset.get("height"),
+                    "direct_candidates": previous_asset.get("direct_candidates"),
+                },
+                {
+                    "media_kind": "video",
+                    "video_uri": refreshed_asset.get("video_uri"),
+                    "minimum_width": refreshed_asset.get("width"),
+                    "minimum_height": refreshed_asset.get("height"),
+                    "direct_candidates": refreshed_asset.get("direct_candidates"),
+                },
+            ):
+                return False
+        return True
 
     def _on_engine_event(self, job_id: str, item_id: str, event: EngineEvent) -> None:
         persist = event.event in {

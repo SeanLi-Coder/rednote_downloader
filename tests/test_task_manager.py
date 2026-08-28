@@ -8,12 +8,13 @@ import pytest
 from app.downloader import (
     DiscoveryResult,
     DownloadOutcome,
+    DownloaderConfig,
     EngineEvent,
-    safe_external_error_message,
 )
 from app.errors import (
     AuthenticationRequiredError,
     DiscoveryError,
+    DouyinMediaRefreshRequiredError,
     MediaDownloadError,
     TemporaryAccessError,
 )
@@ -4534,7 +4535,7 @@ def test_item_temporary_access_pauses_queue_and_retry_resumes_all(
         manager.shutdown()
 
 
-def test_douyin_profile_redirect_interrupts_queue_and_rediscovery_resumes(
+def test_douyin_profile_redirect_auto_refreshes_once_and_resumes_queue(
     monkeypatch,
     tmp_path,
 ) -> None:
@@ -4554,33 +4555,716 @@ def test_douyin_profile_redirect_interrupts_queue_and_rediscovery_resumes(
         "fingerprint: 0123456789ab; "
         "Redirect reason: unrecognized-host"
     )
-    redirect_error = safe_external_error_message(raw_redirect_error)
 
     class RedirectOnceEngine:
         def __init__(self) -> None:
+            self.config = DownloaderConfig(cookie_profile="Default")
             self.discovery_urls: list[str] = []
-            self.download_calls: list[str] = []
-            self.fail_first = True
+            self.download_calls: list[tuple[str, str]] = []
 
         def discover(self, url, platform, kind, *, should_cancel):
             self.discovery_urls.append(url)
+            items: list[DownloadItem] = []
+            for index, media_id in enumerate(media_ids, start=1):
+                metadata = complete_douyin_profile_metadata(
+                    profile_url,
+                    media_id,
+                    title=f"Initial video {index}",
+                )
+                video_uri = metadata["douyin_profile_media"]["video_uri"]
+                metadata["douyin_profile_media"]["direct_candidates"] = [
+                    douyin_direct_candidate(
+                        video_uri,
+                        url=(
+                            "https://v26-web.douyinvod.com/"
+                            f"initial-{media_id}.mp4"
+                        ),
+                    )
+                ]
+                items.append(
+                    DownloadItem(
+                        id=f"initial-{media_id}",
+                        media_id=media_id,
+                        source_url=f"https://www.douyin.com/video/{media_id}",
+                        title=f"Initial video {index}",
+                        author="Verified author",
+                        media_type=MediaType.VIDEO,
+                        metadata=metadata,
+                    )
+                )
+            return DiscoveryResult(
+                author="Verified author",
+                items=items,
+            )
+
+        def download_item(
+            self,
+            item,
+            platform,
+            output_dir,
+            *,
+            callback,
+            should_cancel,
+        ):
+            direct_url = item.metadata["douyin_profile_media"][
+                "direct_candidates"
+            ][0]["urls"][0]
+            self.download_calls.append((item.media_id, direct_url))
+            if (
+                item.media_id == media_ids[1]
+                and f"initial-{item.media_id}.mp4" in direct_url
+            ):
+                raise DouyinMediaRefreshRequiredError(raw_redirect_error)
+            output_path = Path(output_dir) / f"{item.media_id}.mp4"
+            output_path.write_bytes(item.media_id.encode())
+            return DownloadOutcome(
+                output_paths=[str(output_path)],
+                title=item.title,
+                upload_date="2025-11-14",
+                author="Verified author",
+                media_type=MediaType.VIDEO,
+                selected_format="douyin-api-1080x1920-1",
+                resolution="1080x1920",
+            )
+
+    refresh_calls: list[tuple[str, str, str | None]] = []
+
+    def refresh_profile_item(
+        profile_id,
+        media_id,
+        *,
+        cookie_profile,
+        prefer_exact_detail,
+        should_cancel,
+    ):
+        refresh_calls.append((profile_id, media_id, cookie_profile))
+        assert prefer_exact_detail is True
+        assert should_cancel() is False
+        metadata = complete_douyin_profile_metadata(
+            profile_url,
+            media_id,
+            title="Fresh video 2",
+        )["douyin_profile_media"]
+        video_uri = metadata["video_uri"]
+        metadata["direct_candidates"] = [
+            douyin_direct_candidate(
+                video_uri,
+                url=f"https://v26-web.douyinvod.com/fresh-{media_id}.mp4",
+            )
+        ]
+        return metadata
+
+    manager = DownloadManager(
+        state_dir=tmp_path / "state",
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    engine = RedirectOnceEngine()
+    monkeypatch.setattr(manager, "_engine_for_job", lambda job: engine)
+    monkeypatch.setattr(
+        "app.task_manager.discover_item_metadata_from_profile",
+        refresh_profile_item,
+    )
+
+    try:
+        created = manager.create_job(profile_url, auto_start=True)
+        completed = wait_for_job(manager, created.id)
+
+        assert completed.status == JobStatus.COMPLETED
+        assert all(item.status == ItemStatus.COMPLETED for item in completed.items)
+        assert engine.discovery_urls == [profile_url]
+        assert refresh_calls == [
+            (
+                profile_url.split("/user/", 1)[1],
+                media_ids[1],
+                "Default",
+            )
+        ]
+        assert engine.download_calls == [
+            (
+                media_ids[0],
+                f"https://v26-web.douyinvod.com/initial-{media_ids[0]}.mp4",
+            ),
+            (
+                media_ids[1],
+                f"https://v26-web.douyinvod.com/initial-{media_ids[1]}.mp4",
+            ),
+            (
+                media_ids[1],
+                f"https://v26-web.douyinvod.com/fresh-{media_ids[1]}.mp4",
+            ),
+            (
+                media_ids[2],
+                f"https://v26-web.douyinvod.com/initial-{media_ids[2]}.mp4",
+            ),
+        ]
+        assert completed.total_items == len(media_ids)
+        assert completed.completed_items == len(media_ids)
+        assert len({item.media_id for item in completed.items}) == len(media_ids)
+        assert [item.attempts for item in completed.items] == [1, 1, 1]
+        first_item = next(
+            item for item in completed.items if item.media_id == media_ids[0]
+        )
+        assert first_item.output_paths == [
+            str(Path(completed.output_dir) / f"{media_ids[0]}.mp4")
+        ]
+        assert first_item.title == "Initial video 1"
+        refreshed_item = next(
+            item for item in completed.items if item.media_id == media_ids[1]
+        )
+        assert refreshed_item.title == "Fresh video 2"
+        assert all(item.id.startswith("initial-") for item in completed.items)
+        assert completed.error is None
+        assert completed.auth_message is None
+        assert completed.verification_url is None
+
+        persisted = JsonJobStore(tmp_path / "state").get(created.id)
+        assert persisted.status == JobStatus.COMPLETED
+        assert persisted.total_items == len(media_ids)
+        assert len({item.media_id for item in persisted.items}) == len(media_ids)
+        persisted_json = persisted.model_dump_json()
+        for secret in (
+            "must-not-persist",
+            "private.mp4",
+            "127.0.0.1",
+            "token=",
+            "secret-token",
+            "user:",
+        ):
+            assert secret not in persisted_json
+    finally:
+        manager.shutdown()
+
+
+def test_douyin_profile_refresh_rejects_lower_detail_and_uses_feed_floor(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    profile_url = "https://www.douyin.com/user/verified-profile-owner"
+    media_id = "7677165606521581157"
+    initial_url = "https://v26-web.douyinvod.com/initial-1440.mp4"
+    detail_url = "https://v26-web.douyinvod.com/detail-1080.mp4"
+    feed_url = "https://v26-web.douyinvod.com/feed-1440.mp4"
+
+    class QualityFloorEngine:
+        def __init__(self) -> None:
+            self.config = DownloaderConfig(cookie_profile="Default")
+            self.download_calls: list[str] = []
+
+        def discover(self, url, platform, kind, *, should_cancel):
+            metadata = complete_douyin_profile_metadata(profile_url, media_id)
+            video_uri = metadata["douyin_profile_media"]["video_uri"]
+            metadata["douyin_profile_media"]["direct_candidates"] = [
+                douyin_direct_candidate(video_uri, url=initial_url)
+            ]
             return DiscoveryResult(
                 author="Verified author",
                 items=[
                     DownloadItem(
-                        id=f"item-{media_id}",
+                        id="stable-item",
                         media_id=media_id,
                         source_url=f"https://www.douyin.com/video/{media_id}",
-                        title=f"Video {index}",
+                        title="Verified video",
+                        author="Verified author",
+                        media_type=MediaType.VIDEO,
+                        metadata=metadata,
+                    )
+                ],
+            )
+
+        def download_item(
+            self,
+            item,
+            platform,
+            output_dir,
+            *,
+            callback,
+            should_cancel,
+        ):
+            direct_url = item.metadata["douyin_profile_media"][
+                "direct_candidates"
+            ][0]["urls"][0]
+            self.download_calls.append(direct_url)
+            if direct_url == initial_url:
+                raise DouyinMediaRefreshRequiredError(
+                    "Douyin media redirect could not be trusted"
+                )
+            assert direct_url == feed_url
+            output_path = Path(output_dir) / f"{media_id}.mp4"
+            output_path.write_bytes(b"verified-media")
+            return DownloadOutcome(
+                output_paths=[str(output_path)],
+                title=item.title,
+                author=item.author,
+                media_type=MediaType.VIDEO,
+                resolution="1440x2560",
+            )
+
+    refresh_modes: list[bool] = []
+
+    def refresh_profile_item(
+        profile_id,
+        target_media_id,
+        *,
+        cookie_profile,
+        prefer_exact_detail=False,
+        should_cancel,
+    ):
+        refresh_modes.append(prefer_exact_detail)
+        metadata = complete_douyin_profile_metadata(
+            profile_url,
+            target_media_id,
+        )["douyin_profile_media"]
+        metadata["title"] = "Untitled Douyin video"
+        video_uri = metadata["video_uri"]
+        if prefer_exact_detail:
+            metadata["minimum_width"] = 1080
+            metadata["minimum_height"] = 1920
+            metadata["direct_candidates"] = [
+                douyin_direct_candidate(
+                    video_uri,
+                    width=1080,
+                    height=1920,
+                    url=detail_url,
+                )
+            ]
+        else:
+            metadata["direct_candidates"] = [
+                douyin_direct_candidate(video_uri, url=feed_url)
+            ]
+        return metadata
+
+    manager = DownloadManager(
+        state_dir=tmp_path / "state",
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    engine = QualityFloorEngine()
+    monkeypatch.setattr(manager, "_engine_for_job", lambda job: engine)
+    monkeypatch.setattr(
+        "app.task_manager.discover_item_metadata_from_profile",
+        refresh_profile_item,
+    )
+
+    try:
+        created = manager.create_job(profile_url, auto_start=True)
+        completed = wait_for_job(manager, created.id)
+
+        assert completed.status == JobStatus.COMPLETED
+        assert refresh_modes == [True, False]
+        assert engine.download_calls == [initial_url, feed_url]
+        cached = completed.items[0].metadata["douyin_profile_media"]
+        assert cached["direct_candidates"][0]["width"] == 1440
+        assert completed.items[0].title == "Verified video"
+        assert detail_url not in completed.model_dump_json()
+    finally:
+        manager.shutdown()
+
+
+def test_douyin_profile_refresh_quality_guard_rejects_same_size_downgrade() -> None:
+    profile_url = "https://www.douyin.com/user/verified-profile-owner"
+    media_id = "7677165606521581157"
+    previous = complete_douyin_profile_metadata(
+        profile_url,
+        media_id,
+    )["douyin_profile_media"]
+    refreshed = complete_douyin_profile_metadata(
+        profile_url,
+        media_id,
+    )["douyin_profile_media"]
+
+    refreshed["direct_candidates"][0]["bit_rate"] = 10_000_000
+    assert not DownloadManager._douyin_refresh_preserves_quality(
+        previous,
+        refreshed,
+    )
+
+    refreshed["direct_candidates"][0]["bit_rate"] = 20_000_000
+    refreshed["direct_candidates"][0]["codec_hint"] = "h264"
+    assert not DownloadManager._douyin_refresh_preserves_quality(
+        previous,
+        refreshed,
+    )
+
+    refreshed["direct_candidates"][0]["codec_hint"] = "hevc"
+    assert DownloadManager._douyin_refresh_preserves_quality(
+        previous,
+        refreshed,
+    )
+
+
+def test_douyin_profile_refresh_quality_guard_checks_live_photo_bitrate() -> None:
+    video_uri = "v0200fg10000verifiedlivephoto"
+
+    def live_metadata(bit_rate: int) -> dict:
+        return {
+            "media_kind": "image",
+            "image_assets": [
+                {"index": 1, "width": 1440, "height": 2560}
+            ],
+            "live_photo_assets": [
+                {
+                    "index": 1,
+                    "width": 1080,
+                    "height": 1920,
+                    "video_uri": video_uri,
+                    "direct_candidates": [
+                        {
+                            "width": 1080,
+                            "height": 1920,
+                            "video_uri": video_uri,
+                            "bit_rate": bit_rate,
+                            "codec_hint": "hevc",
+                        }
+                    ],
+                }
+            ],
+        }
+
+    assert not DownloadManager._douyin_refresh_preserves_quality(
+        live_metadata(20_000_000),
+        live_metadata(10_000_000),
+    )
+    assert DownloadManager._douyin_refresh_preserves_quality(
+        live_metadata(20_000_000),
+        live_metadata(20_000_000),
+    )
+
+
+def test_douyin_profile_redirect_refresh_attempt_is_capped_at_one(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    profile_url = "https://www.douyin.com/user/verified-profile-owner"
+    media_ids = ["7677923079457231738", "7677554129950241521"]
+    redirect_error = (
+        "Douyin media redirect could not be trusted. The task was paused before "
+        "downloading later items. Redirect host fingerprint: 38c1b2b0b3d0; "
+        "Redirect port: 33443; Redirect reason: nonstandard-port"
+    )
+
+    class AlwaysRedirectEngine:
+        def __init__(self) -> None:
+            self.config = DownloaderConfig(cookie_profile="Default")
+            self.discovery_calls = 0
+            self.download_calls: list[tuple[str, str]] = []
+
+        def discover(self, url, platform, kind, *, should_cancel):
+            self.discovery_calls += 1
+            items: list[DownloadItem] = []
+            for media_id in media_ids:
+                metadata = complete_douyin_profile_metadata(profile_url, media_id)
+                video_uri = metadata["douyin_profile_media"]["video_uri"]
+                metadata["douyin_profile_media"]["direct_candidates"] = [
+                    douyin_direct_candidate(
+                        video_uri,
+                        url=(
+                            "https://v26-web.douyinvod.com/"
+                            f"revision-1-{media_id}.mp4"
+                        ),
+                    )
+                ]
+                items.append(
+                    DownloadItem(
+                        id=f"initial-{media_id}",
+                        media_id=media_id,
+                        source_url=f"https://www.douyin.com/video/{media_id}",
+                        title=f"Video {media_id}",
+                        author="Verified author",
+                        media_type=MediaType.VIDEO,
+                        metadata=metadata,
+                    )
+                )
+            return DiscoveryResult(author="Verified author", items=items)
+
+        def download_item(
+            self,
+            item,
+            platform,
+            output_dir,
+            *,
+            callback,
+            should_cancel,
+        ):
+            direct_url = item.metadata["douyin_profile_media"][
+                "direct_candidates"
+            ][0]["urls"][0]
+            self.download_calls.append((item.media_id, direct_url))
+            raise DouyinMediaRefreshRequiredError(redirect_error)
+
+    refresh_calls: list[str] = []
+
+    def refresh_profile_item(
+        profile_id,
+        media_id,
+        *,
+        cookie_profile,
+        prefer_exact_detail,
+        should_cancel,
+    ):
+        refresh_calls.append(media_id)
+        assert prefer_exact_detail is True
+        metadata = complete_douyin_profile_metadata(
+            profile_url,
+            media_id,
+        )["douyin_profile_media"]
+        video_uri = metadata["video_uri"]
+        metadata["direct_candidates"] = [
+            douyin_direct_candidate(
+                video_uri,
+                url=(
+                    "https://v26-web.douyinvod.com/"
+                    f"revision-2-{media_id}.mp4"
+                ),
+            )
+        ]
+        return metadata
+
+    manager = DownloadManager(
+        state_dir=tmp_path / "state",
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    engine = AlwaysRedirectEngine()
+    monkeypatch.setattr(manager, "_engine_for_job", lambda job: engine)
+    monkeypatch.setattr(
+        "app.task_manager.discover_item_metadata_from_profile",
+        refresh_profile_item,
+    )
+
+    try:
+        created = manager.create_job(profile_url, auto_start=True)
+        interrupted = wait_for_job(manager, created.id)
+
+        assert interrupted.status == JobStatus.INTERRUPTED
+        assert engine.discovery_calls == 1
+        assert refresh_calls == [media_ids[0]]
+        assert engine.download_calls == [
+            (
+                media_ids[0],
+                f"https://v26-web.douyinvod.com/revision-1-{media_ids[0]}.mp4",
+            ),
+            (
+                media_ids[0],
+                f"https://v26-web.douyinvod.com/revision-2-{media_ids[0]}.mp4",
+            ),
+        ]
+        assert [item.status for item in interrupted.items] == [
+            ItemStatus.FAILED,
+            ItemStatus.QUEUED,
+        ]
+        assert [item.attempts for item in interrupted.items] == [1, 0]
+        assert interrupted.active_item_id is None
+        assert interrupted.retryable is True
+    finally:
+        manager.shutdown()
+
+
+def test_douyin_profile_redirect_refresh_respects_disabled_chrome_cookie(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    profile_url = "https://www.douyin.com/user/verified-profile-owner"
+    media_id = "7677923079457231738"
+
+    class CookieDisabledEngine:
+        def __init__(self) -> None:
+            self.config = DownloaderConfig(
+                cookie_browser=None,
+                cookie_profile="Default",
+            )
+            self.download_calls = 0
+
+        def discover(self, url, platform, kind, *, should_cancel):
+            return DiscoveryResult(
+                author="Verified author",
+                items=[
+                    DownloadItem(
+                        id="initial-item",
+                        media_id=media_id,
+                        source_url=f"https://www.douyin.com/video/{media_id}",
+                        title="Verified video",
                         author="Verified author",
                         media_type=MediaType.VIDEO,
                         metadata=complete_douyin_profile_metadata(
                             profile_url,
                             media_id,
-                            title=f"Video {index}",
                         ),
                     )
-                    for index, media_id in enumerate(media_ids, start=1)
+                ],
+            )
+
+        def download_item(
+            self,
+            item,
+            platform,
+            output_dir,
+            *,
+            callback,
+            should_cancel,
+        ):
+            self.download_calls += 1
+            raise DouyinMediaRefreshRequiredError(
+                "Douyin media redirect could not be trusted"
+            )
+
+    refresh_called = False
+
+    def refresh_profile_item(*args, **kwargs):
+        nonlocal refresh_called
+        refresh_called = True
+        raise AssertionError("Chrome Cookie must remain disabled")
+
+    manager = DownloadManager(
+        state_dir=tmp_path / "state",
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    engine = CookieDisabledEngine()
+    monkeypatch.setattr(manager, "_engine_for_job", lambda job: engine)
+    monkeypatch.setattr(
+        "app.task_manager.discover_item_metadata_from_profile",
+        refresh_profile_item,
+    )
+
+    try:
+        created = manager.create_job(
+            profile_url,
+            auto_start=True,
+            cookie_browser=None,
+            cookie_profile="Default",
+        )
+        blocked = wait_for_job(manager, created.id)
+
+        assert blocked.status == JobStatus.INTERRUPTED
+        assert engine.download_calls == 1
+        assert refresh_called is False
+        assert "Chrome Cookie is disabled" in (blocked.error or "")
+        assert blocked.items[0].output_paths == []
+    finally:
+        manager.shutdown()
+
+
+def test_douyin_item_redirect_auto_refresh_replaces_stale_metadata(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    media_id = "7649279395044040154"
+    source_url = f"https://www.douyin.com/video/{media_id}"
+
+    class RefreshingItemEngine:
+        def __init__(self) -> None:
+            self.discovery_calls = 0
+            self.download_calls: list[str] = []
+
+        def discover(self, url, platform, kind, *, should_cancel):
+            self.discovery_calls += 1
+            fresh = self.discovery_calls > 1
+            video_uri = "fresh-video-uri" if fresh else "stale-video-uri"
+            metadata = complete_douyin_item_metadata(
+                source_url,
+                media_id,
+                video_uri=video_uri,
+            )
+            metadata["fresh_only" if fresh else "legacy_only"] = True
+            return DiscoveryResult(
+                author="Verified author",
+                items=[
+                    DownloadItem(
+                        id="fresh-item" if fresh else "stable-item",
+                        media_id=media_id,
+                        source_url=source_url,
+                        title="Fresh title" if fresh else "Stale title",
+                        author="Verified author",
+                        media_type=MediaType.VIDEO,
+                        metadata=metadata,
+                    )
+                ],
+            )
+
+        def download_item(
+            self,
+            item,
+            platform,
+            output_dir,
+            *,
+            callback,
+            should_cancel,
+        ):
+            video_uri = item.metadata["douyin_item_media"]["video_uri"]
+            self.download_calls.append(video_uri)
+            if video_uri == "stale-video-uri":
+                raise DouyinMediaRefreshRequiredError(
+                    "Douyin media redirect could not be trusted"
+                )
+            assert item.id == "stable-item"
+            assert item.metadata["fresh_only"] is True
+            assert "legacy_only" not in item.metadata
+            output_path = Path(output_dir) / f"{media_id}.mp4"
+            output_path.write_bytes(b"verified-media")
+            return DownloadOutcome(
+                output_paths=[str(output_path)],
+                title=item.title,
+                author=item.author,
+                media_type=MediaType.VIDEO,
+                resolution="1080x1920",
+            )
+
+    manager = DownloadManager(
+        state_dir=tmp_path / "state",
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    engine = RefreshingItemEngine()
+    monkeypatch.setattr(manager, "_engine_for_job", lambda job: engine)
+
+    try:
+        created = manager.create_job(source_url, auto_start=True)
+        completed = wait_for_job(manager, created.id)
+
+        assert completed.status == JobStatus.COMPLETED
+        assert engine.discovery_calls == 2
+        assert engine.download_calls == ["stale-video-uri", "fresh-video-uri"]
+        assert completed.items[0].id == "stable-item"
+        assert completed.items[0].title == "Fresh title"
+        assert completed.items[0].metadata["fresh_only"] is True
+        assert "legacy_only" not in completed.items[0].metadata
+    finally:
+        manager.shutdown()
+
+
+def test_douyin_profile_redirect_refresh_rejects_cross_wired_author(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    profile_url = "https://www.douyin.com/user/expected-profile-owner"
+    media_id = "7677923079457231738"
+    redirect_error = (
+        "Douyin media redirect could not be trusted. Redirect reason: "
+        "unrecognized-host"
+    )
+
+    class CrossWiredProfileEngine:
+        def __init__(self) -> None:
+            self.config = DownloaderConfig(cookie_profile="Default")
+            self.discovery_calls = 0
+            self.download_calls: list[str] = []
+
+        def discover(self, url, platform, kind, *, should_cancel):
+            self.discovery_calls += 1
+            metadata = complete_douyin_profile_metadata(profile_url, media_id)
+            return DiscoveryResult(
+                author="Expected author",
+                items=[
+                    DownloadItem(
+                        id="initial-item",
+                        media_id=media_id,
+                        source_url=f"https://www.douyin.com/video/{media_id}",
+                        title="Verified video",
+                        author="Expected author",
+                        media_type=MediaType.VIDEO,
+                        metadata=metadata,
+                    )
                 ],
             )
 
@@ -4594,81 +5278,128 @@ def test_douyin_profile_redirect_interrupts_queue_and_rediscovery_resumes(
             should_cancel,
         ):
             self.download_calls.append(item.media_id)
-            if item.media_id == media_ids[1] and self.fail_first:
-                self.fail_first = False
-                raise TemporaryAccessError(raw_redirect_error)
-            output_path = Path(output_dir) / f"{item.media_id}.mp4"
-            output_path.write_bytes(item.media_id.encode())
-            return DownloadOutcome(
-                output_paths=[str(output_path)],
-                title=item.title,
-                upload_date="2025-11-14",
-                author="Verified author",
-                media_type=MediaType.VIDEO,
-                selected_format="douyin-api-1080x1920-1",
-                resolution="1080x1920",
-            )
+            raise DouyinMediaRefreshRequiredError(redirect_error)
+
+    refresh_calls: list[str] = []
+
+    def cross_wired_profile_item(
+        profile_id,
+        target_media_id,
+        *,
+        cookie_profile,
+        prefer_exact_detail,
+        should_cancel,
+    ):
+        assert prefer_exact_detail is True
+        refresh_calls.append(target_media_id)
+        metadata = complete_douyin_profile_metadata(
+            profile_url,
+            target_media_id,
+        )["douyin_profile_media"]
+        metadata["owner_id"] = "different-profile-owner"
+        metadata["author"] = "Different author"
+        return metadata
 
     manager = DownloadManager(
         state_dir=tmp_path / "state",
         default_output_root=tmp_path / "downloads",
         max_workers=1,
     )
-    engine = RedirectOnceEngine()
+    engine = CrossWiredProfileEngine()
     monkeypatch.setattr(manager, "_engine_for_job", lambda job: engine)
+    monkeypatch.setattr(
+        "app.task_manager.discover_item_metadata_from_profile",
+        cross_wired_profile_item,
+    )
 
     try:
         created = manager.create_job(profile_url, auto_start=True)
-        interrupted = wait_for_job(manager, created.id)
+        blocked = wait_for_job(manager, created.id)
 
-        assert interrupted.status == JobStatus.INTERRUPTED
-        assert [item.status for item in interrupted.items] == [
-            ItemStatus.COMPLETED,
-            ItemStatus.FAILED,
-            ItemStatus.QUEUED,
-        ]
-        assert [item.attempts for item in interrupted.items] == [1, 1, 0]
-        assert engine.download_calls == media_ids[:2]
-        assert interrupted.error == redirect_error
-        assert interrupted.items[0].error is None
-        assert interrupted.items[1].error == redirect_error
-        assert interrupted.auth_message is None
-        assert interrupted.verification_url is None
-        assert all(item.auth_message is None for item in interrupted.items)
+        assert blocked.status == JobStatus.INTERRUPTED
+        assert engine.discovery_calls == 1
+        assert refresh_calls == [media_id]
+        assert engine.download_calls == [media_id]
+        assert blocked.completed_items == 0
+        assert all(not item.output_paths for item in blocked.items)
+        assert blocked.author == "Expected author"
+    finally:
+        manager.shutdown()
 
-        persisted = JsonJobStore(tmp_path / "state").get(created.id)
-        assert persisted.status == JobStatus.INTERRUPTED
-        assert persisted.error == redirect_error
-        assert persisted.items[0].status == ItemStatus.COMPLETED
-        assert persisted.items[2].status == ItemStatus.QUEUED
-        persisted_json = persisted.model_dump_json()
-        assert "Redirect reason: unrecognized-host" in persisted_json
-        for secret in (
-            "must-not-persist",
-            "private.mp4",
-            "127.0.0.1",
-            "token=",
-            "secret-token",
-            "user:",
+
+def test_douyin_item_redirect_refresh_rejects_different_media_id(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    expected_id = "7649279395044040154"
+    different_id = "7664225419386607205"
+    source_url = f"https://www.douyin.com/video/{expected_id}"
+    redirect_error = (
+        "Douyin media redirect could not be trusted. Redirect reason: "
+        "unrecognized-host"
+    )
+
+    class CrossWiredItemEngine:
+        def __init__(self) -> None:
+            self.discovery_calls = 0
+            self.download_calls: list[str] = []
+
+        def discover(self, url, platform, kind, *, should_cancel):
+            self.discovery_calls += 1
+            media_id = expected_id if self.discovery_calls == 1 else different_id
+            item_url = f"https://www.douyin.com/video/{media_id}"
+            return DiscoveryResult(
+                author=(
+                    "Expected author" if media_id == expected_id else "Wrong author"
+                ),
+                items=[
+                    DownloadItem(
+                        id=f"item-{media_id}",
+                        media_id=media_id,
+                        source_url=item_url,
+                        title=f"Video {media_id}",
+                        author=(
+                            "Expected author"
+                            if media_id == expected_id
+                            else "Wrong author"
+                        ),
+                        media_type=MediaType.VIDEO,
+                        metadata=complete_douyin_item_metadata(item_url, media_id),
+                    )
+                ],
+            )
+
+        def download_item(
+            self,
+            item,
+            platform,
+            output_dir,
+            *,
+            callback,
+            should_cancel,
         ):
-            assert secret not in persisted_json
+            self.download_calls.append(item.media_id)
+            raise DouyinMediaRefreshRequiredError(redirect_error)
 
-        manager.retry_failed(created.id)
-        completed = wait_for_job(manager, created.id)
+    manager = DownloadManager(
+        state_dir=tmp_path / "state",
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    engine = CrossWiredItemEngine()
+    monkeypatch.setattr(manager, "_engine_for_job", lambda job: engine)
 
-        assert completed.status == JobStatus.COMPLETED
-        assert all(item.status == ItemStatus.COMPLETED for item in completed.items)
-        assert engine.discovery_urls == [profile_url, profile_url]
-        assert engine.download_calls == [
-            media_ids[0],
-            media_ids[1],
-            media_ids[1],
-            media_ids[2],
-        ]
-        assert completed.items[0].attempts == 1
-        assert completed.error is None
-        assert completed.auth_message is None
-        assert completed.verification_url is None
+    try:
+        created = manager.create_job(source_url, auto_start=True)
+        blocked = wait_for_job(manager, created.id)
+
+        assert blocked.status in {JobStatus.FAILED, JobStatus.INTERRUPTED}
+        assert engine.discovery_calls == 2
+        assert engine.download_calls == [expected_id]
+        assert len(blocked.items) == 1
+        assert blocked.items[0].media_id == expected_id
+        assert blocked.items[0].output_paths == []
+        assert blocked.completed_items == 0
     finally:
         manager.shutdown()
 

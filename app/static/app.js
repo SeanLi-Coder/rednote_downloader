@@ -617,7 +617,7 @@
     const isDefaultProbe = /Probe details:\s*default:/i.test(text);
     const isAuthorFeedProbe = /Probe details:\s*author-feed-\d+:/i.test(text);
     const fallbackText = isDefaultProbe
-      ? "程序已自动尝试两个官方同画质入口，仍未完成验证。"
+      ? "程序已自动尝试四条官方同画质路由，仍未完成验证。"
       : isAuthorFeedProbe
         ? "程序已自动尝试该同档的作者直连镜像，仍未完成验证。"
         : phase === "原文件下载"
@@ -650,13 +650,16 @@
       const fingerprintText = diagnostic.fingerprint
         ? `，校验指纹：${diagnostic.fingerprint}`
         : "";
-      return `抖音${phase}地址使用了尚未验证的非标准 HTTPS 端口（${familyText}，${portText}${fingerprintText}）。程序在读取文件前已拦截，没有保存这个媒体响应；此前已完成的文件会保留，并暂停后续队列。仅凭这个结果无法判断是已失效的旧媒体地址、尚未确认的 CDN，还是代理或 VPN 改写。请从原主页或原视频链接继续或重试以刷新作品；若关闭代理后仍复现，只需反馈这里显示的域名族、端口或校验指纹，不要发送带签名的完整媒体链接，也不需要打开 Chrome 验证。`;
+      return `抖音${phase}地址使用了尚未验证的非标准 HTTPS 端口（${familyText}，${portText}${fingerprintText}）。${fallbackText}程序在读取文件前已拦截，没有保存这个媒体响应；此前已完成的文件会保留，并暂停后续队列。仅凭这个结果无法判断是已失效的旧媒体地址、尚未确认的 CDN，还是代理或 VPN 改写。当前版本会在任务执行时从原任务链接自动刷新当前作品一次；如果这是升级前保留的历史错误，请点击继续任务以执行刷新。刷新后仍出现时，再检查代理或 VPN 并稍后重试。只需反馈这里显示的域名族、端口或校验指纹，不要发送带签名的完整媒体链接，也不需要打开 Chrome 验证。`;
     }
     return `抖音${phase}的重定向地址未通过安全校验。原因：${diagnostic.reasonText}。程序在读取文件前已拦截，这个媒体响应没有保存；此前已完成的文件会保留，并暂停了后续队列。请检查代理或 VPN 是否改写了媒体地址，稍后从原链接重试，不需要打开 Chrome 验证。`;
   }
 
   function localizeRuntimeMessage(value, job = null) {
     let text = asText(value);
+    if (text.includes("Refreshing this Douyin item from the original task link")) {
+      return "检测到抖音媒体路由异常，正在从原任务链接只刷新当前作品并自动重试……";
+    }
     if (text.includes("Chrome cookies could not be read") && text.includes("Fully quit Chrome")) {
       return "无法读取 Chrome Cookie。请完全退出 Chrome（包括所有窗口）后直接重试，或关闭“自动读取 Chrome Cookie”后重新创建任务；这不是验证码，不需要打开验证页面。";
     }
@@ -718,6 +721,19 @@
     }
     if (text.includes("Douyin temporarily limited the verified author-feed request") || text.includes("Douyin temporarily limited a signed request")) {
       return "抖音作者接口正在短时限流，程序已自动退避重试，仍未恢复。请等待一两分钟后重试；程序没有改下低清版本，也不需要先打开作者主页验证。";
+    }
+    if (text.includes("Douyin automatic item refresh was skipped because Chrome Cookie is disabled")) {
+      return "检测到抖音媒体路由异常，但这个任务已关闭 Chrome Cookie，程序遵守该设置，没有读取 Chrome Cookie，也没有复用旧媒体地址。请开启 Chrome Cookie 后继续任务，以便只刷新当前作品。";
+    }
+    if (text.includes("Douyin automatic item refresh returned media below the previously verified quality floor")) {
+      return "抖音为当前作品返回了新的媒体地址，但其分辨率、编码或码率低于任务此前已验证的质量档。程序没有覆盖旧证据，也没有下载降档文件；请稍后继续任务。";
+    }
+    if (
+      text.includes("Douyin automatic item refresh") ||
+      text.includes("Douyin automatic media refresh") ||
+      text.includes("Douyin item identity changed during automatic media refresh")
+    ) {
+      return "抖音媒体路由异常后，程序已从原任务链接定向刷新当前作品，但新响应没有通过作品身份或完整性校验。旧媒体地址没有被复用，也没有下载低清或串号内容；请稍后继续任务，不需要打开 Chrome 验证。";
     }
     if (text.includes("Douyin media transfer was temporarily unavailable")) {
       return "抖音原文件传输遇到临时网络错误或限流。程序已保留完成的文件并暂停后续队列，避免整页连续失败；请稍等后点击继续任务，不需要打开其他作品或作者主页验证。";

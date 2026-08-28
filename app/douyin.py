@@ -12,7 +12,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 from yt_dlp.cookies import extract_cookies_from_browser
 
 from .browser import chrome_user_agent
-from .douyin_signing import fetch_signed_profile_awemes
+from .douyin_signing import fetch_signed_aweme_detail, fetch_signed_profile_awemes
 from .errors import (
     AuthenticationRequiredError,
     DiscoveryError,
@@ -740,6 +740,7 @@ def discover_item_metadata_from_profile(
     media_id: str,
     *,
     cookie_profile: str | None = None,
+    prefer_exact_detail: bool = False,
     should_cancel: Callable[[], bool] | None = None,
 ) -> dict[str, Any] | None:
     if not re.fullmatch(r"[A-Za-z0-9_-]{10,200}", profile_id):
@@ -747,6 +748,31 @@ def discover_item_metadata_from_profile(
     if not media_id.isdigit():
         return None
     profile_url = f"https://www.douyin.com/user/{profile_id}"
+    detail_error: Exception | None = None
+    if prefer_exact_detail:
+        try:
+            detail = fetch_signed_aweme_detail(
+                media_id,
+                verification_url=profile_url,
+                expected_sec_uid=profile_id,
+                cookie_profile=cookie_profile,
+                should_cancel=should_cancel,
+            )
+        except (AuthenticationRequiredError, DownloadCancelledError):
+            raise
+        except (DiscoveryError, TemporaryAccessError) as exc:
+            detail_error = exc
+        else:
+            parsed = _minimal_aweme_metadata(detail, profile_id)
+            if parsed and is_complete_profile_media_metadata(
+                parsed[1], media_id, profile_id
+            ):
+                return parsed[1]
+            detail_error = TemporaryAccessError(
+                "Douyin returned the requested item detail without complete, "
+                "verified media metadata."
+            )
+
     awemes = fetch_signed_profile_awemes(
         profile_url,
         profile_id,
@@ -766,6 +792,8 @@ def discover_item_metadata_from_profile(
                 "verified media metadata. Retry after a short wait."
             )
         return parsed[1]
+    if detail_error is not None:
+        raise detail_error
     return None
 
 

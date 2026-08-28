@@ -39,7 +39,7 @@ from app.douyin import DouyinProfile
 from app.errors import (
     AuthenticationRequiredError,
     DownloadCancelledError,
-    DiscoveryError,
+    DouyinMediaRefreshRequiredError,
     MediaDownloadError,
     TemporaryAccessError,
 )
@@ -2215,9 +2215,17 @@ def test_douyin_ratio_candidates_use_probed_resolution_not_requested_label(
         if value["width"] == 1440 and value["height"] == 2560
     )
     assert [
-        urlsplit(value).hostname
+        (
+            urlsplit(value).hostname,
+            parse_qs(urlsplit(value).query)["line"][0],
+        )
         for value in default_format["_douyin_probe_source_urls"]
-    ] == ["api-play-hl.amemv.com", "api-play.amemv.com"]
+    ] == [
+        ("api-play-hl.amemv.com", "0"),
+        ("api-play.amemv.com", "1"),
+        ("api-play.amemv.com", "0"),
+        ("api-play-hl.amemv.com", "1"),
+    ]
 
     with YoutubeDL(
         {"quiet": True, **engine._download_format_options(Platform.DOUYIN)}
@@ -2229,7 +2237,7 @@ def test_douyin_ratio_candidates_use_probed_resolution_not_requested_label(
     assert selected["vcodec"] == "h265"
 
 
-def test_douyin_default_probe_uses_second_official_origin_after_unknown_redirect(
+def test_douyin_default_probe_uses_independent_line_after_unknown_redirect(
     monkeypatch,
 ) -> None:
     engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
@@ -2238,9 +2246,12 @@ def test_douyin_default_probe_uses_second_official_origin_after_unknown_redirect
     def probe(ydl, url, **kwargs):
         del ydl, kwargs
         attempts.append(url)
-        if urlsplit(url).hostname == "api-play-hl.amemv.com":
+        if parse_qs(urlsplit(url).query)["line"] == ["0"]:
             raise _DouyinRedirectRejected(
-                "media endpoint redirected to an unrecognized Douyin CDN host"
+                "media endpoint redirected to an unrecognized Douyin CDN host",
+                redirect_host_fingerprint="38c1b2b0b3d0",
+                redirect_port=33443,
+                redirect_reason="nonstandard-port",
             )
         return {
             "url": "https://v5-dy-ov-experiment.zjcdn.com/default.mp4",
@@ -2266,17 +2277,22 @@ def test_douyin_default_probe_uses_second_official_origin_after_unknown_redirect
     )
 
     assert result and (result["width"], result["height"]) == (1080, 1920)
-    assert [urlsplit(value).hostname for value in attempts] == [
-        "api-play-hl.amemv.com",
-        "api-play.amemv.com",
+    assert [
+        (
+            urlsplit(value).hostname,
+            parse_qs(urlsplit(value).query)["line"][0],
+        )
+        for value in attempts
+    ] == [
+        ("api-play-hl.amemv.com", "0"),
+        ("api-play.amemv.com", "1"),
     ]
     first, second = map(urlsplit, attempts)
-    assert (first.scheme, first.path, first.query, first.fragment) == (
-        second.scheme,
-        second.path,
-        second.query,
-        second.fragment,
-    )
+    assert first.scheme == second.scheme == "https"
+    assert first.path == second.path == "/aweme/v1/play/"
+    assert parse_qs(first.query)["video_id"] == parse_qs(second.query)[
+        "video_id"
+    ]
 
 
 def test_douyin_default_probe_does_not_request_second_origin_after_success(
@@ -2304,6 +2320,135 @@ def test_douyin_default_probe_does_not_request_second_origin_after_success(
     assert [urlsplit(value).hostname for value in attempts] == [
         "api-play-hl.amemv.com"
     ]
+
+
+def test_douyin_default_probe_exhausts_four_routes_without_following_rejected_cdn(
+    monkeypatch,
+) -> None:
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    attempts: list[tuple[str, str]] = []
+
+    def reject(ydl, url, **kwargs):
+        del ydl, kwargs
+        parsed = urlsplit(url)
+        attempts.append(
+            (parsed.hostname or "", parse_qs(parsed.query)["line"][0])
+        )
+        raise _DouyinRedirectRejected(
+            "media endpoint redirected to an unrecognized Douyin CDN host",
+            redirect_host_fingerprint="38c1b2b0b3d0",
+            redirect_port=33443,
+            redirect_reason="nonstandard-port",
+        )
+
+    monkeypatch.setattr(engine, "_probe_douyin_ratio_with_retry", reject)
+
+    with pytest.raises(_DouyinRedirectRejected) as error:
+        engine._probe_douyin_default_with_fallback(
+            object(),
+            "v0200fg10000verifieddefault",
+            expected_duration=2.0,
+            callback=None,
+            should_cancel=lambda: False,
+        )
+
+    assert attempts == [
+        ("api-play-hl.amemv.com", "0"),
+        ("api-play.amemv.com", "1"),
+        ("api-play.amemv.com", "0"),
+        ("api-play-hl.amemv.com", "1"),
+    ]
+    assert error.value.redirect_port == 33443
+    assert error.value.redirect_host_fingerprint == "38c1b2b0b3d0"
+
+
+def test_douyin_default_probe_prefers_redirect_over_other_blocking_failures(
+    monkeypatch,
+) -> None:
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    attempts: list[str] = []
+
+    def fail(ydl, url, **kwargs):
+        del ydl, kwargs
+        attempts.append(url)
+        if len(attempts) == 1:
+            raise _DouyinProbeIntegrityChanged("media fingerprint changed")
+        if len(attempts) == 2:
+            raise _DouyinRedirectRejected(
+                "media endpoint redirected to an unrecognized Douyin CDN host",
+                redirect_host_fingerprint="38c1b2b0b3d0",
+                redirect_port=33443,
+                redirect_reason="nonstandard-port",
+            )
+        raise TimeoutError("route timed out")
+
+    monkeypatch.setattr(engine, "_probe_douyin_ratio_with_retry", fail)
+
+    with pytest.raises(_DouyinRedirectRejected) as error:
+        engine._probe_douyin_default_with_fallback(
+            object(),
+            "v0200fg10000verifieddefault",
+            expected_duration=2.0,
+            callback=None,
+            should_cancel=lambda: False,
+        )
+
+    assert len(attempts) == 4
+    assert error.value.redirect_port == 33443
+    assert error.value.redirect_host_fingerprint == "38c1b2b0b3d0"
+
+
+def test_douyin_author_feed_mixed_failures_still_require_target_refresh(
+    monkeypatch,
+) -> None:
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    info = _douyin_raw_info()
+    first_mirror = "https://v26-web.douyinvod.com/direct-1.mp4"
+    second_mirror = "https://v26-web.douyinvod.com/direct-2.mp4"
+    info["_douyin_direct_candidates"] = [
+        {
+            "width": 1440,
+            "height": 2560,
+            "bit_rate": 3_000_000,
+            "urls": [first_mirror, second_mirror],
+        }
+    ]
+
+    def probe(ydl, url, *, ratio, **kwargs):
+        del ydl, kwargs
+        if ratio.startswith("author-feed"):
+            if url == first_mirror:
+                raise _DouyinRedirectRejected(
+                    "media endpoint redirected to an unrecognized Douyin CDN host",
+                    redirect_host_fingerprint="38c1b2b0b3d0",
+                    redirect_port=33443,
+                    redirect_reason="nonstandard-port",
+                )
+            raise TimeoutError("later mirror timed out")
+        return {
+            "url": url,
+            "width": 1080,
+            "height": 1920,
+            "bit_rate": 2_000_000,
+            "filesize": 2_500_000,
+            "duration": 100.0,
+            "vcodec": "hevc",
+            "acodec": "aac",
+        }
+
+    monkeypatch.setattr(engine, "_probe_douyin_ratio_with_retry", probe)
+
+    with pytest.raises(
+        DouyinMediaRefreshRequiredError,
+        match="author-feed",
+    ):
+        engine._add_douyin_probe_formats(
+            object(),
+            info,
+            expected_id="1111111111111111111",
+            verification_url="https://www.douyin.com/video/1111111111111111111",
+            should_cancel=lambda: False,
+        )
 
 
 def test_douyin_equal_media_probes_merge_all_verified_transfer_sources(
@@ -4197,7 +4342,10 @@ def test_douyin_redirect_rejection_skips_internal_retries_and_pauses_upstream(
     assert engine._should_pause_douyin_probe_error(
         _DouyinRedirectRejected("rejected")
     )
-    with pytest.raises(TemporaryAccessError, match="task was paused"):
+    with pytest.raises(
+        DouyinMediaRefreshRequiredError,
+        match="task was paused",
+    ):
         engine._select_highest_douyin_live_photo_asset(
             object(),
             asset,
@@ -4205,11 +4353,70 @@ def test_douyin_redirect_rejection_skips_internal_retries_and_pauses_upstream(
             should_cancel=lambda: False,
         )
 
-    assert len(attempts) == 3
+    assert len(attempts) == 5
     assert attempts[0] == "https://v26-web.douyinvod.com/direct.mp4"
     assert "api-play-hl.amemv.com" in attempts[1]
     assert "api-play.amemv.com" in attempts[2]
     assert delays == []
+
+
+def test_douyin_live_photo_mixed_failures_still_require_target_refresh(
+    monkeypatch,
+) -> None:
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    first_mirror = "https://v26-web.douyinvod.com/live-1.mp4"
+    second_mirror = "https://v26-web.douyinvod.com/live-2.mp4"
+    asset = RemoteAsset(
+        candidates=[first_mirror, second_mirror],
+        index=1,
+        width=1440,
+        height=2560,
+        video_uri="v0200fg10000mixedlivephoto",
+        duration=2.0,
+        quality_candidates=[
+            {
+                "width": 1440,
+                "height": 2560,
+                "bit_rate": 3_000_000,
+                "urls": [first_mirror, second_mirror],
+            }
+        ],
+    )
+
+    def probe(ydl, url, *, ratio, **kwargs):
+        del ydl, kwargs
+        if ratio.startswith("author-feed"):
+            if url == first_mirror:
+                raise _DouyinRedirectRejected(
+                    "media endpoint redirected to an unrecognized Douyin CDN host",
+                    redirect_host_fingerprint="38c1b2b0b3d0",
+                    redirect_port=33443,
+                    redirect_reason="nonstandard-port",
+                )
+            raise TimeoutError("later mirror timed out")
+        return {
+            "url": url,
+            "width": 1080,
+            "height": 1920,
+            "bit_rate": 2_000_000,
+            "filesize": 2_500_000,
+            "duration": 2.0,
+            "vcodec": "hevc",
+            "acodec": "aac",
+        }
+
+    monkeypatch.setattr(engine, "_probe_douyin_ratio_with_retry", probe)
+
+    with pytest.raises(
+        DouyinMediaRefreshRequiredError,
+        match="author-feed",
+    ):
+        engine._select_highest_douyin_live_photo_asset(
+            object(),
+            asset,
+            callback=None,
+            should_cancel=lambda: False,
+        )
 
 
 def test_douyin_live_photo_tries_later_mirror_after_unrecognized_redirect(
@@ -4569,6 +4776,44 @@ def test_douyin_cached_direct_candidates_reuse_strict_asset_allowlist() -> None:
             ],
         }
     ]
+
+
+def test_douyin_cached_direct_candidates_prefer_refreshable_play_endpoint() -> None:
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    video_uri = "v0200fg10000verifiedfixture"
+    timestamped = (
+        "https://v26-web.douyinvod.com/original.mp4?dy_q=1787846400"
+    )
+    plain_cdn = "https://v11-web.douyinvod.com/original.mp4"
+    play_endpoint = (
+        "https://www.douyin.com/aweme/v1/play/"
+        f"?video_id={video_uri}&line=0&sign=verified"
+    )
+    cross_wired_play_endpoint = (
+        "https://www.douyin.com/aweme/v1/play/"
+        "?video_id=v0200fg10000differentfixture&line=0&sign=verified"
+    )
+
+    result = engine._douyin_direct_candidates_from_cache(
+        {
+            "video_uri": video_uri,
+            "direct_candidates": [
+                {
+                    "width": 1080,
+                    "height": 1920,
+                    "video_uri": video_uri,
+                    "urls": [
+                        timestamped,
+                        cross_wired_play_endpoint,
+                        plain_cdn,
+                        play_endpoint,
+                    ],
+                }
+            ],
+        }
+    )
+
+    assert result[0]["urls"] == [play_endpoint, plain_cdn, timestamped]
 
 
 def test_douyin_probe_failures_are_safe_and_actionable(monkeypatch) -> None:
@@ -6224,7 +6469,7 @@ def test_douyin_verified_transfer_blocks_untrusted_final_redirect(
     )
 
     with pytest.raises(
-        TemporaryAccessError,
+        DouyinMediaRefreshRequiredError,
         match="redirect could not be trusted",
     ) as error:
         engine.download_item(item, Platform.DOUYIN, tmp_path)
@@ -6267,7 +6512,7 @@ def test_douyin_verified_transfer_pauses_on_unknown_redirect_without_read_or_fil
     )
 
     with pytest.raises(
-        TemporaryAccessError,
+        DouyinMediaRefreshRequiredError,
         match="redirect could not be trusted",
     ) as error:
         engine.download_item(item, Platform.DOUYIN, tmp_path)

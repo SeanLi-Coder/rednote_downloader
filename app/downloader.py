@@ -45,6 +45,7 @@ from .douyin_signing import fetch_signed_aweme_detail
 from .errors import (
     AuthenticationRequiredError,
     DiscoveryError,
+    DouyinMediaRefreshRequiredError,
     DownloadCancelledError,
     MediaDownloadError,
     TemporaryAccessError,
@@ -64,6 +65,7 @@ DOUYIN_PROBE_RATIOS = ("default", "4k", "2k", "1080p", "720p")
 DOUYIN_PROBE_BYTES = 256 * 1024
 DOUYIN_DEFAULT_PROBE_HOST = "api-play-hl.amemv.com"
 DOUYIN_RATIO_PROBE_HOST = "api-play.amemv.com"
+DOUYIN_DEFAULT_ROUTE_LINES = ("0", "1")
 DOUYIN_PROBE_HTTP_TIMEOUT_SECONDS = 10.0
 DOUYIN_PROBE_ATTEMPTS = 3
 DOUYIN_PROBE_RETRY_BASE_SECONDS = 1.0
@@ -1682,18 +1684,41 @@ class MediaDownloader:
             if not (0 < width <= 16_384 and 0 < height <= 16_384):
                 continue
             urls: list[str] = []
-            for candidate_url in value.get("urls") or []:
+            raw_urls = value.get("urls")
+            if not isinstance(raw_urls, list):
+                continue
+            for candidate_url in raw_urls[:20]:
+                if not isinstance(candidate_url, str):
+                    continue
                 if not cls._is_trusted_douyin_asset_url(
                     candidate_url,
                     MediaType.VIDEO,
                 ):
                     continue
+                try:
+                    parsed_candidate = urlsplit(candidate_url)
+                    candidate_video_ids = parse_qs(
+                        parsed_candidate.query
+                    ).get("video_id")
+                except (TypeError, ValueError):
+                    continue
+                if (
+                    parsed_candidate.path.rstrip("/") == "/aweme/v1/play"
+                    and candidate_video_ids
+                    and candidate_video_ids != [expected_video_uri]
+                ):
+                    continue
                 if candidate_url not in urls:
                     urls.append(candidate_url)
-                if len(urls) >= 5:
-                    break
             if not urls:
                 continue
+            urls.sort(
+                key=lambda url: cls._douyin_direct_source_priority(
+                    url,
+                    expected_video_uri,
+                )
+            )
+            urls = urls[:5]
             candidate: dict[str, Any] = {
                 "width": width,
                 "height": height,
@@ -1706,6 +1731,30 @@ class MediaDownloader:
                 candidate["codec_hint"] = codec_hint
             result.append(candidate)
         return result
+
+    @classmethod
+    def _douyin_direct_source_priority(
+        cls,
+        value: str,
+        expected_video_uri: str,
+    ) -> tuple[int, int]:
+        try:
+            parsed = urlsplit(value)
+            query = parse_qs(parsed.query)
+        except (TypeError, ValueError):
+            return (3, 0)
+        is_play_endpoint = bool(
+            cls._is_trusted_douyin_asset_url(value, MediaType.VIDEO)
+            and parsed.path.rstrip("/") == "/aweme/v1/play"
+            and re.fullmatch(
+                r"[A-Za-z0-9_-]{10,200}",
+                str((query.get("video_id") or [""])[0]),
+            )
+            and query.get("video_id") == [expected_video_uri]
+        )
+        if is_play_endpoint:
+            return (0, 0)
+        return (2 if "dy_q" in query else 1, 0)
 
     @staticmethod
     def _raise_douyin_mismatch(
@@ -2067,6 +2116,7 @@ class MediaDownloader:
         ratio: str,
         *,
         hostname: str | None = None,
+        line: str = "0",
     ) -> str:
         hostname = hostname or (
             DOUYIN_DEFAULT_PROBE_HOST
@@ -2077,7 +2127,7 @@ class MediaDownloader:
             {
                 "video_id": video_uri,
                 "ratio": ratio,
-                "line": "0",
+                "line": line,
                 "is_play_url": "1",
                 "source": "PackSourceEnum_AWEME_DETAIL",
             }
@@ -2091,10 +2141,13 @@ class MediaDownloader:
                 video_uri,
                 "default",
                 hostname=hostname,
+                line=line,
             )
-            for hostname in (
-                DOUYIN_DEFAULT_PROBE_HOST,
-                DOUYIN_RATIO_PROBE_HOST,
+            for hostname, line in (
+                (DOUYIN_DEFAULT_PROBE_HOST, DOUYIN_DEFAULT_ROUTE_LINES[0]),
+                (DOUYIN_RATIO_PROBE_HOST, DOUYIN_DEFAULT_ROUTE_LINES[1]),
+                (DOUYIN_RATIO_PROBE_HOST, DOUYIN_DEFAULT_ROUTE_LINES[0]),
+                (DOUYIN_DEFAULT_PROBE_HOST, DOUYIN_DEFAULT_ROUTE_LINES[1]),
             )
         ]
 
@@ -2134,18 +2187,22 @@ class MediaDownloader:
                 (
                     failure
                     for failure in failures
-                    if isinstance(
-                        failure,
-                        (_DouyinRedirectRejected, _DouyinProbeIntegrityChanged),
-                    )
+                    if isinstance(failure, _DouyinRedirectRejected)
                 ),
                 next(
                     (
                         failure
                         for failure in failures
-                        if self._should_pause_douyin_probe_error(failure)
+                        if isinstance(failure, _DouyinProbeIntegrityChanged)
                     ),
-                    failures[-1],
+                    next(
+                        (
+                            failure
+                            for failure in failures
+                            if self._should_pause_douyin_probe_error(failure)
+                        ),
+                        failures[-1],
+                    ),
                 ),
             )
             raise blocking
@@ -2283,7 +2340,7 @@ class MediaDownloader:
                 (
                     candidate,
                     label,
-                    errors[-1][0] if errors else "no media URL was available",
+                    self._preferred_douyin_probe_failure(errors),
                     any(transient for _, transient in errors),
                 )
             )
@@ -2312,7 +2369,12 @@ class MediaDownloader:
         except Exception as exc:
             reason = self._safe_douyin_probe_failure(exc)
             if self._should_pause_douyin_probe_error(exc):
-                raise TemporaryAccessError(
+                error_type = (
+                    DouyinMediaRefreshRequiredError
+                    if isinstance(exc, _DouyinRedirectRejected)
+                    else TemporaryAccessError
+                )
+                raise error_type(
                     "Douyin authoritative default quality source was temporarily "
                     "unavailable after automatic retries. The task was paused before "
                     "probing later items; wait briefly and continue the task. No "
@@ -2336,7 +2398,15 @@ class MediaDownloader:
                 [(label, reason) for label, reason, _ in unresolved_direct]
             )
             if any(transient for _, _, transient in unresolved_direct):
-                raise TemporaryAccessError(
+                error_type = (
+                    DouyinMediaRefreshRequiredError
+                    if any(
+                        self._douyin_probe_failure_requires_refresh(reason)
+                        for _, reason, _ in unresolved_direct
+                    )
+                    else TemporaryAccessError
+                )
+                raise error_type(
                     "Douyin authoritative author-feed quality source was temporarily "
                     "unavailable after automatic retries. The task was paused before "
                     "probing later items; wait briefly and continue the task. No "
@@ -2597,6 +2667,26 @@ class MediaDownloader:
         ):
             return "media endpoint returned an HTTP error"
         return f"media probe failed ({type(exc).__name__})"
+
+    @staticmethod
+    def _douyin_probe_failure_requires_refresh(reason: str) -> bool:
+        return any(marker in reason for marker in _DOUYIN_REDIRECT_ERROR_MARKERS)
+
+    @classmethod
+    def _preferred_douyin_probe_failure(
+        cls,
+        errors: list[tuple[str, bool]],
+    ) -> str:
+        if not errors:
+            return "no media URL was available"
+        return next(
+            (
+                reason
+                for reason, _ in errors
+                if cls._douyin_probe_failure_requires_refresh(reason)
+            ),
+            errors[-1][0],
+        )
 
     @staticmethod
     def _summarize_douyin_probe_failures(
@@ -3848,12 +3938,11 @@ class MediaDownloader:
                 direct_probes.append(direct_probe)
                 continue
 
-            reason = errors[-1][0] if errors else "no media URL was available"
             direct_failures.append(
                 (
                     rendition,
                     label,
-                    reason,
+                    self._preferred_douyin_probe_failure(errors),
                     any(transient for _, transient in errors),
                 )
             )
@@ -3883,7 +3972,12 @@ class MediaDownloader:
         except Exception as exc:
             reason = self._safe_douyin_probe_failure(exc)
             if self._should_pause_douyin_probe_error(exc):
-                raise TemporaryAccessError(
+                error_type = (
+                    DouyinMediaRefreshRequiredError
+                    if isinstance(exc, _DouyinRedirectRejected)
+                    else TemporaryAccessError
+                )
+                raise error_type(
                     "Douyin Live Photo authoritative quality source was temporarily "
                     "unavailable after automatic retries. The task was paused before "
                     "probing later items; wait briefly and continue the task. No "
@@ -3911,7 +4005,15 @@ class MediaDownloader:
                 [(label, reason) for label, reason, _ in unresolved]
             )
             if any(transient for _, _, transient in unresolved):
-                raise TemporaryAccessError(
+                error_type = (
+                    DouyinMediaRefreshRequiredError
+                    if any(
+                        self._douyin_probe_failure_requires_refresh(reason)
+                        for _, reason, _ in unresolved
+                    )
+                    else TemporaryAccessError
+                )
+                raise error_type(
                     "Douyin Live Photo authoritative quality source was temporarily "
                     "unavailable after automatic retries. The task was paused before "
                     "probing later items; wait briefly and continue the task. No "
@@ -4605,7 +4707,7 @@ class MediaDownloader:
                         except DownloadCancelled as exc:
                             raise DownloadCancelledError("Task cancelled") from exc
                         except _DouyinRedirectRejected as exc:
-                            raise TemporaryAccessError(
+                            raise DouyinMediaRefreshRequiredError(
                                 "Douyin media redirect could not be trusted. The task "
                                 "was paused before downloading later items. Redirect "
                                 f"host: {exc.redirect_host or 'unavailable'}; Redirect "
@@ -4639,7 +4741,7 @@ class MediaDownloader:
                             final_url,
                             redirect_reason,
                         )
-                        raise TemporaryAccessError(
+                        raise DouyinMediaRefreshRequiredError(
                             "Douyin media redirect could not be trusted. The task was "
                             "paused before downloading later items. Redirect host: "
                             f"{redirect_error.redirect_host or 'unavailable'}; "
