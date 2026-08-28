@@ -316,6 +316,18 @@ pytest
 - 单实例端口占用、前后端 build 一致性，以及旧抖音数字队列从可信原主页安全迁移
 - 启动器、依赖安装守护、后端和子进程树在正常停止、父进程消失、`SIGKILL` 与卡死关闭时的端口和锁回收
 
+### 独立机器真实下载 smoke test
+
+普通 `pytest` 不访问外部网站，因此它只能证明各平台逻辑在 macOS、Linux 和 Windows 上兼容，不能证明某个时刻的抖音真实媒体入口在另一台机器也可用。仓库另有 `Portable Douyin live smoke` workflow：它在 GitHub 托管的全新 macOS 与 Ubuntu runner 上，不读取 Chrome Cookie、不使用仓库 secret，直接调用生产 `MediaDownloader` 下载两个固定公开样本，并验证 1080×1920 与 1440×2560 最高档、完整文件、独立 FFprobe 时长、只产生一个目标文件且没有 `.parts` 残留。每次还会记录实际 codec、大小和 SHA-256，便于比较不同地区的 CDN 响应；这些易随平台重新封装而变化的值只用于诊断，不作为错误的固定白名单。
+
+该 smoke test 有意从已经公开且绑定作者、作品 ID 的稳定 `video_uri` 开始，所以覆盖真实官方入口、CDN 安全跳转、最高画质探测、完整传输和落盘校验，但不冒充 Chrome Cookie、签名发现或 CAPTCHA 测试。后面三项必须使用运行工具那台机器自己的 Chrome 状态；项目不会为了 CI 导出用户 Cookie，也不会放宽空 Cookie 的认证要求。GitHub 数据中心 IP 若被抖音临时限流，workflow 会如实失败，而不是改下低清文件。
+
+本机也可以运行同一条无 Cookie 测试：
+
+```bash
+python scripts/douyin_portable_live_smoke.py --report portable-live-report.json
+```
+
 ## 隐私、安全与免责声明
 
 - 服务默认只监听本机回环地址，媒体和任务数据不经过第三方中转服务器。
