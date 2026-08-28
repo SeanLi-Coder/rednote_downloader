@@ -93,6 +93,22 @@ def matching_launcher_health(record: LauncherRecord) -> dict[str, Any]:
     }
 
 
+def test_main_uses_the_new_default_port(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_stop_backend(**kwargs):
+        captured.update(kwargs)
+        return "not_running"
+
+    monkeypatch.setattr(stop, "stop_backend", fake_stop_backend)
+
+    assert stop.main(["--runtime-dir", str(tmp_path)]) == 0
+    assert captured["port"] == stop.DEFAULT_SERVER_PORT == 8766
+
+
 def test_tokenized_runtime_record_stops_only_matching_instance(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -192,7 +208,10 @@ def test_invalid_record_never_falls_back_to_pid_signaling(
 ) -> None:
     runtime_dir = tmp_path / "runtime"
     runtime_dir.mkdir()
-    (runtime_dir / "runtime-8765.json").write_text("not json", encoding="utf-8")
+    (runtime_dir / f"runtime-{stop.DEFAULT_SERVER_PORT}.json").write_text(
+        "not json",
+        encoding="utf-8",
+    )
     monkeypatch.setattr(
         stop,
         "_stop_legacy_macos_backend",
@@ -569,6 +588,7 @@ def test_macos_legacy_fallback_signals_only_twice_verified_pid(
 
     assert (
         stop.stop_backend(
+            port=stop.LEGACY_PORT,
             runtime_dir=tmp_path / "missing-runtime",
             platform_name="darwin",
         )
@@ -644,6 +664,7 @@ def test_macos_legacy_fallback_refuses_any_failed_identity_check(
 
     with pytest.raises(stop.StopRefusedError):
         stop.stop_backend(
+            port=stop.LEGACY_PORT,
             runtime_dir=tmp_path / "missing-runtime",
             platform_name="darwin",
         )
@@ -688,12 +709,13 @@ def test_legacy_fallback_rechecks_identity_immediately_before_signal(
 
     with pytest.raises(stop.StopRefusedError, match="changed during verification"):
         stop.stop_backend(
+            port=stop.LEGACY_PORT,
             runtime_dir=tmp_path / "missing-runtime",
             platform_name="darwin",
         )
 
 
-def test_legacy_fallback_is_limited_to_macos_default_port(
+def test_legacy_fallback_is_limited_to_macos_legacy_port(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -713,7 +735,7 @@ def test_legacy_fallback_is_limited_to_macos_default_port(
             runtime_dir=tmp_path / "missing-runtime",
             platform_name="linux",
         )
-    with pytest.raises(stop.StopRefusedError, match="default localhost port 8765"):
+    with pytest.raises(stop.StopRefusedError, match="legacy localhost port 8765"):
         stop.stop_backend(
             port=18_765,
             runtime_dir=tmp_path / "missing-runtime",

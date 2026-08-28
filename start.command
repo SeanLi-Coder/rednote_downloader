@@ -31,7 +31,7 @@ if ! /usr/bin/open -Ra "Google Chrome" >/dev/null 2>&1; then
   echo "Warning: Google Chrome was not found. Cookie access and verification cannot work until it is installed."
 fi
 
-echo "Starting Original Media Downloader at http://127.0.0.1:8765"
+echo "Starting Original Media Downloader at http://127.0.0.1:8766"
 launcher_pid=""
 shutdown_requested=0
 

@@ -23,6 +23,7 @@ from app.browser import open_chrome
 from app.build_info import APP_ID, APP_VERSION, BUILD_ID
 from app.runtime import (
     DEFAULT_RUNTIME_DIR,
+    DEFAULT_SERVER_PORT,
     ENV_INSTANCE_ID,
     ENV_PROJECT_LOCK_FD,
     ENV_RUNTIME_DIR,
@@ -356,7 +357,7 @@ def _graceful_signal_handlers(server: uvicorn.Server) -> Iterator[None]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Start the media downloader web app")
-    parser.add_argument("--port", default=8765, type=int)
+    parser.add_argument("--port", default=DEFAULT_SERVER_PORT, type=int)
     parser.add_argument("--no-browser", action="store_true")
     parser.add_argument("--exit-with-parent", type=int)
     parser.add_argument(

@@ -24,6 +24,7 @@ from app.launcher_control import (
     remove_launcher_record,
 )
 from app.runtime import (
+    DEFAULT_SERVER_PORT,
     STOP_TOKEN_HEADER,
     InvalidRuntimeRecordError,
     RuntimeRecord,
@@ -536,7 +537,7 @@ def _stop_legacy_macos_backend(
 ) -> str:
     if port != LEGACY_PORT:
         raise StopRefusedError(
-            "Legacy fallback is only allowed for the default localhost port 8765."
+            "Legacy fallback is only allowed for the legacy localhost port 8765."
         )
     request_timeout = min(2.0, max(0.1, timeout))
     first = _inspect_legacy_macos_backend(
@@ -572,7 +573,7 @@ def _stop_legacy_macos_backend(
     remaining = _macos_listener_pids(port)
     if remaining:
         raise StopRefusedError(
-            "The verified legacy backend exited, but another process now owns port 8765."
+            "The verified legacy backend exited, but another process now owns legacy port 8765."
         )
     return "stopped"
 
@@ -606,7 +607,7 @@ def _stop_launcher(
 
 def stop_backend(
     *,
-    port: int = LEGACY_PORT,
+    port: int = DEFAULT_SERVER_PORT,
     runtime_dir: str | Path = DEFAULT_RUNTIME_DIR,
     timeout: float = DEFAULT_STOP_TIMEOUT_SECONDS,
     project_root: Path = PROJECT_ROOT,
@@ -758,7 +759,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Safely stop Original Media Downloader"
     )
-    parser.add_argument("--port", default=LEGACY_PORT, type=_port_argument)
+    parser.add_argument("--port", default=DEFAULT_SERVER_PORT, type=_port_argument)
     parser.add_argument(
         "--runtime-dir",
         default=str(DEFAULT_RUNTIME_DIR),

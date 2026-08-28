@@ -22,6 +22,7 @@ ENV_PROJECT_LOCK_FD = "OMD_PROJECT_LOCK_FD"
 ENV_RUNTIME_DIR = "OMD_RUNTIME_DIR"
 
 STOP_TOKEN_HEADER = "X-Original-Media-Stop-Token"
+DEFAULT_SERVER_PORT = 8766
 DEFAULT_RUNTIME_DIR = PROJECT_ROOT / "data" / "runtime"
 DEFAULT_PROJECT_LOCK_PATH = DEFAULT_RUNTIME_DIR / "project.lock"
 RUNTIME_RECORD_MAX_BYTES = 64 * 1024
@@ -29,7 +30,7 @@ RUNTIME_STOP_EVENT = threading.Event()
 _RUNTIME_IDENTITY_LOCK = threading.Lock()
 _runtime_instance_id = "unmanaged"
 _runtime_stop_token = ""
-_runtime_server_port = 8765
+_runtime_server_port = DEFAULT_SERVER_PORT
 
 _WINDOWS_ERROR_ALREADY_EXISTS = 183
 _WINDOWS_HANDLE_FLAG_INHERIT = 0x00000001
@@ -101,7 +102,7 @@ def clear_runtime_identity(*, instance_id: str) -> bool:
             return False
         _runtime_instance_id = "unmanaged"
         _runtime_stop_token = ""
-        _runtime_server_port = 8765
+        _runtime_server_port = DEFAULT_SERVER_PORT
         RUNTIME_STOP_EVENT.clear()
         return True
 

@@ -21,6 +21,7 @@ from app.launcher_control import LauncherControl, LauncherControlError
 from app.process_guard import stop_process_group
 from app.runtime import (
     DEFAULT_RUNTIME_DIR,
+    DEFAULT_SERVER_PORT,
     ENV_INSTANCE_ID,
     ENV_PROJECT_LOCK_FD,
     ENV_RUNTIME_DIR,
@@ -839,7 +840,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Prepare and supervise the Original Media Downloader"
     )
-    parser.add_argument("--port", default=8765, type=_port)
+    parser.add_argument("--port", default=DEFAULT_SERVER_PORT, type=_port)
     parser.add_argument("--no-browser", action="store_true")
     parser.add_argument("--parent-pid", type=_positive_pid)
     parser.add_argument(

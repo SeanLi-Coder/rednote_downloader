@@ -9,6 +9,7 @@ import pytest
 
 import run
 from app.build_info import APP_ID, APP_VERSION, BUILD_ID
+from app.runtime import DEFAULT_SERVER_PORT
 
 
 @pytest.fixture(autouse=True)
@@ -49,6 +50,27 @@ def test_launcher_parent_uses_stable_monitor_on_windows(monkeypatch) -> None:
     )
 
     assert run._launcher_parent_matches(12_345, platform_name="nt") is True
+
+
+def test_main_uses_the_shared_default_port(monkeypatch, tmp_path) -> None:
+    captured: list[int] = []
+
+    def reject_bind(port: int):
+        captured.append(port)
+        raise OSError("test occupied port")
+
+    monkeypatch.setattr(run, "_bind_listener", reject_bind)
+    monkeypatch.setattr(
+        run,
+        "_handle_occupied_port",
+        lambda port, *, no_browser: 0,
+    )
+
+    assert (
+        run.main(["--runtime-dir", str(tmp_path / "runtime"), "--no-browser"])
+        == 0
+    )
+    assert captured == [DEFAULT_SERVER_PORT]
 
 
 def test_occupied_old_backend_never_opens_browser(monkeypatch, tmp_path) -> None:

@@ -27,7 +27,7 @@ if errorlevel 1 echo Warning: FFmpeg was not found. Split video/audio downloads 
 where ffprobe >nul 2>nul
 if errorlevel 1 echo Warning: FFprobe was not found. Douyin and Xiaohongshu video quality verification will fail.
 
-echo Starting Original Media Downloader at http://127.0.0.1:8765
+echo Starting Original Media Downloader at http://127.0.0.1:8766
 %PYTHON_CMD% launcher.py
 if errorlevel 1 goto :run_error
 exit /b 0

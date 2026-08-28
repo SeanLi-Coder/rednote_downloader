@@ -7,7 +7,9 @@ from pathlib import Path
 
 import pytest
 
+from app.build_info import PROJECT_ROOT
 from app.runtime import (
+    DEFAULT_SERVER_PORT,
     ENV_INSTANCE_ID,
     ENV_PROJECT_LOCK_FD,
     ENV_RUNTIME_DIR,
@@ -45,6 +47,17 @@ def test_environment_variable_names_are_stable() -> None:
     assert ENV_SERVER_PORT == "OMD_SERVER_PORT"
     assert ENV_PROJECT_LOCK_FD == "OMD_PROJECT_LOCK_FD"
     assert ENV_RUNTIME_DIR == "OMD_RUNTIME_DIR"
+
+
+def test_default_server_port_avoids_the_legacy_port() -> None:
+    assert DEFAULT_SERVER_PORT == 8766
+
+
+@pytest.mark.parametrize("path", ["start.command", "start.sh", "start.bat"])
+def test_launch_scripts_advertise_the_shared_default_port(path: str) -> None:
+    script = (PROJECT_ROOT / path).read_text(encoding="utf-8")
+
+    assert f"http://127.0.0.1:{DEFAULT_SERVER_PORT}" in script
 
 
 def test_project_lock_is_exclusive_and_stale_file_is_harmless(tmp_path) -> None:

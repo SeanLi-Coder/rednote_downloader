@@ -26,5 +26,5 @@ if ! command -v google-chrome >/dev/null 2>&1 \
   echo "Warning: Google Chrome was not found. Chromium may open the UI, but Chrome Cookie access and profile discovery require Google Chrome."
 fi
 
-echo "Starting Original Media Downloader at http://127.0.0.1:8765"
+echo "Starting Original Media Downloader at http://127.0.0.1:8766"
 exec python3 launcher.py

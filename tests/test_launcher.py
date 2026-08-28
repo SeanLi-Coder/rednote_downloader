@@ -12,6 +12,7 @@ import pytest
 
 import launcher
 from app.runtime import (
+    DEFAULT_SERVER_PORT,
     ENV_INSTANCE_ID,
     ENV_PROJECT_LOCK_FD,
     ENV_RUNTIME_DIR,
@@ -457,6 +458,30 @@ def test_main_honors_explicit_parent_pid(monkeypatch, tmp_path) -> None:
     assert captured["initial_parent_pid"] == 54321
     assert captured["port"] == 18765
     assert captured["no_browser"] is True
+
+
+def test_main_uses_the_shared_default_port(monkeypatch, tmp_path) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_launch(**kwargs):
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(launcher, "_launch", fake_launch)
+
+    assert (
+        launcher.main(
+            [
+                "--parent-pid",
+                "54321",
+                "--runtime-dir",
+                str(tmp_path),
+                "--no-browser",
+            ]
+        )
+        == 0
+    )
+    assert captured["port"] == DEFAULT_SERVER_PORT
 
 
 @pytest.mark.skipif(os.name == "nt", reason="tests POSIX process-group cleanup")
