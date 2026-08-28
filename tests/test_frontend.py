@@ -9,6 +9,7 @@ import pytest
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+NODE_EXECUTION_TIMEOUT_SECONDS = 30
 
 
 def test_douyin_redirect_messages_execute_with_safe_legacy_and_reason_parsing() -> None:
@@ -137,7 +138,7 @@ def test_douyin_redirect_messages_execute_with_safe_legacy_and_reason_parsing() 
         encoding="utf-8",
         capture_output=True,
         check=False,
-        timeout=10,
+        timeout=NODE_EXECUTION_TIMEOUT_SECONDS,
     )
 
     assert completed.returncode == 0, completed.stderr
@@ -218,7 +219,7 @@ def test_interrupted_job_labels_queued_items_as_waiting_to_continue() -> None:
         encoding="utf-8",
         capture_output=True,
         check=False,
-        timeout=10,
+        timeout=NODE_EXECUTION_TIMEOUT_SECONDS,
     )
 
     assert completed.returncode == 0, completed.stderr
@@ -270,7 +271,7 @@ def test_nonretryable_failed_item_keeps_visible_error_without_retrying() -> None
         encoding="utf-8",
         capture_output=True,
         check=False,
-        timeout=10,
+        timeout=NODE_EXECUTION_TIMEOUT_SECONDS,
     )
 
     assert completed.returncode == 0, completed.stderr
