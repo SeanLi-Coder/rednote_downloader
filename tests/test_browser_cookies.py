@@ -298,7 +298,9 @@ def test_profile_cookie_probe_tries_older_database_when_newer_one_is_unreadable(
 def test_profile_cookie_probe_encodes_special_characters_in_database_path(
     tmp_path: Path,
 ) -> None:
-    user_data = tmp_path / "chrome # question? data"
+    # Keep the path valid on Windows while still exercising URI-reserved
+    # characters that must be percent-encoded for SQLite's read-only URI.
+    user_data = tmp_path / "chrome # percent% data"
     _write_chrome_cookie_database(
         user_data,
         "Profile 1",
@@ -317,10 +319,13 @@ def test_profile_cookie_probe_encodes_special_characters_in_database_path(
 
 def test_open_chrome_uses_the_bound_profile_directory_on_macos(monkeypatch) -> None:
     commands: list[list[str]] = []
+    chrome_executable = Path(
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    )
     monkeypatch.setattr("app.browser.sys.platform", "darwin")
     monkeypatch.setattr(
         "app.browser._macos_chrome_executable",
-        lambda: Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+        lambda: chrome_executable,
     )
     monkeypatch.setattr(
         "app.browser.subprocess.Popen",
@@ -331,7 +336,7 @@ def test_open_chrome_uses_the_bound_profile_directory_on_macos(monkeypatch) -> N
 
     assert commands == [
         [
-            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            str(chrome_executable),
             "--profile-directory=Profile 1",
             "https://www.xiaohongshu.com/explore/abc123",
         ]
