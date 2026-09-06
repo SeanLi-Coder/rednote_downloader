@@ -1194,12 +1194,23 @@ def _video_assets(note: dict[str, Any]) -> list[RemoteAsset]:
 def _live_photo_asset(image: dict[str, Any], index: int) -> RemoteAsset | None:
     candidates: list[tuple[tuple[int, int, int], RemoteAsset]] = []
     for data in _walk_dicts(image.get("stream") or {}):
-        urls = _unique_urls([data.get("masterUrl"), *(data.get("backupUrls") or [])])
+        master_url = data.get("masterUrl") or data.get("master_url")
+        backup_urls = _url_values(
+            data.get("backupUrls") or data.get("backup_urls")
+        )
+        urls = _unique_urls([master_url, *backup_urls])
         if not urls:
             continue
-        width = _as_int(data.get("width")) or _as_int(image.get("width"))
-        height = _as_int(data.get("height")) or _as_int(image.get("height"))
-        bitrate = _as_int(data.get("avgBitrate") or data.get("videoBitrate"))
+        # A Live Photo's still image and motion clip are separate media files.
+        # The image dimensions are not evidence of the clip dimensions.
+        width = _as_int(data.get("width"))
+        height = _as_int(data.get("height"))
+        bitrate = _as_int(
+            data.get("avgBitrate")
+            or data.get("avg_bitrate")
+            or data.get("videoBitrate")
+            or data.get("video_bitrate")
+        )
         size = _as_int(data.get("size"))
         score = ((width or 0) * (height or 0), bitrate or 0, size or 0)
         candidates.append(
@@ -1211,7 +1222,12 @@ def _live_photo_asset(image: dict[str, Any], index: int) -> RemoteAsset | None:
                     width=width,
                     height=height,
                     size=size,
-                    format_id=str(data.get("qualityType") or "live-photo"),
+                    bit_rate=bitrate,
+                    format_id=str(
+                        data.get("qualityType")
+                        or data.get("quality_type")
+                        or "live-photo"
+                    ),
                 ),
             )
         )

@@ -600,6 +600,39 @@ def test_xiaohongshu_asset_extractors_drop_untrusted_urls() -> None:
     ) is None
 
 
+def test_live_photo_stream_does_not_inherit_still_image_dimensions() -> None:
+    asset = _live_photo_asset(
+        {
+            "width": 4283,
+            "height": 5711,
+            "stream": {
+                "h264": [
+                    {
+                        "masterUrl": (
+                            "http://sns-video-bd.xhscdn.com/live-photo.mp4"
+                        ),
+                        "backupUrls": (
+                            "http://sns-video-qc.xhscdn.com/live-photo.mp4"
+                        ),
+                        "avgBitrate": 2_000_000,
+                        "qualityType": "LIVE_HD",
+                    }
+                ]
+            },
+        },
+        1,
+    )
+
+    assert asset is not None
+    assert asset.width is None
+    assert asset.height is None
+    assert asset.bit_rate == 2_000_000
+    assert asset.candidates == [
+        "https://sns-video-bd.xhscdn.com/live-photo.mp4",
+        "https://sns-video-qc.xhscdn.com/live-photo.mp4",
+    ]
+
+
 def test_video_assets_upgrade_only_trusted_standard_http_xhscdn_urls() -> None:
     note = {
         "video": {

@@ -8392,6 +8392,53 @@ def test_xhs_image_and_live_photo_reports_highest_asset_resolution(
     ]
 
 
+def test_xhs_live_photo_without_declared_dimensions_rejects_lower_bitrate(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    path = tmp_path / "live-photo.mp4"
+    path.write_bytes(b"live-photo")
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    monkeypatch.setattr(engine, "_find_ffprobe_executable", lambda: "/fake/ffprobe")
+    monkeypatch.setattr(
+        engine,
+        "_run_ffprobe",
+        lambda *args, **kwargs: json.dumps(
+            {
+                "streams": [
+                    {
+                        "codec_type": "video",
+                        "codec_name": "h264",
+                        "width": 1080,
+                        "height": 1440,
+                        "bit_rate": "1000000",
+                        "duration": "2.5",
+                    }
+                ],
+                "format": {
+                    "duration": "2.5",
+                    "bit_rate": "1000000",
+                    "size": str(path.stat().st_size),
+                },
+            }
+        ).encode(),
+    )
+
+    with pytest.raises(MediaDownloadError, match="bitrate was below"):
+        engine._verify_local_video_asset(
+            path,
+            RemoteAsset(
+                candidates=[
+                    "https://sns-video-bd.xhscdn.com/live-photo.mp4"
+                ],
+                index=1,
+                bit_rate=2_000_000,
+                format_id="HD",
+            ),
+            should_cancel=lambda: False,
+        )
+
+
 def test_xhs_original_video_inherits_best_declared_floor_and_is_verified(
     monkeypatch,
     tmp_path,
