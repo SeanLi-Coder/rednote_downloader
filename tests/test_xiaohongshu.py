@@ -3,8 +3,11 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from http.cookiejar import CookieJar
+from io import BytesIO
 
 import pytest
+from yt_dlp import YoutubeDL
+from yt_dlp.networking import Request
 from yt_dlp.utils import DownloadError
 
 from app.errors import (
@@ -13,22 +16,32 @@ from app.errors import (
     TemporaryAccessError,
 )
 from app.xiaohongshu import (
+    XIAOHONGSHU_MAX_REDIRECTS,
+    _XiaohongshuRedirectRejected,
+    _collect_profile_note_urls,
     _image_candidates,
     _is_explicit_xiaohongshu_auth_url,
+    _is_explicit_xiaohongshu_verification_url,
     _live_photo_asset,
     _looks_like_auth_page,
+    _page_has_verification_challenge,
     _looks_like_transient_limit,
+    _looks_like_verification_challenge,
+    _open_xiaohongshu_response,
+    _read_page,
     _upload_date,
     _video_assets,
     discover_profile,
     is_trusted_xiaohongshu_asset_url,
     is_trusted_xiaohongshu_note_url,
     parse_note,
+    xiaohongshu_note_id,
 )
 
 
 NOTE_ID = "6411cf99000000001300b6d9"
 NOTE_URL = f"https://www.xiaohongshu.com/explore/{NOTE_ID}"
+_REAL_OPEN_XIAOHONGSHU_RESPONSE = _open_xiaohongshu_response
 
 
 def make_html() -> str:
@@ -138,6 +151,95 @@ class FakeYoutubeDL:
         return FakeResponse(self.html)
 
 
+@pytest.fixture(autouse=True)
+def _adapt_lightweight_xiaohongshu_ytdl_fakes(monkeypatch) -> None:
+    """Keep legacy parser fakes while preserving fail-closed redirect semantics."""
+
+    def open_response(
+        ydl,
+        request,
+        *,
+        is_trusted_url,
+        max_redirects=XIAOHONGSHU_MAX_REDIRECTS,
+    ):
+        del max_redirects
+        if not is_trusted_url(request.url):
+            raise _XiaohongshuRedirectRejected(
+                "untrusted-url",
+                target_url=request.url,
+            )
+        response = ydl.urlopen(request)
+        final_url = str(getattr(response, "url", None) or request.url)
+        if not is_trusted_url(final_url):
+            response.close()
+            raise _XiaohongshuRedirectRejected(
+                "untrusted-response-url",
+                target_url=final_url,
+            )
+        return response
+
+    monkeypatch.setattr(
+        "app.xiaohongshu._open_xiaohongshu_response",
+        open_response,
+    )
+
+
+class _FakeRequestsRaw(BytesIO):
+    def read(self, size: int = -1, decode_content: bool = False) -> bytes:
+        return super().read(size)
+
+
+class _FakeRequestsResponse:
+    def __init__(
+        self,
+        url: str,
+        *,
+        location: str | None = None,
+        payload: bytes = b"",
+    ) -> None:
+        self.url = url
+        self.status_code = 302 if location is not None else 200
+        self.reason = "Found" if location is not None else "OK"
+        self.headers = {} if location is None else {"Location": location}
+        self.is_redirect = location is not None
+        self.raw = _FakeRequestsRaw(payload)
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+        self.raw.close()
+
+
+class _QueuedRequestsSession:
+    def __init__(self, responses: list[_FakeRequestsResponse]) -> None:
+        self.responses = responses
+        self.requests: list[dict] = []
+
+    def request(self, **kwargs):
+        self.requests.append(kwargs)
+        if len(self.requests) > len(self.responses):
+            raise AssertionError("Unexpected request after the queued redirect chain")
+        response = self.responses[len(self.requests) - 1]
+        hook = (kwargs.get("hooks") or {}).get("response")
+        if callable(hook):
+            response = hook(response)
+        return response
+
+
+def _youtube_dl_with_requests_session(
+    monkeypatch,
+    session: _QueuedRequestsSession,
+) -> YoutubeDL:
+    ydl = YoutubeDL({"quiet": True, "proxy": ""})
+    handler = ydl._request_director.handlers["Requests"]
+    monkeypatch.setattr(
+        handler,
+        "_get_instance",
+        lambda **kwargs: session,
+    )
+    return ydl
+
+
 def test_parse_note_uses_browser_cookies_and_keeps_original_assets(monkeypatch) -> None:
     FakeYoutubeDL.created_options.clear()
     monkeypatch.setattr("app.xiaohongshu.YoutubeDL", FakeYoutubeDL)
@@ -217,7 +319,7 @@ def test_parse_note_reports_verification_page(monkeypatch) -> None:
 
     monkeypatch.setattr("app.xiaohongshu.YoutubeDL", AuthPageYoutubeDL)
 
-    with pytest.raises(AuthenticationRequiredError, match="CAPTCHA"):
+    with pytest.raises(AuthenticationRequiredError, match="verification challenge"):
         parse_note(NOTE_URL)
 
 
@@ -243,11 +345,123 @@ def test_parse_note_rejects_untrusted_final_redirect_before_read(monkeypatch) ->
 
     monkeypatch.setattr("app.xiaohongshu.YoutubeDL", RedirectingYoutubeDL)
 
-    with pytest.raises(DiscoveryError, match="redirected outside"):
+    with pytest.raises(DiscoveryError, match="blocked before requesting"):
         parse_note(NOTE_URL)
 
     assert RedirectingYoutubeDL.response.read_calls == 0
     assert RedirectingYoutubeDL.response.closed is True
+
+
+@pytest.mark.parametrize(
+    "target_url",
+    [
+        "http://127.0.0.1:8080/private",
+        "https://evil.example/private",
+        f"https://www.xiaohongshu.com:8443/explore/{NOTE_ID}",
+    ],
+)
+def test_note_redirect_rejects_untrusted_next_hop_before_request(
+    monkeypatch,
+    target_url: str,
+) -> None:
+    first_response = _FakeRequestsResponse(NOTE_URL, location=target_url)
+    session = _QueuedRequestsSession([first_response])
+    ydl = _youtube_dl_with_requests_session(monkeypatch, session)
+
+    with ydl, pytest.raises(
+        _XiaohongshuRedirectRejected,
+        match="untrusted-target",
+    ):
+        _REAL_OPEN_XIAOHONGSHU_RESPONSE(
+            ydl,
+            Request(NOTE_URL),
+            is_trusted_url=lambda value: xiaohongshu_note_id(value) == NOTE_ID,
+        )
+
+    assert [request["url"] for request in session.requests] == [NOTE_URL]
+    assert target_url not in [request["url"] for request in session.requests]
+    assert first_response.closed is True
+
+
+def test_note_redirect_follows_only_trusted_https_hops(monkeypatch) -> None:
+    redirected_url = (
+        f"https://www.xiaohongshu.com/discovery/item/{NOTE_ID}?from=redirect"
+    )
+    first_response = _FakeRequestsResponse(NOTE_URL, location=redirected_url)
+    final_response = _FakeRequestsResponse(
+        redirected_url,
+        payload=make_html().encode("utf-8"),
+    )
+    session = _QueuedRequestsSession([first_response, final_response])
+    ydl = _youtube_dl_with_requests_session(monkeypatch, session)
+
+    with ydl:
+        response = _REAL_OPEN_XIAOHONGSHU_RESPONSE(
+            ydl,
+            Request(NOTE_URL),
+            is_trusted_url=lambda value: xiaohongshu_note_id(value) == NOTE_ID,
+        )
+        try:
+            assert response.read() == make_html().encode("utf-8")
+        finally:
+            response.close()
+
+    assert [request["url"] for request in session.requests] == [
+        NOTE_URL,
+        redirected_url,
+    ]
+    assert all(request["allow_redirects"] is False for request in session.requests)
+    assert first_response.closed is True
+
+
+def test_note_redirect_chain_is_bounded_before_extra_request(monkeypatch) -> None:
+    max_redirects = 2
+    urls = [f"{NOTE_URL}?hop={index}" for index in range(max_redirects + 2)]
+    responses = [
+        _FakeRequestsResponse(urls[index], location=urls[index + 1])
+        for index in range(max_redirects + 1)
+    ]
+    session = _QueuedRequestsSession(responses)
+    ydl = _youtube_dl_with_requests_session(monkeypatch, session)
+
+    with ydl, pytest.raises(
+        _XiaohongshuRedirectRejected,
+        match="too-many-redirects",
+    ):
+        _REAL_OPEN_XIAOHONGSHU_RESPONSE(
+            ydl,
+            Request(urls[0]),
+            is_trusted_url=lambda value: xiaohongshu_note_id(value) == NOTE_ID,
+            max_redirects=max_redirects,
+        )
+
+    assert [request["url"] for request in session.requests] == urls[:-1]
+    assert urls[-1] not in [request["url"] for request in session.requests]
+    assert all(response.closed for response in responses)
+
+
+def test_note_captcha_redirect_is_classified_without_requesting_challenge(
+    monkeypatch,
+) -> None:
+    captcha_url = (
+        "https://www.xiaohongshu.com/website-login/captcha"
+        f"?redirectPath=%2Fexplore%2F{NOTE_ID}"
+    )
+    first_response = _FakeRequestsResponse(NOTE_URL, location=captcha_url)
+    session = _QueuedRequestsSession([first_response])
+    ydl = _youtube_dl_with_requests_session(monkeypatch, session)
+    monkeypatch.setattr(
+        "app.xiaohongshu._open_xiaohongshu_response",
+        _REAL_OPEN_XIAOHONGSHU_RESPONSE,
+    )
+
+    with ydl, pytest.raises(AuthenticationRequiredError) as exc_info:
+        _read_page(ydl, NOTE_URL)
+
+    assert exc_info.value.verification_url == NOTE_URL
+    assert [request["url"] for request in session.requests] == [NOTE_URL]
+    assert captcha_url not in [request["url"] for request in session.requests]
+    assert first_response.closed is True
 
 
 def test_xiaohongshu_rate_limit_and_hidden_script_are_not_authentication() -> None:
@@ -260,6 +474,41 @@ def test_xiaohongshu_rate_limit_and_hidden_script_are_not_authentication() -> No
     mixed_page = "<button>请登录</button><main>当前访问频繁，请稍后再试</main>"
     assert _looks_like_auth_page(mixed_page)
     assert _looks_like_transient_limit(mixed_page)
+    assert not _looks_like_verification_challenge(
+        "<aside>手机号登录 获取验证码</aside>"
+    )
+    assert _looks_like_verification_challenge("<main>请完成验证</main>")
+
+
+def test_structured_challenge_detection_does_not_scan_normal_page_text() -> None:
+    class FakePage:
+        url = "https://www.xiaohongshu.com/user/profile/expected"
+
+        def evaluate(self, script: str) -> bool:
+            assert "document.querySelectorAll" in script
+            return False
+
+    assert not _page_has_verification_challenge(FakePage())
+
+
+def test_profile_dom_recommendation_does_not_establish_membership() -> None:
+    class FakeLocator:
+        def evaluate_all(self, script: str) -> list[str]:
+            return [NOTE_URL]
+
+    class FakePage:
+        url = "https://www.xiaohongshu.com/user/profile/expected"
+
+        def evaluate(self, script: str) -> list[dict[str, str]]:
+            return []
+
+        def locator(self, selector: str) -> FakeLocator:
+            return FakeLocator()
+
+    discovered: dict[str, str] = {}
+    _collect_profile_note_urls(FakePage(), discovered)
+
+    assert discovered == {}
 
 
 def test_xiaohongshu_auth_url_requires_trusted_origin() -> None:
@@ -268,6 +517,12 @@ def test_xiaohongshu_auth_url_requires_trusted_origin() -> None:
     )
     assert not _is_explicit_xiaohongshu_auth_url(
         "https://www.xiaohongshu.com.evil.example/login"
+    )
+    assert _is_explicit_xiaohongshu_verification_url(
+        "https://www.xiaohongshu.com/website-login/captcha?redirectPath=%2Fexplore"
+    )
+    assert not _is_explicit_xiaohongshu_verification_url(
+        "https://www.xiaohongshu.com/login"
     )
 
 
@@ -290,6 +545,12 @@ def test_xiaohongshu_note_and_asset_urls_require_trusted_https_origins() -> None
     )
     assert not is_trusted_xiaohongshu_asset_url(
         "https://127.0.0.1/private"
+    )
+    assert not is_trusted_xiaohongshu_asset_url(
+        "http://sns-video-bd.xhscdn.com/original.mp4"
+    )
+    assert not is_trusted_xiaohongshu_asset_url(
+        "https://sns-video-bd.xhscdn.com:8443/original.mp4"
     )
 
 
@@ -339,6 +600,109 @@ def test_xiaohongshu_asset_extractors_drop_untrusted_urls() -> None:
     ) is None
 
 
+def test_video_assets_upgrade_only_trusted_standard_http_xhscdn_urls() -> None:
+    note = {
+        "video": {
+            "media": {
+                "stream": {
+                    "h264": [
+                        {
+                            "masterUrl": (
+                                "http://sns-video-zl.xhscdn.com/video.mp4?token=test"
+                            ),
+                            "backupUrls": [
+                                "http://sns-bak-v8.xhscdn.com:80/video.mp4",
+                                "http://user:pass@sns-bak-v8.xhscdn.com/private.mp4",
+                                "http://sns-bak-v8.xhscdn.com:81/private.mp4",
+                                "http://xhscdn.com.evil.example/private.mp4",
+                                "http://www.xiaohongshu.com/private.mp4",
+                            ],
+                            "width": 720,
+                            "height": 1608,
+                        }
+                    ]
+                }
+            }
+        }
+    }
+
+    assets = _video_assets(note)
+
+    assert len(assets) == 1
+    assert assets[0].candidates == [
+        "https://sns-video-zl.xhscdn.com/video.mp4?token=test",
+        "https://sns-bak-v8.xhscdn.com/video.mp4",
+    ]
+    assert all(
+        is_trusted_xiaohongshu_asset_url(candidate)
+        for candidate in assets[0].candidates
+    )
+
+
+def test_video_assets_support_media_v2_json_snake_case_streams() -> None:
+    media_v2 = {
+        "stream": {
+            "EF5": [
+                {
+                    "master_url": "http://sns-video-zl.xhscdn.com/hevc.mp4",
+                    "backup_urls": [
+                        "http://sns-bak-v10.xhscdn.com/hevc.mp4"
+                    ],
+                    "width": 1440,
+                    "height": 2560,
+                    "avg_bitrate": 8_000_000,
+                    "size": 12_000_000,
+                    "quality_type": "HD",
+                    "video_codec": "EF5",
+                    "audio_codec": "aac",
+                }
+            ]
+        }
+    }
+    note = {
+        "video": {
+            "media": {
+                "stream": {
+                    "EF4": [
+                        {
+                            "masterUrl": (
+                                "http://sns-video-zl.xhscdn.com/h264.mp4"
+                            ),
+                            "width": 720,
+                            "height": 1280,
+                            "avgBitrate": 4_000_000,
+                            "qualityType": "SD",
+                        }
+                    ]
+                }
+            },
+            "mediaV2": json.dumps(media_v2),
+        }
+    }
+
+    assets = _video_assets(note)
+
+    assert [(asset.width, asset.height) for asset in assets] == [
+        (1440, 2560),
+        (720, 1280),
+    ]
+    assert assets[0].format_id == "HD"
+    assert assets[0].candidates == [
+        "https://sns-video-zl.xhscdn.com/hevc.mp4",
+        "https://sns-bak-v10.xhscdn.com/hevc.mp4",
+    ]
+    assert assets[1].candidates == [
+        "https://sns-video-zl.xhscdn.com/h264.mp4"
+    ]
+
+
+def test_video_assets_ignore_invalid_or_oversized_media_v2_payloads() -> None:
+    assert _video_assets({"video": "not-an-object"}) == []
+    assert _video_assets(
+        {"video": {"mediaV2": "{" + (" " * 1_000_001)}}
+    ) == []
+
+
 def test_parse_note_ignores_auth_words_inside_hidden_script(monkeypatch) -> None:
     class HiddenAuthScriptYoutubeDL(FakeYoutubeDL):
         html = '<script>const route = "captcha";</script>' + make_html()
@@ -351,6 +715,24 @@ def test_parse_note_ignores_auth_words_inside_hidden_script(monkeypatch) -> None
     note, _ = parse_note(NOTE_URL)
 
     assert note.note_id == NOTE_ID
+
+
+def test_parse_note_accepts_matching_state_with_generic_login_overlay(
+    monkeypatch,
+) -> None:
+    class LoginOverlayYoutubeDL(FakeYoutubeDL):
+        html = (
+            "<html><body><aside>登录即可查看 Ta 的笔记 "
+            "手机号登录 获取验证码</aside></body></html>"
+            + make_html()
+        )
+
+    monkeypatch.setattr("app.xiaohongshu.YoutubeDL", LoginOverlayYoutubeDL)
+
+    note, _ = parse_note(NOTE_URL)
+
+    assert note.note_id == NOTE_ID
+    assert note.title == "Original title"
 
 
 def test_parse_note_rate_limit_is_temporary_not_authentication(monkeypatch) -> None:
@@ -540,6 +922,104 @@ def test_xiaohongshu_profile_mixed_login_and_rate_limit_is_temporary(
         match="Chrome verification is not required",
     ):
         discover_profile(profile_url)
+
+
+def test_profile_discovers_state_note_despite_generic_login_overlay(
+    monkeypatch,
+) -> None:
+    profile_url = "https://www.xiaohongshu.com/user/profile/expected"
+    note_url = (
+        f"{NOTE_URL}?xsec_token=fresh-token&xsec_source=pc_user"
+    )
+
+    class FakeMouse:
+        def wheel(self, x: int, y: int) -> None:
+            return None
+
+    class FakeLocator:
+        def __init__(self, selector: str) -> None:
+            self.selector = selector
+
+        @property
+        def first(self):
+            return self
+
+        def count(self) -> int:
+            return 1
+
+        def inner_text(self, timeout: int) -> str:
+            if self.selector == "body":
+                return (
+                    "登录即可查看 Ta 的笔记 手机号登录 +86 "
+                    "获取验证码 登录"
+                )
+            return "Test Author"
+
+        def evaluate_all(self, script: str) -> list[str]:
+            return [note_url]
+
+    class FakePage:
+        url = profile_url
+        mouse = FakeMouse()
+
+        def goto(self, url: str, wait_until: str, timeout: int) -> None:
+            self.url = url
+
+        def wait_for_timeout(self, timeout: int) -> None:
+            return None
+
+        def locator(self, selector: str) -> FakeLocator:
+            return FakeLocator(selector)
+
+        def evaluate(self, script: str):
+            if "noteQueries" in script:
+                return False
+            if "const notesRef" in script:
+                return [{"id": NOTE_ID, "token": "fresh-token"}]
+            return None
+
+    class FakeContext:
+        def new_page(self) -> FakePage:
+            return FakePage()
+
+    class FakeBrowser:
+        version = "151.0.0.0"
+
+        def new_context(self, **kwargs) -> FakeContext:
+            return FakeContext()
+
+        def close(self) -> None:
+            return None
+
+    class FakeChromium:
+        def launch(self, **kwargs) -> FakeBrowser:
+            return FakeBrowser()
+
+    class FakePlaywright:
+        chromium = FakeChromium()
+
+    class FakePlaywrightContext:
+        def __enter__(self) -> FakePlaywright:
+            return FakePlaywright()
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "app.xiaohongshu._extract_chrome_cookies",
+        lambda profile: CookieJar(),
+    )
+    monkeypatch.setattr(
+        "playwright.sync_api.sync_playwright",
+        lambda: FakePlaywrightContext(),
+    )
+
+    result = discover_profile(profile_url)
+
+    assert result.author == "Test Author"
+    assert result.note_urls == [note_url]
+    assert result.discovery_complete is True
+    assert result.warning is None
 
 
 def test_image_candidates_prioritize_direct_original_cdn() -> None:

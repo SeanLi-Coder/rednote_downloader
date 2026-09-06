@@ -140,6 +140,36 @@ def test_douyin_redirect_messages_execute_with_safe_legacy_and_reason_parsing(
             "downloading any item.",
             "没有下载低清文件",
         ),
+        (
+            "No current authenticated Xiaohongshu session was found in the "
+            "selected Chrome profile. This is a Chrome login/profile setting "
+            "issue; CAPTCHA verification is not required.",
+            "不是验证码",
+        ),
+        (
+            "Xiaohongshu did not accept the selected Chrome profile's login "
+            "session. This is a login-session issue; a CAPTCHA is not required "
+            "unless Chrome actually displays one.",
+            "同一个 Profile",
+        ),
+        (
+            "Xiaohongshu displayed an explicit verification challenge.",
+            "已明确显示验证码",
+        ),
+        (
+            "The Xiaohongshu task has an unsupported cookie-browser setting.",
+            "浏览器 Cookie 设置无效",
+        ),
+        (
+            "Xiaohongshu identified this work as a video but returned no trusted "
+            "video stream. The cover image was not downloaded as a substitute.",
+            "没有把封面图片冒充视频保存",
+        ),
+        (
+            "This Xiaohongshu profile item was completed by an older version "
+            "without verified media-type metadata. Existing files were preserved.",
+            "重新识别它是图片还是视频",
+        ),
     ]
     harness = (
         "globalThis.window = {};\n"
@@ -244,6 +274,72 @@ def test_interrupted_job_labels_queued_items_as_waiting_to_continue(
         "count": "151",
         "progress": "已暂停，等待继续；已处理 1 / 152 个作品",
     }
+
+
+def test_xiaohongshu_profile_auth_labels_the_blocked_note_as_verification_target(
+    tmp_path: Path,
+) -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is unavailable")
+    source = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(
+        encoding="utf-8"
+    )
+    tail = "  initialize();\n})();\n"
+    assert tail in source
+    source = source.replace(
+        tail,
+        "  window.__verificationTarget = verificationTarget;\n"
+        "  window.__isXiaohongshuVerificationItem = "
+        "isXiaohongshuVerificationItem;\n})();\n",
+    )
+    jobs = [
+        {
+            "platform": "xiaohongshu",
+            "source_kind": "profile",
+            "source_url": "https://www.xiaohongshu.com/user/profile/example",
+            "verification_url": (
+                "https://www.xiaohongshu.com/explore/"
+                "693e3a810000000019025182?xsec_source=pc_user"
+            ),
+        },
+        {
+            "platform": "xiaohongshu",
+            "source_kind": "profile",
+            "source_url": "https://www.xiaohongshu.com/user/profile/example",
+            "verification_url": "https://www.xiaohongshu.com/user/profile/example",
+        },
+        {
+            "platform": "douyin",
+            "source_kind": "profile",
+            "source_url": "https://www.douyin.com/user/example",
+            "verification_url": "https://www.douyin.com/user/example",
+        },
+    ]
+    harness = (
+        "globalThis.window = {};\n"
+        "globalThis.document = {querySelector: () => null};\n"
+        f"const __jobs = {json.dumps(jobs)};\n"
+    )
+    trailer = (
+        "\nprocess.stdout.write(JSON.stringify(__jobs.map(job => ({"
+        "item: window.__isXiaohongshuVerificationItem(job), "
+        "target: window.__verificationTarget(job)}))));\n"
+    )
+
+    completed = _run_node_script(
+        node,
+        harness + source + trailer,
+        tmp_path,
+        "xiaohongshu-verification-target.js",
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == [
+        {"item": True, "target": "触发验证的作品"},
+        {"item": False, "target": "原主页"},
+        {"item": False, "target": "原主页"},
+    ]
 
 
 def test_nonretryable_failed_item_keeps_visible_error_without_retrying(

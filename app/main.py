@@ -21,7 +21,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from .browser import open_chrome
 from .build_info import APP_ID, APP_VERSION, BUILD_ID, calculate_build_id
 from .downloader import DownloaderConfig
-from .models import DownloadJob
+from .models import DownloadJob, ItemStatus, JobStatus, Platform, SourceKind
 from .platforms import UnsupportedUrlError, identify_url
 from .runtime import (
     RUNTIME_STOP_EVENT,
@@ -34,6 +34,12 @@ from .task_manager import (
     ItemNotFoundError,
     ItemNotRetryableError,
     JobBusyError,
+)
+from .xiaohongshu import (
+    is_trusted_xiaohongshu_note_url,
+    is_trusted_xiaohongshu_profile_url,
+    xiaohongshu_note_id,
+    xiaohongshu_profile_id,
 )
 
 
@@ -344,6 +350,136 @@ def cancel_job(job_id: str):
 _open_chrome = open_chrome
 
 
+def _canonical_xiaohongshu_verification_note_url(
+    value: str,
+    expected_note_id: str,
+) -> str | None:
+    if (
+        not is_trusted_xiaohongshu_note_url(value)
+        or xiaohongshu_note_id(value) != expected_note_id
+    ):
+        return None
+    try:
+        parsed = urlsplit(value)
+        allowed: dict[str, str] = {}
+        for name, item in parse_qsl(parsed.query, keep_blank_values=True):
+            normalized_name = name.lower()
+            if normalized_name not in {"xsec_token", "xsec_source"}:
+                continue
+            if normalized_name in allowed:
+                return None
+            if not item or len(item) > 2_048 or any(ord(char) < 32 for char in item):
+                return None
+            if normalized_name == "xsec_source" and not re.fullmatch(
+                r"[A-Za-z0-9_-]{1,64}", item
+            ):
+                return None
+            allowed[normalized_name] = item
+    except (TypeError, ValueError):
+        return None
+    query = urlencode(
+        [
+            (name, allowed[name])
+            for name in ("xsec_token", "xsec_source")
+            if name in allowed
+        ]
+    )
+    return urlunsplit(
+        ("https", "www.xiaohongshu.com", f"/explore/{expected_note_id}", query, "")
+    )
+
+
+def _xiaohongshu_verification_target(job: DownloadJob) -> str | None:
+    if (
+        job.platform != Platform.XIAOHONGSHU
+        or job.status != JobStatus.NEEDS_AUTH
+        or job.verification_url is None
+    ):
+        return None
+    verification_note_id = xiaohongshu_note_id(job.verification_url)
+    if not verification_note_id:
+        return None
+    candidates = [item for item in job.items if item.status == ItemStatus.NEEDS_AUTH]
+    if len(candidates) != 1:
+        return None
+    item = candidates[0]
+    if str(item.media_id or "").lower() != verification_note_id:
+        return None
+    item_url = _canonical_xiaohongshu_verification_note_url(
+        item.source_url,
+        verification_note_id,
+    )
+    verification_url = _canonical_xiaohongshu_verification_note_url(
+        job.verification_url,
+        verification_note_id,
+    )
+    if not item_url or not verification_url:
+        return None
+
+    if job.source_kind == SourceKind.ITEM:
+        bound = xiaohongshu_note_id(job.source_url) == verification_note_id
+    elif job.source_kind == SourceKind.PROFILE:
+        profile_id = xiaohongshu_profile_id(job.source_url)
+        bound = bool(
+            profile_id
+            and item.metadata.get("profile_note_membership_verified") is True
+            and item.metadata.get("xiaohongshu_profile_id") == profile_id
+        )
+    elif job.source_kind == SourceKind.SHORT_LINK:
+        resolved_kind = job.resolved_source_kind
+        resolved_id = str(job.resolved_source_id or "").lower()
+        metadata_kind = str(
+            item.metadata.get("xiaohongshu_resolved_source_kind") or ""
+        )
+        metadata_url = str(
+            item.metadata.get("xiaohongshu_resolved_source_url") or ""
+        )
+        if resolved_kind == SourceKind.ITEM:
+            bound = bool(
+                resolved_id == verification_note_id
+                and metadata_kind == SourceKind.ITEM.value
+                and xiaohongshu_note_id(metadata_url) == verification_note_id
+            )
+        elif resolved_kind == SourceKind.PROFILE:
+            metadata_profile_id = xiaohongshu_profile_id(metadata_url)
+            bound = bool(
+                resolved_id
+                and metadata_kind == SourceKind.PROFILE.value
+                and metadata_profile_id == resolved_id
+                and item.metadata.get("profile_note_membership_verified") is True
+                and item.metadata.get("xiaohongshu_profile_id") == resolved_id
+            )
+        else:
+            bound = False
+    else:
+        bound = False
+    return verification_url if bound else None
+
+
+def _is_trusted_xiaohongshu_verification_source(
+    source_url: str,
+    source_kind: SourceKind,
+) -> bool:
+    if source_kind == SourceKind.PROFILE:
+        return is_trusted_xiaohongshu_profile_url(source_url)
+    if source_kind == SourceKind.ITEM:
+        return is_trusted_xiaohongshu_note_url(source_url)
+    if source_kind != SourceKind.SHORT_LINK:
+        return False
+    try:
+        parsed = urlsplit(source_url)
+        hostname = (parsed.hostname or "").lower().rstrip(".")
+        return (
+            parsed.scheme == "https"
+            and parsed.username is None
+            and parsed.password is None
+            and parsed.port in {None, 443}
+            and (hostname == "xhslink.com" or hostname.endswith(".xhslink.com"))
+        )
+    except (TypeError, ValueError):
+        return False
+
+
 @app.post("/api/jobs/{job_id}/verify")
 def open_verification(job_id: str) -> dict[str, str]:
     try:
@@ -351,8 +487,27 @@ def open_verification(job_id: str) -> dict[str, str]:
         source = identify_url(job.source_url)
         if source.platform != job.platform or source.kind != job.source_kind:
             raise UnsupportedUrlError("The original task URL is no longer verifiable")
-        url = source.url
-        _open_chrome(url)
+        if (
+            job.platform == Platform.XIAOHONGSHU
+            and not _is_trusted_xiaohongshu_verification_source(
+                source.url,
+                source.kind,
+            )
+        ):
+            raise UnsupportedUrlError("The original task URL is no longer trusted")
+        if (
+            job.platform == Platform.XIAOHONGSHU
+            and job.status == JobStatus.NEEDS_AUTH
+            and job.cookie_browser == "chrome"
+            and (
+                job.cookie_profile is None
+                or job.cookie_profile_auto_selected
+            )
+        ):
+            job = manager.bind_xiaohongshu_verification_profile(job_id)
+        url = _xiaohongshu_verification_target(job) or source.url
+        profile = job.cookie_profile if job.cookie_browser == "chrome" else None
+        _open_chrome(url, profile)
         return {"status": "opened", "url": _redact_public_url(url)}
     except Exception as exc:
         raise _http_error(exc) from exc

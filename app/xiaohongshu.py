@@ -13,7 +13,17 @@ from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlsplit, urlun
 
 from yt_dlp import YoutubeDL
 from yt_dlp.cookies import extract_cookies_from_browser
+from yt_dlp.dependencies import requests, urllib3
 from yt_dlp.networking import Request
+from yt_dlp.networking._requests import RequestsRH, RequestsResponseAdapter
+from yt_dlp.networking.exceptions import (
+    CertificateVerifyError,
+    HTTPError,
+    ProxyError,
+    RequestError,
+    SSLError,
+    TransportError,
+)
 from yt_dlp.utils import DownloadError, js_to_json
 
 from .browser import chrome_user_agent
@@ -36,6 +46,15 @@ AUTH_TEXT_PATTERNS = (
     "请登录",
     "登录后继续",
 )
+VERIFICATION_CHALLENGE_TEXT_PATTERNS = (
+    "captcha",
+    "verify you are human",
+    "security verification",
+    "安全验证",
+    "请完成验证",
+    "滑块验证",
+    "行为验证",
+)
 TRANSIENT_TEXT_PATTERNS = (
     "访问频繁",
     "请求频繁",
@@ -44,6 +63,9 @@ TRANSIENT_TEXT_PATTERNS = (
     "网络环境存在风险",
 )
 EXPLICIT_AUTH_PATH_MARKERS = ("/captcha", "/login", "/passport/", "/verify")
+EXPLICIT_VERIFICATION_PATH_MARKERS = ("/captcha", "/verify")
+MAX_MEDIA_V2_JSON_CHARS = 1_000_000
+XIAOHONGSHU_MAX_REDIRECTS = 5
 
 
 @dataclass(slots=True)
@@ -90,6 +112,18 @@ class XiaohongshuNote:
     videos: list[RemoteAsset] = field(default_factory=list)
     live_photos: list[RemoteAsset] = field(default_factory=list)
     raw: dict[str, Any] = field(default_factory=dict)
+
+
+class _XiaohongshuRedirectRejected(RuntimeError):
+    def __init__(
+        self,
+        reason: str,
+        *,
+        target_url: str | None = None,
+    ) -> None:
+        super().__init__(f"Xiaohongshu redirect was blocked ({reason})")
+        self.reason = reason
+        self.target_url = target_url
 
 
 class _QuietCookieLogger:
@@ -144,6 +178,53 @@ def _looks_like_auth_page(text: str) -> bool:
     return any(pattern in lowered for pattern in AUTH_TEXT_PATTERNS)
 
 
+def _looks_like_verification_challenge(text: str) -> bool:
+    lowered = _visible_text(text)
+    return any(
+        pattern in lowered for pattern in VERIFICATION_CHALLENGE_TEXT_PATTERNS
+    )
+
+
+def _page_has_verification_challenge(page: Any) -> bool:
+    if _is_explicit_xiaohongshu_verification_url(str(page.url)):
+        return True
+    try:
+        return bool(
+            page.evaluate(
+                r"""
+                () => {
+                  const selectors = [
+                    'iframe[src*="captcha" i]',
+                    '[id*="captcha" i]',
+                    '[class*="captcha" i]',
+                    '[data-testid*="captcha" i]',
+                    '[role="dialog"]',
+                    '[class*="modal" i]',
+                    '[class*="dialog" i]'
+                  ];
+                  const challengeText = /(请完成验证|安全验证|行为验证|滑块验证|verify you are human|security verification)/i;
+                  const challengeHint = /(captcha|geetest|yidun|tcaptcha|verify[-_ ]?slider)/i;
+                  for (const element of document.querySelectorAll(selectors.join(','))) {
+                    const style = window.getComputedStyle(element);
+                    const rect = element.getBoundingClientRect();
+                    if (style.display === 'none' || style.visibility === 'hidden' || rect.width <= 0 || rect.height <= 0) continue;
+                    const hint = [
+                      element.id,
+                      element.className,
+                      element.getAttribute('src'),
+                      element.getAttribute('data-testid')
+                    ].filter((value) => typeof value === 'string').join(' ');
+                    if (challengeHint.test(hint) || challengeText.test(element.innerText || '')) return true;
+                  }
+                  return false;
+                }
+                """
+            )
+        )
+    except Exception:
+        return False
+
+
 def _looks_like_transient_limit(text: str) -> bool:
     lowered = _visible_text(text)
     return any(pattern in lowered for pattern in TRANSIENT_TEXT_PATTERNS)
@@ -175,6 +256,16 @@ def _is_explicit_xiaohongshu_auth_url(value: str) -> bool:
     except (TypeError, ValueError):
         return False
     return any(marker in path for marker in EXPLICIT_AUTH_PATH_MARKERS)
+
+
+def _is_explicit_xiaohongshu_verification_url(value: str) -> bool:
+    if not _is_trusted_xiaohongshu_page_url(value):
+        return False
+    try:
+        path = unquote(urlsplit(value).path).lower()
+    except (TypeError, ValueError):
+        return False
+    return any(marker in path for marker in EXPLICIT_VERIFICATION_PATH_MARKERS)
 
 
 def is_trusted_xiaohongshu_note_url(value: str) -> bool:
@@ -252,6 +343,33 @@ def is_trusted_xiaohongshu_asset_url(value: str) -> bool:
         return parsed.port in {None, 443}
     except (TypeError, ValueError):
         return False
+
+
+def _normalize_xiaohongshu_asset_url(value: Any) -> str | None:
+    if not isinstance(value, str) or not value or len(value) > 8_192:
+        return None
+    if is_trusted_xiaohongshu_asset_url(value):
+        return value
+    try:
+        parsed = urlsplit(value)
+        hostname = (parsed.hostname or "").lower().rstrip(".")
+        if (
+            parsed.scheme != "http"
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.port not in {None, 80}
+            or not (
+                hostname == "xhscdn.com"
+                or hostname.endswith(".xhscdn.com")
+            )
+        ):
+            return None
+        upgraded = urlunsplit(
+            parsed._replace(scheme="https", netloc=hostname)
+        )
+    except (TypeError, ValueError):
+        return None
+    return upgraded if is_trusted_xiaohongshu_asset_url(upgraded) else None
 
 
 def _without_xsec_query(value: str) -> str:
@@ -400,6 +518,67 @@ def _profile_has_more(page: Any) -> bool | None:
         return None
 
 
+def _collect_profile_note_urls(
+    page: Any,
+    discovered: dict[str, str],
+) -> None:
+    for note_id, token in _profile_note_tokens(page):
+        note_url = f"https://www.xiaohongshu.com/explore/{note_id}"
+        if token:
+            note_url = (
+                f"{note_url}?"
+                f"{urlencode({'xsec_token': token, 'xsec_source': 'pc_user'})}"
+            )
+            discovered[note_id] = note_url
+        else:
+            discovered.setdefault(note_id, note_url)
+
+    try:
+        hrefs: Iterable[str] = page.locator(
+            "a[href*='/explore/'], a[href*='/discovery/item/']"
+        ).evaluate_all("elements => elements.map(element => element.href)")
+    except Exception:
+        hrefs = []
+    for href in hrefs:
+        absolute = urljoin(page.url, href)
+        if not is_trusted_xiaohongshu_note_url(absolute):
+            continue
+        match = re.search(
+            r"/(?:explore|discovery/item)/([0-9a-f]+)",
+            urlsplit(absolute).path,
+            re.IGNORECASE,
+        )
+        note_id = match.group(1).lower() if match else ""
+        # Only INITIAL_STATE.user.notes establishes profile membership. DOM links
+        # can include recommendations or navigation outside the author's feed.
+        if not note_id or note_id not in discovered:
+            continue
+        if "xsec_token=" in urlsplit(absolute).query:
+            discovered[note_id] = absolute
+        else:
+            discovered.setdefault(note_id, absolute)
+
+
+def _xiaohongshu_auth_required(
+    verification_url: str,
+    *,
+    challenge: bool,
+) -> AuthenticationRequiredError:
+    if challenge:
+        message = (
+            "Xiaohongshu displayed an explicit verification challenge. Open the "
+            "same page in the bound Chrome profile, complete it, and retry."
+        )
+    else:
+        message = (
+            "Xiaohongshu did not accept the selected Chrome profile's login session. "
+            "Sign in or refresh Xiaohongshu in that same Chrome profile, then retry. "
+            "This is a login-session issue; a CAPTCHA is not required unless Chrome "
+            "actually displays one."
+        )
+    return AuthenticationRequiredError(message, verification_url=verification_url)
+
+
 def discover_profile(
     url: str,
     *,
@@ -461,10 +640,9 @@ def discover_profile(
                 page.wait_for_timeout(2_000)
 
                 if _is_explicit_xiaohongshu_auth_url(page.url):
-                    raise AuthenticationRequiredError(
-                        "Xiaohongshu redirected to an explicit login or verification "
-                        "page. Complete it in Chrome and retry.",
-                        verification_url=url,
+                    raise _xiaohongshu_auth_required(
+                        url,
+                        challenge=_is_explicit_xiaohongshu_verification_url(page.url),
                     )
                 if not _is_trusted_xiaohongshu_page_url(page.url):
                     raise DiscoveryError(
@@ -481,20 +659,19 @@ def discover_profile(
                     body_text = page.locator("body").inner_text(timeout=5_000)
                 except Exception:
                     body_text = page.content()
+                discovered: dict[str, str] = {}
+                _collect_profile_note_urls(page, discovered)
                 if _looks_like_transient_limit(body_text):
                     raise TemporaryAccessError(
                         "Xiaohongshu profile discovery was temporarily rate-limited. "
                         "Retry after a short wait; Chrome verification is not required."
                     )
-                if _looks_like_auth_page(body_text):
-                    raise AuthenticationRequiredError(
-                        "Xiaohongshu requires verification. Open this profile in Chrome, "
-                        "finish the CAPTCHA or login, then retry the task.",
-                        verification_url=url,
-                    )
+                if _page_has_verification_challenge(page):
+                    raise _xiaohongshu_auth_required(url, challenge=True)
+                if not discovered and _looks_like_auth_page(body_text):
+                    raise _xiaohongshu_auth_required(url, challenge=False)
 
                 author = _pick_author(page) or "Xiaohongshu Author"
-                discovered: dict[str, str] = {}
                 unchanged_rounds = 0
                 discovery_complete = False
                 discovery_warning: str | None = None
@@ -502,32 +679,8 @@ def discover_profile(
                 for _ in range(max_scrolls):
                     if should_cancel and should_cancel():
                         raise DownloadCancelledError("Task cancelled")
-                    hrefs: Iterable[str] = page.locator(
-                        "a[href*='/explore/'], a[href*='/discovery/item/']"
-                    ).evaluate_all("elements => elements.map(element => element.href)")
                     before = len(discovered)
-                    for note_id, token in _profile_note_tokens(page):
-                        note_url = f"https://www.xiaohongshu.com/explore/{note_id}"
-                        if token:
-                            note_url = f"{note_url}?{urlencode({'xsec_token': token, 'xsec_source': 'pc_user'})}"
-                            discovered[note_id] = note_url
-                        else:
-                            discovered.setdefault(note_id, note_url)
-                    for href in hrefs:
-                        absolute = urljoin(page.url, href)
-                        if not is_trusted_xiaohongshu_note_url(absolute):
-                            continue
-                        match = re.search(
-                            r"/(?:explore|discovery/item)/([0-9a-f]+)",
-                            urlsplit(absolute).path,
-                            re.IGNORECASE,
-                        )
-                        note_id = match.group(1).lower() if match else ""
-                        if note_id and note_id in discovered:
-                            if "xsec_token=" in urlsplit(absolute).query:
-                                discovered[note_id] = absolute
-                            else:
-                                discovered.setdefault(note_id, absolute)
+                    _collect_profile_note_urls(page, discovered)
                     unchanged_rounds = (
                         unchanged_rounds + 1 if len(discovered) == before else 0
                     )
@@ -547,10 +700,11 @@ def discover_profile(
                     page.wait_for_timeout(1_000)
 
                     if _is_explicit_xiaohongshu_auth_url(page.url):
-                        raise AuthenticationRequiredError(
-                            "Xiaohongshu redirected to an explicit login or verification "
-                            "page. Complete it in Chrome and retry.",
-                            verification_url=url,
+                        raise _xiaohongshu_auth_required(
+                            url,
+                            challenge=_is_explicit_xiaohongshu_verification_url(
+                                page.url
+                            ),
                         )
                     if not _is_trusted_xiaohongshu_page_url(page.url):
                         raise DiscoveryError(
@@ -567,12 +721,10 @@ def discover_profile(
                             "Retry after a short wait; Chrome verification is not "
                             "required."
                         )
-                    if _looks_like_auth_page(updated_body):
-                        raise AuthenticationRequiredError(
-                            "Xiaohongshu interrupted discovery with a verification "
-                            "challenge. Complete it in Chrome and retry.",
-                            verification_url=url,
-                        )
+                    if _page_has_verification_challenge(page):
+                        raise _xiaohongshu_auth_required(url, challenge=True)
+                    if not discovered and _looks_like_auth_page(updated_body):
+                        raise _xiaohongshu_auth_required(url, challenge=False)
                 if not discovery_complete and not discovery_warning:
                     discovery_warning = (
                         "Xiaohongshu reached the discovery safety limit before confirming "
@@ -641,23 +793,193 @@ def _extract_balanced_object(source: str, offset: int) -> str:
     raise ValueError("Object end not found")
 
 
-def _read_page(ydl: YoutubeDL, url: str) -> str:
-    response = ydl.urlopen(
-        Request(
-            url,
-            headers={
-                "Referer": "https://www.xiaohongshu.com/",
-                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-            },
+def _open_xiaohongshu_response(
+    ydl: YoutubeDL,
+    request: Request,
+    *,
+    is_trusted_url: Callable[[str], bool],
+    max_redirects: int = XIAOHONGSHU_MAX_REDIRECTS,
+):
+    if not is_trusted_url(request.url):
+        raise _XiaohongshuRedirectRejected(
+            "untrusted-url",
+            target_url=request.url,
         )
+    director = getattr(ydl, "_request_director", None)
+    handler = getattr(director, "handlers", {}).get("Requests")
+    if not isinstance(handler, RequestsRH) or requests is None:
+        raise _XiaohongshuRedirectRejected("secure-handler-unavailable")
+
+    headers = handler._get_headers(request)
+    current_headers = {
+        key: value
+        for key, value in headers.items()
+        if key.lower()
+        not in {
+            "authorization",
+            "cookie",
+            "host",
+            "proxy-authorization",
+        }
+    }
+    session = handler._get_instance(
+        cookiejar=handler._get_cookiejar(request),
+        legacy_ssl_support=request.extensions.get("legacy_ssl"),
     )
+    current_url = request.url
+    request_timeout = handler._calculate_timeout(request)
+    redirect_deadline = time.monotonic() + request_timeout
+
+    for redirect_count in range(max_redirects + 1):
+        remaining_timeout = redirect_deadline - time.monotonic()
+        if remaining_timeout <= 0:
+            raise TransportError(
+                cause=TimeoutError("Xiaohongshu redirect chain timed out")
+            )
+        redirect_location_present = False
+        redirect_location: str | None = None
+
+        def suppress_requests_redirect_preparation(response, *args, **kwargs):
+            nonlocal redirect_location_present, redirect_location
+            redirect_location_present = "Location" in response.headers
+            redirect_location = response.headers.pop("Location", None)
+            return response
+
+        try:
+            raw_response = session.request(
+                method=request.method,
+                url=current_url,
+                data=request.data,
+                headers=current_headers,
+                timeout=max(0.1, min(request_timeout, remaining_timeout)),
+                proxies=handler._get_proxies(request),
+                allow_redirects=False,
+                stream=True,
+                hooks={"response": suppress_requests_redirect_preparation},
+            )
+        except requests.exceptions.SSLError as exc:
+            if "CERTIFICATE_VERIFY_FAILED" in str(exc):
+                raise CertificateVerifyError(cause=exc) from exc
+            raise SSLError(cause=exc) from exc
+        except requests.exceptions.ProxyError as exc:
+            raise ProxyError(cause=exc) from exc
+        except (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+        ) as exc:
+            raise TransportError(cause=exc) from exc
+        except urllib3.exceptions.HTTPError as exc:
+            raise TransportError(cause=exc) from exc
+        except requests.exceptions.RequestException as exc:
+            raise RequestError(cause=exc) from exc
+
+        if redirect_location_present:
+            raw_response.headers["Location"] = redirect_location or ""
+
+        response_url = str(getattr(raw_response, "url", None) or current_url)
+        try:
+            response_is_trusted = is_trusted_url(response_url)
+        except BaseException:
+            raw_response.close()
+            raise
+        if not response_is_trusted:
+            raw_response.close()
+            raise _XiaohongshuRedirectRejected(
+                "untrusted-response-url",
+                target_url=response_url,
+            )
+
+        is_redirect_response = bool(raw_response.is_redirect) or getattr(
+            raw_response,
+            "status_code",
+            None,
+        ) in {301, 302, 303, 307, 308}
+        if is_redirect_response:
+            location = str(raw_response.headers.get("Location") or "")
+            if (
+                not location
+                or len(location) > 8_192
+                or "\\" in location
+                or any(character.isspace() for character in location)
+                or any(
+                    ord(character) < 32 or ord(character) == 127
+                    for character in location
+                )
+            ):
+                raw_response.close()
+                raise _XiaohongshuRedirectRejected("malformed-location")
+            try:
+                target_url = urljoin(response_url, location)
+            except (TypeError, ValueError):
+                raw_response.close()
+                raise _XiaohongshuRedirectRejected("malformed-location")
+            try:
+                target_is_trusted = is_trusted_url(target_url)
+            except BaseException:
+                raw_response.close()
+                raise
+            if not target_is_trusted:
+                raw_response.close()
+                raise _XiaohongshuRedirectRejected(
+                    "untrusted-target",
+                    target_url=target_url,
+                )
+            if redirect_count >= max_redirects:
+                raw_response.close()
+                raise _XiaohongshuRedirectRejected(
+                    "too-many-redirects",
+                    target_url=target_url,
+                )
+            raw_response.close()
+            current_url = target_url
+            continue
+
+        response = RequestsResponseAdapter(raw_response)
+        if not 200 <= response.status < 300:
+            raise HTTPError(response)
+        return response
+    raise AssertionError("unreachable Xiaohongshu redirect loop state")
+
+
+def _read_page(ydl: YoutubeDL, url: str) -> str:
+    expected_note_id = xiaohongshu_note_id(url)
+
+    def is_trusted_note_target(value: str) -> bool:
+        return bool(
+            expected_note_id
+            and xiaohongshu_note_id(value) == expected_note_id
+        )
+
+    try:
+        response = _open_xiaohongshu_response(
+            ydl,
+            Request(
+                url,
+                headers={
+                    "Referer": "https://www.xiaohongshu.com/",
+                    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                },
+            ),
+            is_trusted_url=is_trusted_note_target,
+        )
+    except _XiaohongshuRedirectRejected as exc:
+        if exc.target_url and _is_explicit_xiaohongshu_auth_url(exc.target_url):
+            raise _xiaohongshu_auth_required(
+                url,
+                challenge=_is_explicit_xiaohongshu_verification_url(
+                    exc.target_url
+                ),
+            ) from exc
+        raise DiscoveryError(
+            "Xiaohongshu note redirect was blocked before requesting an "
+            "untrusted or mismatched target"
+        ) from exc
     try:
         final_url = str(getattr(response, "url", None) or url)
         if _is_explicit_xiaohongshu_auth_url(final_url):
-            raise AuthenticationRequiredError(
-                "Xiaohongshu redirected to an explicit login or verification page. "
-                "Complete it in Chrome and retry.",
-                verification_url=url,
+            raise _xiaohongshu_auth_required(
+                url,
+                challenge=_is_explicit_xiaohongshu_verification_url(final_url),
             )
         if not is_trusted_xiaohongshu_note_url(final_url):
             raise DiscoveryError(
@@ -691,11 +1013,12 @@ def _unique_urls(values: Iterable[Any]) -> list[str]:
     result: list[str] = []
     seen: set[str] = set()
     for value in values:
-        if not is_trusted_xiaohongshu_asset_url(value):
+        normalized = _normalize_xiaohongshu_asset_url(value)
+        if not normalized:
             continue
-        if value not in seen:
-            seen.add(value)
-            result.append(value)
+        if normalized not in seen:
+            seen.add(normalized)
+            result.append(normalized)
     return result
 
 
@@ -779,8 +1102,34 @@ def _walk_dicts(value: Any) -> Iterable[dict[str, Any]]:
             yield from _walk_dicts(child)
 
 
+def _video_media_roots(video: dict[str, Any]) -> list[dict[str, Any]]:
+    roots = [video]
+    media_v2 = video.get("mediaV2")
+    if isinstance(media_v2, str):
+        if len(media_v2) > MAX_MEDIA_V2_JSON_CHARS:
+            media_v2 = None
+        else:
+            try:
+                media_v2 = json.loads(media_v2)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                media_v2 = None
+    if isinstance(media_v2, dict):
+        roots.append(media_v2)
+    return roots
+
+
+def _url_values(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple)):
+        return [item for item in value if isinstance(item, str)]
+    return []
+
+
 def _video_assets(note: dict[str, Any]) -> list[RemoteAsset]:
     video = note.get("video") or {}
+    if not isinstance(video, dict):
+        return []
     assets: list[RemoteAsset] = []
     origin_key = (
         ((video.get("consumer") or {}).get("originVideoKey"))
@@ -799,30 +1148,42 @@ def _video_assets(note: dict[str, Any]) -> list[RemoteAsset]:
         )
 
     candidates: list[tuple[tuple[int, int, int], RemoteAsset]] = []
-    for data in _walk_dicts(video):
-        master_url = data.get("masterUrl")
-        backup_urls = data.get("backupUrls") or []
-        urls = _unique_urls([master_url, *backup_urls])
-        if not urls:
-            continue
-        width = _as_int(data.get("width"))
-        height = _as_int(data.get("height"))
-        bitrate = _as_int(data.get("avgBitrate") or data.get("videoBitrate"))
-        size = _as_int(data.get("size"))
-        score = ((width or 0) * (height or 0), bitrate or 0, size or 0)
-        candidates.append(
-            (
-                score,
-                RemoteAsset(
-                    candidates=urls,
-                    index=1,
-                    width=width,
-                    height=height,
-                    size=size,
-                    format_id=str(data.get("qualityType") or "stream"),
-                ),
+    for root in _video_media_roots(video):
+        for data in _walk_dicts(root):
+            master_url = data.get("masterUrl") or data.get("master_url")
+            backup_urls = _url_values(
+                data.get("backupUrls") or data.get("backup_urls")
             )
-        )
+            urls = _unique_urls([master_url, *backup_urls])
+            if not urls:
+                continue
+            width = _as_int(data.get("width"))
+            height = _as_int(data.get("height"))
+            bitrate = _as_int(
+                data.get("avgBitrate")
+                or data.get("avg_bitrate")
+                or data.get("videoBitrate")
+                or data.get("video_bitrate")
+            )
+            size = _as_int(data.get("size"))
+            score = ((width or 0) * (height or 0), bitrate or 0, size or 0)
+            candidates.append(
+                (
+                    score,
+                    RemoteAsset(
+                        candidates=urls,
+                        index=1,
+                        width=width,
+                        height=height,
+                        size=size,
+                        format_id=str(
+                            data.get("qualityType")
+                            or data.get("quality_type")
+                            or "stream"
+                        ),
+                    ),
+                )
+            )
     candidates.sort(key=lambda pair: pair[0], reverse=True)
     for _, asset in candidates:
         if not any(asset.candidates[0] in existing.candidates for existing in assets):
@@ -928,19 +1289,25 @@ def parse_note(
             "Xiaohongshu temporarily rate-limited the note request. Retry after a "
             "short wait; Chrome verification is not required."
         )
-    if _looks_like_auth_page(html):
-        raise AuthenticationRequiredError(
-            "Xiaohongshu requires a CAPTCHA or login. Complete it in Chrome and retry.",
-            verification_url=url,
-        )
+    state_error: Exception | None = None
+    note: Any = None
     try:
         state = _initial_state_from_html(html)
         note = (
             ((state.get("note") or {}).get("noteDetailMap") or {}).get(note_id) or {}
         ).get("note")
     except (ValueError, TypeError, json.JSONDecodeError) as exc:
-        raise DiscoveryError(f"Could not parse Xiaohongshu note data: {exc}") from exc
+        state_error = exc
     if not isinstance(note, dict) or not note:
+        if _looks_like_auth_page(html):
+            raise _xiaohongshu_auth_required(
+                url,
+                challenge=_looks_like_verification_challenge(html),
+            )
+        if state_error is not None:
+            raise DiscoveryError(
+                f"Could not parse Xiaohongshu note data: {state_error}"
+            ) from state_error
         if "xsec_token=" in urlsplit(url).query:
             canonical_url = _without_xsec_query(url)
             if canonical_url != url:

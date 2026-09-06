@@ -42,7 +42,23 @@ from app.task_manager import (
     DownloadManager,
     ItemNotRetryableError,
     XIAOHONGSHU_BINDING_REDISCOVERY_MARKER,
+    XIAOHONGSHU_MEDIA_VERIFICATION_MARKER,
+    XIAOHONGSHU_MEDIA_VERIFICATION_VERSION,
+    XIAOHONGSHU_PROFILE_MEDIA_REVALIDATION_MARKER,
+    XIAOHONGSHU_PROFILE_MEDIA_REVALIDATION_MESSAGE,
 )
+
+
+@pytest.fixture(autouse=True)
+def stable_xiaohongshu_chrome_profile(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "app.task_manager.select_chrome_profile_with_cookies",
+        lambda domain, cookie_names: "Default",
+    )
+    monkeypatch.setattr(
+        "app.task_manager.chrome_profile_has_cookies",
+        lambda profile, domain, cookie_names: True,
+    )
 
 
 class FakeEngine:
@@ -325,6 +341,481 @@ def complete_douyin_profile_metadata(
             "title": title,
         },
     }
+
+
+def test_xiaohongshu_job_pins_a_valid_chrome_profile_at_creation(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    calls: list[tuple[str, tuple[str, ...]]] = []
+    monkeypatch.setattr(
+        "app.task_manager.select_chrome_profile_with_cookies",
+        lambda domain, cookie_names: (
+            calls.append((domain, cookie_names)) or "Profile 1"
+        ),
+    )
+    manager = DownloadManager(
+        state_dir=tmp_path / "state",
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    try:
+        created = manager.create_job(
+            "https://www.xiaohongshu.com/user/profile/example",
+            cookie_browser="chrome",
+            auto_start=False,
+        )
+
+        assert created.cookie_profile == "Profile 1"
+        assert created.cookie_profile_auto_selected is True
+        assert calls == [("xiaohongshu.com", ("web_session", "id_token"))]
+        persisted = JsonJobStore(tmp_path / "state").get(created.id)
+        assert persisted.cookie_profile == "Profile 1"
+        assert persisted.cookie_profile_auto_selected is True
+    finally:
+        manager.shutdown()
+
+
+def test_explicit_chrome_profile_is_never_replaced(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(
+        "app.task_manager.select_chrome_profile_with_cookies",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("automatic profile selection must not run")
+        ),
+    )
+    manager = DownloadManager(
+        state_dir=tmp_path / "state",
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    try:
+        created = manager.create_job(
+            "https://www.xiaohongshu.com/user/profile/example",
+            cookie_browser="chrome",
+            cookie_profile="Profile 4",
+            auto_start=False,
+        )
+
+        assert created.cookie_profile == "Profile 4"
+        assert created.cookie_profile_auto_selected is False
+    finally:
+        manager.shutdown()
+
+
+def test_xiaohongshu_job_rejects_explicit_profile_without_session(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(
+        "app.task_manager.chrome_profile_has_cookies",
+        lambda *args, **kwargs: False,
+    )
+    monkeypatch.setattr(
+        "app.task_manager.select_chrome_profile_with_cookies",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("an explicit profile must not trigger automatic selection")
+        ),
+    )
+    manager = DownloadManager(
+        state_dir=tmp_path / "state",
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    try:
+        with pytest.raises(TemporaryAccessError, match="Chrome login/profile") as error:
+            manager.create_job(
+                "https://www.xiaohongshu.com/user/profile/example",
+                cookie_browser="chrome",
+                cookie_profile="Profile 4",
+                auto_start=False,
+            )
+
+        assert getattr(error.value, "verification_url", None) is None
+        assert manager.list_jobs() == []
+    finally:
+        manager.shutdown()
+
+
+def test_xiaohongshu_job_rejects_missing_chrome_session(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(
+        "app.task_manager.select_chrome_profile_with_cookies",
+        lambda *args, **kwargs: None,
+    )
+    manager = DownloadManager(
+        state_dir=tmp_path / "state",
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    try:
+        with pytest.raises(
+            TemporaryAccessError,
+            match="CAPTCHA verification is not required",
+        ) as error:
+            manager.create_job(
+                "https://www.xiaohongshu.com/user/profile/example",
+                cookie_browser="chrome",
+                auto_start=False,
+            )
+
+        assert getattr(error.value, "verification_url", None) is None
+        assert manager.list_jobs() == []
+    finally:
+        manager.shutdown()
+
+
+def test_legacy_xiaohongshu_job_pins_profile_before_retry_submission(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(
+        "app.task_manager.select_chrome_profile_with_cookies",
+        lambda *args, **kwargs: "Profile 1",
+    )
+    manager = DownloadManager(
+        state_dir=tmp_path / "state",
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    monkeypatch.setattr(manager._executor, "submit", lambda *args, **kwargs: object())
+    try:
+        created = DownloadJob(
+            id="legacy-xhs-null-profile",
+            source_url="https://www.xiaohongshu.com/user/profile/example",
+            platform=Platform.XIAOHONGSHU,
+            source_kind=SourceKind.PROFILE,
+            output_root=str(tmp_path / "downloads"),
+            cookie_browser="chrome",
+        )
+        with manager._lock:
+            manager._jobs[created.id] = created
+            manager.store.save(created)
+        assert created.cookie_profile is None
+
+        with manager._lock:
+            job = manager._require_job(created.id)
+            manager._submit_locked(job, None, rediscover=True)
+
+        rebound = manager.get_job(created.id)
+        assert rebound.cookie_profile == "Profile 1"
+        assert rebound.cookie_profile_auto_selected is True
+        persisted = JsonJobStore(tmp_path / "state").get(created.id)
+        assert persisted.cookie_profile == "Profile 1"
+        assert persisted.cookie_profile_auto_selected is True
+    finally:
+        manager.shutdown()
+
+
+def test_auto_selected_xiaohongshu_profile_is_reselected_after_machine_change(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(
+        "app.task_manager.select_chrome_profile_with_cookies",
+        lambda *args, **kwargs: "Profile 1",
+    )
+    first_manager = DownloadManager(
+        state_dir=tmp_path / "state",
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    try:
+        created = first_manager.create_job(
+            "https://www.xiaohongshu.com/user/profile/example",
+            cookie_browser="chrome",
+            auto_start=False,
+        )
+        assert created.cookie_profile == "Profile 1"
+        assert created.cookie_profile_auto_selected is True
+    finally:
+        first_manager.shutdown()
+
+    monkeypatch.setattr(
+        "app.task_manager.chrome_profile_has_cookies",
+        lambda profile, *args, **kwargs: profile == "Profile 7",
+    )
+    monkeypatch.setattr(
+        "app.task_manager.select_chrome_profile_with_cookies",
+        lambda *args, **kwargs: "Profile 7",
+    )
+    second_manager = DownloadManager(
+        state_dir=tmp_path / "state",
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    monkeypatch.setattr(
+        second_manager._executor,
+        "submit",
+        lambda *args, **kwargs: object(),
+    )
+    try:
+        restored = second_manager.get_job(created.id)
+        assert restored.cookie_profile == "Profile 1"
+        assert restored.cookie_profile_auto_selected is True
+        with second_manager._lock:
+            job = second_manager._require_job(created.id)
+            second_manager._submit_locked(job, None, rediscover=True)
+
+        rebound = second_manager.get_job(created.id)
+        assert rebound.cookie_profile == "Profile 7"
+        assert rebound.cookie_profile_auto_selected is True
+        persisted = JsonJobStore(tmp_path / "state").get(created.id)
+        assert persisted.cookie_profile == "Profile 7"
+        assert persisted.cookie_profile_auto_selected is True
+    finally:
+        second_manager.shutdown()
+
+
+def test_explicit_xiaohongshu_profile_remains_strict_after_machine_change(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    manager = DownloadManager(
+        state_dir=tmp_path / "state",
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    try:
+        created = manager.create_job(
+            "https://www.xiaohongshu.com/user/profile/example",
+            cookie_browser="chrome",
+            cookie_profile="Profile 4",
+            auto_start=False,
+        )
+        monkeypatch.setattr(
+            "app.task_manager.chrome_profile_has_cookies",
+            lambda *args, **kwargs: False,
+        )
+        monkeypatch.setattr(
+            "app.task_manager.select_chrome_profile_with_cookies",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("an explicit profile must never be reselected")
+            ),
+        )
+
+        with pytest.raises(TemporaryAccessError, match="Chrome login/profile"):
+            with manager._lock:
+                job = manager._require_job(created.id)
+                manager._submit_locked(job, None, rediscover=True)
+
+        unchanged = manager.get_job(created.id)
+        assert unchanged.cookie_profile == "Profile 4"
+        assert unchanged.cookie_profile_auto_selected is False
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.parametrize("legacy_cookie_browser", ["Chrome", " chrome ", "firefox"])
+def test_legacy_xiaohongshu_cookie_browser_never_reaches_executor(
+    monkeypatch,
+    tmp_path,
+    legacy_cookie_browser: str,
+) -> None:
+    manager = DownloadManager(
+        state_dir=tmp_path / "state",
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    monkeypatch.setattr(
+        manager._executor,
+        "submit",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("an unsupported browser must not reach the worker")
+        ),
+    )
+    try:
+        legacy = DownloadJob.model_validate(
+            {
+                "id": f"legacy-xhs-{legacy_cookie_browser.strip()}",
+                "source_url": ("https://www.xiaohongshu.com/user/profile/example"),
+                "platform": Platform.XIAOHONGSHU,
+                "source_kind": SourceKind.PROFILE,
+                "output_root": str(tmp_path / "downloads"),
+                "cookie_browser": legacy_cookie_browser,
+            }
+        )
+        assert legacy.cookie_profile_auto_selected is False
+
+        with pytest.raises(TemporaryAccessError, match="unsupported cookie-browser"):
+            with manager._lock:
+                manager._jobs[legacy.id] = legacy
+                manager._submit_locked(legacy, None, rediscover=True)
+
+        assert legacy.cookie_profile is None
+    finally:
+        manager.shutdown()
+
+
+def test_legacy_xiaohongshu_verification_binds_and_persists_profile(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    calls: list[tuple[str, tuple[str, ...]]] = []
+    monkeypatch.setattr(
+        "app.task_manager.select_chrome_profile_with_cookies",
+        lambda domain, cookie_names: (
+            calls.append((domain, cookie_names)) or "Profile 2"
+        ),
+    )
+    manager = DownloadManager(
+        state_dir=tmp_path / "state",
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    try:
+        legacy = DownloadJob(
+            id="legacy-xhs-null-verification-profile",
+            source_url="https://www.xiaohongshu.com/user/profile/example",
+            platform=Platform.XIAOHONGSHU,
+            source_kind=SourceKind.PROFILE,
+            output_root=str(tmp_path / "downloads"),
+            status=JobStatus.NEEDS_AUTH,
+            cookie_browser="chrome",
+        )
+        with manager._lock:
+            manager._jobs[legacy.id] = legacy
+            manager.store.save(legacy)
+
+        bound = manager.bind_xiaohongshu_verification_profile(legacy.id)
+
+        assert bound.cookie_profile == "Profile 2"
+        assert bound.cookie_profile_auto_selected is True
+        assert calls == [("xiaohongshu.com", ("web_session", "id_token"))]
+        persisted = JsonJobStore(tmp_path / "state").get(legacy.id)
+        assert persisted.cookie_profile == "Profile 2"
+        assert persisted.cookie_profile_auto_selected is True
+    finally:
+        manager.shutdown()
+
+
+def test_auto_selected_xiaohongshu_verification_profile_can_be_reselected(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(
+        "app.task_manager.select_chrome_profile_with_cookies",
+        lambda *args, **kwargs: "Profile 1",
+    )
+    manager = DownloadManager(
+        state_dir=tmp_path / "state",
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    try:
+        created = manager.create_job(
+            "https://www.xiaohongshu.com/user/profile/example",
+            cookie_browser="chrome",
+            auto_start=False,
+        )
+        with manager._lock:
+            job = manager._require_job(created.id)
+            job.status = JobStatus.NEEDS_AUTH
+            manager._commit_locked(job)
+        monkeypatch.setattr(
+            "app.task_manager.chrome_profile_has_cookies",
+            lambda profile, *args, **kwargs: profile == "Profile 2",
+        )
+        monkeypatch.setattr(
+            "app.task_manager.select_chrome_profile_with_cookies",
+            lambda *args, **kwargs: "Profile 2",
+        )
+
+        rebound = manager.bind_xiaohongshu_verification_profile(created.id)
+
+        assert rebound.cookie_profile == "Profile 2"
+        assert rebound.cookie_profile_auto_selected is True
+        persisted = JsonJobStore(tmp_path / "state").get(created.id)
+        assert persisted.cookie_profile == "Profile 2"
+        assert persisted.cookie_profile_auto_selected is True
+    finally:
+        manager.shutdown()
+
+
+def test_legacy_xiaohongshu_job_without_session_never_reaches_executor(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(
+        "app.task_manager.select_chrome_profile_with_cookies",
+        lambda *args, **kwargs: None,
+    )
+    manager = DownloadManager(
+        state_dir=tmp_path / "state",
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    monkeypatch.setattr(
+        manager._executor,
+        "submit",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("a null profile must not reach the worker")
+        ),
+    )
+    try:
+        legacy = DownloadJob(
+            id="legacy-xhs-without-session",
+            source_url="https://www.xiaohongshu.com/user/profile/example",
+            platform=Platform.XIAOHONGSHU,
+            source_kind=SourceKind.PROFILE,
+            output_root=str(tmp_path / "downloads"),
+            cookie_browser="chrome",
+        )
+        with manager._lock:
+            manager._jobs[legacy.id] = legacy
+            manager.store.save(legacy)
+
+        with pytest.raises(TemporaryAccessError, match="Chrome login/profile") as error:
+            with manager._lock:
+                manager._submit_locked(legacy, None, rediscover=True)
+
+        persisted = JsonJobStore(tmp_path / "state").get(legacy.id)
+        assert persisted.cookie_profile is None
+        assert persisted.verification_url is None
+        assert getattr(error.value, "verification_url", None) is None
+    finally:
+        manager.shutdown()
+
+
+def test_xiaohongshu_worker_turns_profile_drift_into_temporary_failure(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    manager = DownloadManager(
+        state_dir=tmp_path / "state",
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    try:
+        created = manager.create_job(
+            "https://www.xiaohongshu.com/user/profile/example",
+            cookie_browser=None,
+            auto_start=False,
+        )
+        with manager._lock:
+            job = manager._require_job(created.id)
+            job.cookie_browser = "chrome"
+            job.cookie_profile = None
+            manager._commit_locked(job)
+        monkeypatch.setattr(
+            "app.task_manager.select_chrome_profile_with_cookies",
+            lambda *args, **kwargs: None,
+        )
+
+        manager._run_job(created.id, None, True, threading.Event())
+
+        failed = manager.get_job(created.id)
+        assert failed.status == JobStatus.FAILED
+        assert failed.cookie_profile is None
+        assert failed.verification_url is None
+        assert failed.auth_message is None
+        assert "Chrome login/profile" in (failed.error or "")
+    finally:
+        manager.shutdown()
 
 
 @pytest.mark.parametrize(
@@ -1198,6 +1689,208 @@ def test_persisted_xiaohongshu_direct_binding_failure_rediscovery_after_restart(
         assert [item.media_id for item in completed.items] == [expected_id]
     finally:
         second_manager.shutdown()
+
+
+def test_restore_migrates_only_unverified_completed_xiaohongshu_profile_images(
+    tmp_path,
+) -> None:
+    state_dir = tmp_path / "state"
+    output_root = tmp_path / "downloads"
+    legacy_path = output_root / "legacy-image.webp"
+    job = DownloadJob(
+        id="legacy-xhs-profile-images",
+        source_url="https://www.xiaohongshu.com/user/profile/expected",
+        platform=Platform.XIAOHONGSHU,
+        source_kind=SourceKind.PROFILE,
+        output_root=str(output_root),
+        status=JobStatus.COMPLETED,
+        items=[
+            DownloadItem(
+                id="legacy-image",
+                media_id="6411cf99000000001300b6d9",
+                source_url=(
+                    "https://www.xiaohongshu.com/explore/"
+                    "6411cf99000000001300b6d9"
+                ),
+                media_type=MediaType.IMAGE,
+                status=ItemStatus.COMPLETED,
+                output_paths=[str(legacy_path)],
+            ),
+            DownloadItem(
+                id="verified-image",
+                media_id="6411cf99000000001300b6da",
+                source_url=(
+                    "https://www.xiaohongshu.com/explore/"
+                    "6411cf99000000001300b6da"
+                ),
+                media_type=MediaType.IMAGE,
+                status=ItemStatus.COMPLETED,
+                metadata={
+                    XIAOHONGSHU_MEDIA_VERIFICATION_MARKER: (
+                        XIAOHONGSHU_MEDIA_VERIFICATION_VERSION
+                    )
+                },
+            ),
+            DownloadItem(
+                id="legacy-video",
+                media_id="6411cf99000000001300b6db",
+                source_url=(
+                    "https://www.xiaohongshu.com/explore/"
+                    "6411cf99000000001300b6db"
+                ),
+                media_type=MediaType.VIDEO,
+                status=ItemStatus.COMPLETED,
+            ),
+        ],
+    )
+    job.refresh_counts()
+    JsonJobStore(state_dir).save(job)
+
+    manager = DownloadManager(
+        state_dir=state_dir,
+        default_output_root=output_root,
+        max_workers=1,
+    )
+    try:
+        restored = manager.get_job(job.id)
+        items = {item.id: item for item in restored.items}
+
+        assert restored.status == JobStatus.INTERRUPTED
+        assert restored.discovery_complete is False
+        assert restored.retryable is True
+        assert restored.error == XIAOHONGSHU_PROFILE_MEDIA_REVALIDATION_MESSAGE
+        assert restored.completed_items == 2
+        assert restored.failed_items == 1
+        assert items["legacy-image"].status == ItemStatus.FAILED
+        assert items["legacy-image"].output_paths == [str(legacy_path)]
+        assert items["legacy-image"].metadata[
+            XIAOHONGSHU_PROFILE_MEDIA_REVALIDATION_MARKER
+        ] is True
+        assert items["verified-image"].status == ItemStatus.COMPLETED
+        assert items["legacy-video"].status == ItemStatus.COMPLETED
+
+        persisted = JsonJobStore(state_dir).get(job.id)
+        assert persisted.status == JobStatus.INTERRUPTED
+        assert persisted.items[0].output_paths == [str(legacy_path)]
+    finally:
+        manager.shutdown()
+
+
+def test_legacy_xiaohongshu_profile_image_is_rediscovered_as_video(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    profile_id = "expected"
+    note_id = "6411cf99000000001300b6d9"
+    profile_url = f"https://www.xiaohongshu.com/user/profile/{profile_id}"
+    note_url = f"https://www.xiaohongshu.com/explore/{note_id}"
+    state_dir = tmp_path / "state"
+    output_root = tmp_path / "downloads"
+    old_file = output_root / "legacy-image.webp"
+    old_file.parent.mkdir(parents=True)
+    old_file.write_bytes(b"preserved")
+    legacy = DownloadJob(
+        id="legacy-xhs-profile-video",
+        source_url=profile_url,
+        platform=Platform.XIAOHONGSHU,
+        source_kind=SourceKind.PROFILE,
+        output_root=str(output_root),
+        status=JobStatus.COMPLETED,
+        cookie_browser=None,
+        items=[
+            DownloadItem(
+                id="legacy-image",
+                media_id=note_id,
+                source_url=note_url,
+                title="Legacy cover",
+                media_type=MediaType.IMAGE,
+                status=ItemStatus.COMPLETED,
+                output_paths=[str(old_file)],
+            )
+        ],
+    )
+    legacy.refresh_counts()
+    JsonJobStore(state_dir).save(legacy)
+
+    class RevalidationEngine:
+        def __init__(self) -> None:
+            self.discovery_calls = 0
+            self.download_calls = 0
+
+        def discover(self, url, platform, kind, *, should_cancel):
+            self.discovery_calls += 1
+            return DiscoveryResult(
+                author="Verified Author",
+                items=[
+                    DownloadItem(
+                        id="fresh-video",
+                        media_id=note_id,
+                        source_url=note_url,
+                        title="Verified video",
+                        media_type=MediaType.VIDEO,
+                        metadata={
+                            "xiaohongshu_profile_id": profile_id,
+                            "profile_note_membership_verified": True,
+                        },
+                    )
+                ],
+            )
+
+        def download_item(
+            self,
+            item,
+            platform,
+            output_dir,
+            *,
+            callback,
+            should_cancel,
+        ):
+            self.download_calls += 1
+            assert item.media_type == MediaType.VIDEO
+            assert item.output_paths == [str(old_file)]
+            assert (
+                XIAOHONGSHU_PROFILE_MEDIA_REVALIDATION_MARKER
+                not in item.metadata
+            )
+            return DownloadOutcome(
+                output_paths=[str(Path(output_dir) / "verified-video.mp4")],
+                title=item.title,
+                author="Verified Author",
+                media_type=MediaType.VIDEO,
+                selected_format="original-video",
+                resolution="1080x1920",
+            )
+
+    manager = DownloadManager(
+        state_dir=state_dir,
+        default_output_root=output_root,
+        max_workers=1,
+    )
+    engine = RevalidationEngine()
+    monkeypatch.setattr(manager, "_engine_for_job", lambda job: engine)
+    try:
+        restored = manager.get_job(legacy.id)
+        assert restored.status == JobStatus.INTERRUPTED
+
+        manager.retry_failed(legacy.id)
+        completed = wait_for_job(manager, legacy.id)
+
+        assert completed.status == JobStatus.COMPLETED
+        assert engine.discovery_calls == 1
+        assert engine.download_calls == 1
+        assert len(completed.items) == 1
+        assert completed.items[0].id == "fresh-video"
+        assert completed.items[0].media_type == MediaType.VIDEO
+        assert completed.items[0].metadata[
+            XIAOHONGSHU_MEDIA_VERIFICATION_MARKER
+        ] == XIAOHONGSHU_MEDIA_VERIFICATION_VERSION
+        assert (
+            XIAOHONGSHU_PROFILE_MEDIA_REVALIDATION_MARKER
+            not in completed.items[0].metadata
+        )
+        assert old_file.read_bytes() == b"preserved"
+    finally:
+        manager.shutdown()
 
 
 def test_persisted_xiaohongshu_profile_item_is_revalidated_before_download(

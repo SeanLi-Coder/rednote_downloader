@@ -44,7 +44,17 @@ from app.errors import (
     TemporaryAccessError,
 )
 from app.models import DownloadItem, MediaType, Platform, SourceKind
-from app.xiaohongshu import RemoteAsset, XiaohongshuNote
+from app.xiaohongshu import (
+    XIAOHONGSHU_MAX_REDIRECTS,
+    RemoteAsset,
+    XiaohongshuNote,
+    _XiaohongshuRedirectRejected,
+    _open_xiaohongshu_response,
+    is_trusted_xiaohongshu_asset_url,
+)
+
+
+_REAL_OPEN_XIAOHONGSHU_RESPONSE = _open_xiaohongshu_response
 
 
 class FakeYoutubeDL:
@@ -187,6 +197,39 @@ class _QueuedRequestsSession:
         return self.responses[len(self.requests) - 1]
 
 
+@pytest.fixture(autouse=True)
+def _adapt_lightweight_xiaohongshu_asset_ytdl_fakes(monkeypatch) -> None:
+    """Keep asset-stream fakes while preserving fail-closed URL validation."""
+
+    def open_response(
+        ydl,
+        request,
+        *,
+        is_trusted_url,
+        max_redirects=XIAOHONGSHU_MAX_REDIRECTS,
+    ):
+        del max_redirects
+        if not is_trusted_url(request.url):
+            raise _XiaohongshuRedirectRejected(
+                "untrusted-url",
+                target_url=request.url,
+            )
+        response = ydl.urlopen(request)
+        final_url = str(getattr(response, "url", None) or request.url)
+        if not is_trusted_url(final_url):
+            response.close()
+            raise _XiaohongshuRedirectRejected(
+                "untrusted-response-url",
+                target_url=final_url,
+            )
+        return response
+
+    monkeypatch.setattr(
+        "app.downloader._open_xiaohongshu_response",
+        open_response,
+    )
+
+
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
@@ -246,6 +289,40 @@ def test_item_key_is_stable_when_profile_tokens_change() -> None:
     )
 
     assert first == refreshed
+
+
+@pytest.mark.parametrize(
+    ("cookie_browser", "cookie_profile", "expected_message"),
+    [
+        ("firefox", None, "unsupported cookie-browser"),
+        ("Chrome", None, "unsupported cookie-browser"),
+        ("chrome", None, "bound Chrome profile"),
+    ],
+)
+def test_xhs_cookie_settings_never_fall_back_to_default_browser_scan(
+    monkeypatch,
+    cookie_browser: str,
+    cookie_profile: str | None,
+    expected_message: str,
+) -> None:
+    class UnexpectedYoutubeDL:
+        def __init__(self, options):
+            raise AssertionError("yt-dlp must not scan a default browser profile")
+
+    monkeypatch.setattr("app.downloader.YoutubeDL", UnexpectedYoutubeDL)
+    engine = MediaDownloader(
+        DownloaderConfig(
+            cookie_browser=cookie_browser,
+            cookie_profile=cookie_profile,
+        )
+    )
+
+    with pytest.raises(TemporaryAccessError, match=expected_message):
+        engine.discover(
+            "https://xhslink.com/a/stable-short-code",
+            Platform.XIAOHONGSHU,
+            SourceKind.SHORT_LINK,
+        )
 
 
 def test_output_template_uses_date_prefix_and_explicit_unknown_fallback() -> None:
@@ -7562,14 +7639,12 @@ def test_xhs_asset_request_blocks_untrusted_final_redirect_before_read(
     ydl = AssetYoutubeDL()
     engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
 
-    with pytest.raises(MediaDownloadError, match="untrusted URL"):
+    with pytest.raises(MediaDownloadError, match="blocked before requesting"):
         engine._download_first_available_asset(
             ydl,
             [
                 RemoteAsset(
-                    candidates=[
-                        "https://sns-img-bd.xhscdn.com/redirectable-original"
-                    ],
+                    candidates=["https://sns-img-bd.xhscdn.com/redirectable-original"],
                     index=1,
                 )
             ],
@@ -7587,6 +7662,46 @@ def test_xhs_asset_request_blocks_untrusted_final_redirect_before_read(
 
     assert ydl.response.read_calls == 0
     assert ydl.response.closed is True
+    assert not list(tmp_path.iterdir())
+
+
+def test_xhs_asset_redirect_never_requests_untrusted_next_hop(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    media_url = "https://sns-img-bd.xhscdn.com/redirectable-original"
+    blocked_url = "http://127.0.0.1:8080/private.jpg"
+    first_response = _FakeRequestsResponse(media_url, location=blocked_url)
+    session = _QueuedRequestsSession([first_response])
+    ydl = YoutubeDL({"quiet": True, "proxy": ""})
+    handler = ydl._request_director.handlers["Requests"]
+    monkeypatch.setattr(handler, "_get_instance", lambda **kwargs: session)
+    monkeypatch.setattr(
+        "app.downloader._open_xiaohongshu_response",
+        _REAL_OPEN_XIAOHONGSHU_RESPONSE,
+    )
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+
+    with ydl, pytest.raises(MediaDownloadError, match="blocked before requesting"):
+        engine._download_first_available_asset(
+            ydl,
+            [RemoteAsset(candidates=[media_url], index=1)],
+            tmp_path,
+            "2025-11-14",
+            "Title",
+            "6411cf99000000001300b6d9",
+            "https://www.xiaohongshu.com/explore/6411cf99000000001300b6d9",
+            media_type=MediaType.IMAGE,
+            platform=Platform.XIAOHONGSHU,
+            callback=None,
+            should_cancel=lambda: False,
+            asset_index=1,
+        )
+
+    assert [request["url"] for request in session.requests] == [media_url]
+    assert blocked_url not in [request["url"] for request in session.requests]
+    assert session.requests[0]["allow_redirects"] is False
+    assert first_response.closed is True
     assert not list(tmp_path.iterdir())
 
 
@@ -8138,6 +8253,80 @@ def test_xhs_profile_download_blocks_note_from_different_author(
     )
 
     with pytest.raises(MediaDownloadError, match="cross-wired"):
+        engine.download_item(item, Platform.XIAOHONGSHU, tmp_path)
+
+    assert not list(tmp_path.iterdir())
+
+
+def test_xhs_video_without_trusted_stream_is_not_discovered_as_image(
+    monkeypatch,
+) -> None:
+    note_id = "6411cf99000000001300b6d9"
+    note = XiaohongshuNote(
+        note_id=note_id,
+        title="Video with cover only",
+        author="Test Author",
+        upload_date="2025-11-14",
+        images=[
+            RemoteAsset(
+                candidates=["https://sns-img-bd.xhscdn.com/video-cover"],
+                index=1,
+            )
+        ],
+        raw={"type": "video"},
+    )
+    monkeypatch.setattr(
+        "app.downloader.parse_xhs_note",
+        lambda *args, **kwargs: (note, False),
+    )
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+
+    with pytest.raises(TemporaryAccessError, match="cover image was not downloaded"):
+        engine.discover(
+            f"https://www.xiaohongshu.com/explore/{note_id}",
+            Platform.XIAOHONGSHU,
+            SourceKind.ITEM,
+        )
+
+
+def test_xhs_video_without_trusted_stream_never_downloads_cover(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    note_id = "6411cf99000000001300b6d9"
+    note = XiaohongshuNote(
+        note_id=note_id,
+        title="Video with cover only",
+        author="Test Author",
+        upload_date="2025-11-14",
+        images=[
+            RemoteAsset(
+                candidates=["https://sns-img-bd.xhscdn.com/video-cover"],
+                index=1,
+            )
+        ],
+        raw={"type": "video"},
+    )
+    monkeypatch.setattr(
+        "app.downloader.parse_xhs_note",
+        lambda *args, **kwargs: (note, False),
+    )
+
+    class UnexpectedYoutubeDL:
+        def __init__(self, options):
+            raise AssertionError("A video cover must never be downloaded as media")
+
+    monkeypatch.setattr("app.downloader.YoutubeDL", UnexpectedYoutubeDL)
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    item = DownloadItem(
+        id=note_id,
+        media_id=note_id,
+        source_url=f"https://www.xiaohongshu.com/explore/{note_id}",
+        title=note.title,
+        media_type=MediaType.UNKNOWN,
+    )
+
+    with pytest.raises(MediaDownloadError, match="cover image was not downloaded"):
         engine.download_item(item, Platform.XIAOHONGSHU, tmp_path)
 
     assert not list(tmp_path.iterdir())

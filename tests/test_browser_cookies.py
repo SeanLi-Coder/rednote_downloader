@@ -1,8 +1,19 @@
 from __future__ import annotations
 
+import json
+import sqlite3
+from pathlib import Path
+
 import pytest
 
-from app.browser import chrome_user_agent
+from app.browser import (
+    chrome_profile_has_cookie,
+    chrome_profile_has_cookies,
+    chrome_user_agent,
+    open_chrome,
+    select_chrome_profile_with_cookie,
+    select_chrome_profile_with_cookies,
+)
 from app.douyin import discover_profile as discover_douyin_profile
 from app.errors import AuthenticationRequiredError, TemporaryAccessError
 from app.douyin import _cookie_jar_to_playwright as douyin_cookies
@@ -21,6 +32,40 @@ class FakeCookie:
 
     def has_nonstandard_attr(self, name: str) -> bool:
         return name == "HttpOnly"
+
+
+def _write_chrome_cookie_database(
+    root: Path,
+    profile: str,
+    *,
+    expires_utc: int,
+    cookie_names: tuple[str, ...] = ("web_session",),
+) -> None:
+    directory = root / profile
+    directory.mkdir(parents=True)
+    connection = sqlite3.connect(directory / "Cookies")
+    try:
+        connection.execute(
+            "CREATE TABLE cookies ("
+            "host_key TEXT, name TEXT, value TEXT, encrypted_value BLOB, "
+            "expires_utc INTEGER)"
+        )
+        connection.executemany(
+            "INSERT INTO cookies VALUES (?, ?, ?, ?, ?)",
+            [
+                (
+                    ".xiaohongshu.com",
+                    cookie_name,
+                    "",
+                    b"encrypted",
+                    expires_utc,
+                )
+                for cookie_name in cookie_names
+            ],
+        )
+        connection.commit()
+    finally:
+        connection.close()
 
 
 @pytest.mark.parametrize(
@@ -70,6 +115,239 @@ def test_chrome_user_agent_matches_host_platform(
 
     assert expected_token in value
     assert "Chrome/140.0.0.0" in value
+
+
+def test_chrome_profile_selection_uses_a_valid_site_session_deterministically(
+    tmp_path: Path,
+) -> None:
+    chrome_now = int((2_000_000_000 + 11_644_473_600) * 1_000_000)
+    _write_chrome_cookie_database(
+        tmp_path,
+        "Profile 1",
+        expires_utc=chrome_now + 1_000_000,
+    )
+    _write_chrome_cookie_database(
+        tmp_path,
+        "Profile 4",
+        expires_utc=chrome_now - 1_000_000,
+    )
+    (tmp_path / "Local State").write_text(
+        json.dumps(
+            {
+                "profile": {
+                    "last_used": "Profile 4",
+                    "info_cache": {
+                        "Profile 1": {"active_time": 1},
+                        "Profile 4": {"active_time": 2},
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert select_chrome_profile_with_cookie(
+        "xiaohongshu.com",
+        "web_session",
+        user_data_dir=tmp_path,
+        now=2_000_000_000,
+    ) == "Profile 1"
+
+
+def test_chrome_profile_selection_prefers_last_used_among_valid_profiles(
+    tmp_path: Path,
+) -> None:
+    _write_chrome_cookie_database(tmp_path, "Profile 1", expires_utc=0)
+    _write_chrome_cookie_database(tmp_path, "Profile 4", expires_utc=0)
+    (tmp_path / "Local State").write_text(
+        json.dumps(
+            {
+                "profile": {
+                    "last_used": "Profile 4",
+                    "info_cache": {
+                        "Profile 1": {"active_time": 20},
+                        "Profile 4": {"active_time": 10},
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert select_chrome_profile_with_cookie(
+        "xiaohongshu.com",
+        "web_session",
+        user_data_dir=tmp_path,
+        now=2_000_000_000,
+    ) == "Profile 4"
+
+
+def test_explicit_chrome_profile_requires_a_current_site_session(
+    tmp_path: Path,
+) -> None:
+    chrome_now = int((2_000_000_000 + 11_644_473_600) * 1_000_000)
+    _write_chrome_cookie_database(
+        tmp_path,
+        "Profile 1",
+        expires_utc=chrome_now + 1_000_000,
+    )
+    _write_chrome_cookie_database(
+        tmp_path,
+        "Profile 4",
+        expires_utc=chrome_now - 1_000_000,
+    )
+
+    assert chrome_profile_has_cookie(
+        "Profile 1",
+        "xiaohongshu.com",
+        "web_session",
+        user_data_dir=tmp_path,
+        now=2_000_000_000,
+    )
+    assert not chrome_profile_has_cookie(
+        "Profile 4",
+        "xiaohongshu.com",
+        "web_session",
+        user_data_dir=tmp_path,
+        now=2_000_000_000,
+    )
+    assert not chrome_profile_has_cookie(
+        "../../Other",
+        "xiaohongshu.com",
+        "web_session",
+        user_data_dir=tmp_path,
+        now=2_000_000_000,
+    )
+
+
+def test_authenticated_profile_selection_rejects_anonymous_web_session(
+    tmp_path: Path,
+) -> None:
+    _write_chrome_cookie_database(
+        tmp_path,
+        "Profile 1",
+        expires_utc=0,
+        cookie_names=("web_session", "id_token"),
+    )
+    _write_chrome_cookie_database(
+        tmp_path,
+        "Profile 4",
+        expires_utc=0,
+        cookie_names=("web_session",),
+    )
+    (tmp_path / "Local State").write_text(
+        json.dumps(
+            {
+                "profile": {
+                    "last_used": "Profile 4",
+                    "info_cache": {
+                        "Profile 1": {"active_time": 1},
+                        "Profile 4": {"active_time": 2},
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    required = ("web_session", "id_token")
+    assert select_chrome_profile_with_cookies(
+        "xiaohongshu.com",
+        required,
+        user_data_dir=tmp_path,
+        now=2_000_000_000,
+    ) == "Profile 1"
+    assert chrome_profile_has_cookies(
+        "Profile 1",
+        "xiaohongshu.com",
+        required,
+        user_data_dir=tmp_path,
+        now=2_000_000_000,
+    )
+    assert not chrome_profile_has_cookies(
+        "Profile 4",
+        "xiaohongshu.com",
+        required,
+        user_data_dir=tmp_path,
+        now=2_000_000_000,
+    )
+
+
+def test_profile_cookie_probe_tries_older_database_when_newer_one_is_unreadable(
+    tmp_path: Path,
+) -> None:
+    _write_chrome_cookie_database(
+        tmp_path,
+        "Profile 1",
+        expires_utc=0,
+        cookie_names=("web_session", "id_token"),
+    )
+    network_directory = tmp_path / "Profile 1" / "Network"
+    network_directory.mkdir()
+    (network_directory / "Cookies").write_bytes(b"not a sqlite database")
+
+    assert chrome_profile_has_cookies(
+        "Profile 1",
+        "xiaohongshu.com",
+        ("web_session", "id_token"),
+        user_data_dir=tmp_path,
+        now=2_000_000_000,
+    )
+
+
+def test_profile_cookie_probe_encodes_special_characters_in_database_path(
+    tmp_path: Path,
+) -> None:
+    user_data = tmp_path / "chrome # question? data"
+    _write_chrome_cookie_database(
+        user_data,
+        "Profile 1",
+        expires_utc=0,
+        cookie_names=("web_session", "id_token"),
+    )
+
+    assert chrome_profile_has_cookies(
+        "Profile 1",
+        "xiaohongshu.com",
+        ("web_session", "id_token"),
+        user_data_dir=user_data,
+        now=2_000_000_000,
+    )
+
+
+def test_open_chrome_uses_the_bound_profile_directory_on_macos(monkeypatch) -> None:
+    commands: list[list[str]] = []
+    monkeypatch.setattr("app.browser.sys.platform", "darwin")
+    monkeypatch.setattr(
+        "app.browser._macos_chrome_executable",
+        lambda: Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+    )
+    monkeypatch.setattr(
+        "app.browser.subprocess.Popen",
+        lambda command, **kwargs: commands.append(command),
+    )
+
+    open_chrome("https://www.xiaohongshu.com/explore/abc123", "Profile 1")
+
+    assert commands == [
+        [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "--profile-directory=Profile 1",
+            "https://www.xiaohongshu.com/explore/abc123",
+        ]
+    ]
+
+
+def test_open_chrome_rejects_untrusted_profile_directory(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "app.browser.subprocess.Popen",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("Chrome must not start")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="profile directory is invalid"):
+        open_chrome("https://www.xiaohongshu.com/", "../../Other")
 
 
 @pytest.mark.parametrize(

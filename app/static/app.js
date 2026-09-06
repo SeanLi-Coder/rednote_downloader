@@ -430,8 +430,21 @@
     return /\/user\/[^/?#]+(?:[/?#]|$)/i.test(url);
   }
 
+  function isXiaohongshuVerificationItem(job) {
+    if (platformMeta(job).key !== "xiaohongshu") return false;
+    const url = String(firstDefined(job?.verification_url, job?.verificationUrl, ""));
+    return /\/(?:explore|discovery\/item)\/[0-9a-f]+(?:[/?#]|$)/i.test(url);
+  }
+
+  function isXiaohongshuLoginSessionIssue(job) {
+    const message = String(firstDefined(job?.auth_message, job?.authMessage, job?.error, ""));
+    return platformMeta(job).key === "xiaohongshu" && message.includes("login session");
+  }
+
   function verificationTarget(job) {
-    return isProfileJob(job) ? "原主页" : "原视频";
+    if (isXiaohongshuVerificationItem(job)) return "触发验证的作品";
+    if (isProfileJob(job)) return "原主页";
+    return platformMeta(job).key === "xiaohongshu" ? "原作品" : "原视频";
   }
 
   function getAuthor(job) {
@@ -829,6 +842,24 @@
       text.includes("Xiaohongshu returned no note data for the saved access token")
     ) {
       return "小红书本次遇到临时限流、超时或作品访问令牌失效。请稍等后直接重试；主页任务会重新解析令牌，没有明确验证码或登录页面时不需要打开 Chrome。";
+    }
+    if (text.includes("No current authenticated Xiaohongshu session was found in the selected Chrome profile")) {
+      return "没有在 Chrome 中找到有效的小红书登录会话。请用任意普通 Chrome Profile 登录小红书后重试；这是 Chrome 登录状态问题，不是验证码，程序不会改用未登录请求。";
+    }
+    if (text.includes("The Xiaohongshu task has an unsupported cookie-browser setting")) {
+      return "这个旧任务的浏览器 Cookie 设置无效。请在设置中启用 Chrome Cookie，或明确关闭浏览器 Cookie 后重新创建任务；程序不会偷偷改用其他浏览器身份。";
+    }
+    if (text.includes("Xiaohongshu did not accept the selected Chrome profile's login session")) {
+      return `小红书没有接受该任务绑定的 Chrome Profile 登录状态。请在同一个 Profile 打开${verificationTarget(job)}并重新登录或刷新后再重试；这不是验证码，除非 Chrome 页面确实显示验证码。`;
+    }
+    if (text.includes("Xiaohongshu displayed an explicit verification challenge")) {
+      return `小红书页面已明确显示验证码。请在该任务绑定的 Chrome Profile 打开${verificationTarget(job)}完成验证后再重试。`;
+    }
+    if (text.includes("Xiaohongshu identified this work as a video but returned no trusted video stream")) {
+      return "小红书明确把这个作品标记为视频，但本次没有返回可信的视频流。程序没有把封面图片冒充视频保存；请从原作品链接重试。";
+    }
+    if (text.includes("This Xiaohongshu profile item was completed by an older version without verified media-type metadata")) {
+      return "这个小红书作品曾被旧版在未验证媒体类型时标记为完成。已有文件会保留；请点击继续任务，程序会从原主页重新识别它是图片还是视频，并补下真实视频。";
     }
     if (text.includes("Xiaohongshu stopped returning new notes before the profile reported completion") || text.includes("Xiaohongshu reached the discovery safety limit before confirming the end of the profile")) {
       return "小红书主页在确认列表结束前停止返回新作品。当前结果可能不完整，请稍后点击继续发现；已有成功记录不会重复下载。";
@@ -1297,9 +1328,18 @@
         job?.error,
         "请打开对应网站，完成登录或验证码后回到这里继续。"
       ), job);
-      elements.authOpenButton.textContent = isProfileJob(job)
-        ? "打开 Chrome 验证主页"
-        : "打开 Chrome 验证视频";
+      const xiaohongshuLogin = isXiaohongshuLoginSessionIssue(job);
+      elements.authOpenButton.textContent = isXiaohongshuVerificationItem(job)
+        ? xiaohongshuLogin
+          ? "打开 Chrome 登录作品"
+          : "打开 Chrome 验证作品"
+        : isProfileJob(job)
+          ? xiaohongshuLogin
+            ? "打开 Chrome 登录主页"
+            : "打开 Chrome 验证主页"
+          : platform.key === "xiaohongshu"
+            ? "打开 Chrome 验证作品"
+            : "打开 Chrome 验证视频";
     }
     const items = getItems(job);
     const discoveryFailureMessage = canonicalStatus(job) === "failed" && (items.length === 0 || job?.discovery_complete === false)
@@ -1532,8 +1572,9 @@
       showToast("下载任务已创建，正在解析链接");
       document.querySelector(".job-panel")?.scrollIntoView({ behavior: "smooth", block: "start" });
     } catch (error) {
-      elements.formError.textContent = error.message;
-      showToast(`创建任务失败：${error.message}`, "error");
+      const message = localizeRuntimeMessage(error.message);
+      elements.formError.textContent = message;
+      showToast(`创建任务失败：${message}`, "error");
     } finally {
       setButtonLoading(elements.downloadButton, false);
     }

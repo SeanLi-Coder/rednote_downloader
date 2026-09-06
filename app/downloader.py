@@ -53,6 +53,10 @@ from .errors import (
 from .models import DownloadItem, MediaType, Platform, SourceKind, TransferProgress
 from .platforms import identify_url
 from .xiaohongshu import RemoteAsset, discover_profile as discover_xhs_profile
+from .xiaohongshu import (
+    _XiaohongshuRedirectRejected,
+    _open_xiaohongshu_response,
+)
 from .xiaohongshu import is_trusted_xiaohongshu_asset_url
 from .xiaohongshu import parse_note as parse_xhs_note
 
@@ -144,6 +148,15 @@ COOKIE_LOAD_ERROR_MARKERS = (
     "failed to decrypt",
     "could not decrypt",
     "keyring",
+)
+XIAOHONGSHU_COOKIE_BROWSER_ERROR = (
+    "The Xiaohongshu task has an unsupported cookie-browser setting. Use Chrome "
+    "Cookie or disable browser cookies, then create a new task."
+)
+XIAOHONGSHU_COOKIE_PROFILE_ERROR = (
+    "Xiaohongshu Chrome Cookie access requires a bound Chrome profile. Create the "
+    "task again so an authenticated profile can be selected; automatic Chrome "
+    "profile scanning was blocked."
 )
 COOKIE_FALLBACK_WARNING = (
     "Chrome cookies could not be read, so anonymous access was used. "
@@ -529,6 +542,15 @@ class MediaDownloader:
     def __init__(self, config: DownloaderConfig | None = None) -> None:
         self.config = config or DownloaderConfig()
 
+    def _xiaohongshu_browser_cookies_enabled(self) -> bool:
+        if self.config.cookie_browser is None:
+            return False
+        if self.config.cookie_browser != "chrome":
+            raise TemporaryAccessError(XIAOHONGSHU_COOKIE_BROWSER_ERROR)
+        if not str(self.config.cookie_profile or "").strip():
+            raise TemporaryAccessError(XIAOHONGSHU_COOKIE_PROFILE_ERROR)
+        return True
+
     def discover(
         self,
         url: str,
@@ -540,6 +562,9 @@ class MediaDownloader:
         should_cancel = should_cancel or (lambda: False)
         if should_cancel():
             raise DownloadCancelledError("Task cancelled")
+        xiaohongshu_browser_cookies = False
+        if platform == Platform.XIAOHONGSHU:
+            xiaohongshu_browser_cookies = self._xiaohongshu_browser_cookies_enabled()
 
         short_link_fallback = False
         if kind == SourceKind.SHORT_LINK:
@@ -588,7 +613,7 @@ class MediaDownloader:
             profile = discover_xhs_profile(
                 url,
                 cookie_profile=self.config.cookie_profile,
-                use_browser_cookies=bool(self.config.cookie_browser),
+                use_browser_cookies=xiaohongshu_browser_cookies,
                 allow_cookie_fallback=self.config.allow_cookie_fallback,
                 should_cancel=should_cancel,
             )
@@ -634,7 +659,7 @@ class MediaDownloader:
             profile = discover_douyin_profile(
                 url,
                 cookie_profile=self.config.cookie_profile,
-                use_browser_cookies=bool(self.config.cookie_browser),
+                use_browser_cookies=self.config.cookie_browser == "chrome",
                 allow_cookie_fallback=self.config.allow_cookie_fallback,
                 should_cancel=should_cancel,
             )
@@ -734,10 +759,16 @@ class MediaDownloader:
             note, fallback = parse_xhs_note(
                 url,
                 cookie_profile=self.config.cookie_profile,
-                use_browser_cookies=bool(self.config.cookie_browser),
+                use_browser_cookies=xiaohongshu_browser_cookies,
                 allow_cookie_fallback=self.config.allow_cookie_fallback,
             )
-            media_type = MediaType.VIDEO if note.videos else MediaType.IMAGE
+            media_type = self._xiaohongshu_note_media_type(note)
+            if media_type == MediaType.VIDEO and not note.videos:
+                raise TemporaryAccessError(
+                    "Xiaohongshu identified this work as a video but returned no "
+                    "trusted video stream. Retry the original link; the cover image "
+                    "was not downloaded as a substitute."
+                )
             item = DownloadItem(
                 id=_item_key(platform, note.note_id, url, 1),
                 media_id=note.note_id,
@@ -4362,6 +4393,16 @@ class MediaDownloader:
             return f"{asset.width}x{asset.height}"
         return None
 
+    @staticmethod
+    def _xiaohongshu_note_media_type(note: Any) -> MediaType:
+        raw = note.raw if isinstance(getattr(note, "raw", None), dict) else {}
+        raw_type = str(
+            raw.get("type") or raw.get("noteType") or raw.get("note_type") or ""
+        ).strip().lower()
+        if raw_type == "video" or note.videos:
+            return MediaType.VIDEO
+        return MediaType.IMAGE
+
     def _download_xhs_item(
         self,
         item: DownloadItem,
@@ -4372,10 +4413,11 @@ class MediaDownloader:
     ) -> DownloadOutcome:
         if should_cancel():
             raise DownloadCancelledError("Task cancelled")
+        use_browser_cookies = self._xiaohongshu_browser_cookies_enabled()
         note, fallback = parse_xhs_note(
             item.source_url,
             cookie_profile=self.config.cookie_profile,
-            use_browser_cookies=bool(self.config.cookie_browser),
+            use_browser_cookies=use_browser_cookies,
             allow_cookie_fallback=self.config.allow_cookie_fallback,
         )
         expected_note_id = str(item.media_id or "").strip().lower()
@@ -4400,7 +4442,13 @@ class MediaDownloader:
                     "Xiaohongshu profile note belongs to a different or unverifiable "
                     "author. The cross-wired response was blocked before download."
                 )
-        media_type = MediaType.VIDEO if note.videos else MediaType.IMAGE
+        media_type = self._xiaohongshu_note_media_type(note)
+        if media_type == MediaType.VIDEO and not note.videos:
+            raise MediaDownloadError(
+                "Xiaohongshu identified this work as a video but returned no trusted "
+                "video stream. The cover image was not downloaded as a substitute; "
+                "retry the original work."
+            )
         if not note.videos and not note.images and not note.live_photos:
             raise MediaDownloadError(
                 "The Xiaohongshu note contains no downloadable media"
@@ -4715,6 +4763,18 @@ class MediaDownloader:
                                 f"{exc.redirect_host_fingerprint or 'unavailable'}; "
                                 f"Redirect port: {exc.redirect_port or 'unavailable'}; "
                                 f"reason: {exc.redirect_reason or 'unrecognized-host'}"
+                            ) from exc
+                    elif is_xiaohongshu_source:
+                        try:
+                            response = _open_xiaohongshu_response(
+                                ydl,
+                                media_request,
+                                is_trusted_url=is_trusted_xiaohongshu_asset_url,
+                            )
+                        except _XiaohongshuRedirectRejected as exc:
+                            raise MediaDownloadError(
+                                "Xiaohongshu media redirect was blocked before "
+                                "requesting an untrusted target"
                             ) from exc
                     else:
                         response = ydl.urlopen(media_request)

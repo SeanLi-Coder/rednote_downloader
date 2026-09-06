@@ -12,12 +12,17 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
+from .browser import (
+    chrome_profile_has_cookies,
+    select_chrome_profile_with_cookies,
+)
 from .downloader import (
     DOUYIN_ITEM_EXPANSION_MESSAGE,
     DiscoveryResult,
     DownloaderConfig,
     EngineEvent,
     MediaDownloader,
+    XIAOHONGSHU_COOKIE_BROWSER_ERROR,
     safe_component,
     safe_external_error_message,
 )
@@ -113,8 +118,27 @@ XIAOHONGSHU_ITEM_BINDING_ERROR = (
     "The untrusted or cross-wired entry was blocked before download; retry the "
     "original link to rediscover it."
 )
+XIAOHONGSHU_CHROME_PROFILE_ERROR = (
+    "No current authenticated Xiaohongshu session was found in the selected "
+    "Chrome profile. Sign in to Xiaohongshu in a regular Chrome profile and "
+    "retry. This is a Chrome login/profile setting issue; CAPTCHA verification "
+    "is not required."
+)
+XIAOHONGSHU_AUTH_COOKIE_NAMES = ("web_session", "id_token")
 XIAOHONGSHU_BINDING_REDISCOVERY_MARKER = (
     "_xiaohongshu_binding_rediscovery_pending"
+)
+XIAOHONGSHU_MEDIA_VERIFICATION_VERSION = 1
+XIAOHONGSHU_MEDIA_VERIFICATION_MARKER = (
+    "_xiaohongshu_media_verification_version"
+)
+XIAOHONGSHU_PROFILE_MEDIA_REVALIDATION_MARKER = (
+    "_xiaohongshu_profile_media_revalidation_pending"
+)
+XIAOHONGSHU_PROFILE_MEDIA_REVALIDATION_MESSAGE = (
+    "This Xiaohongshu profile item was completed by an older version without "
+    "verified media-type metadata. Retry the original profile to rediscover and "
+    "verify whether the note contains images or video. Existing files were preserved."
 )
 LEGACY_DOUYIN_GENERIC_SIGNING_MARKER = (
     "Douyin could not create a verified signed request"
@@ -269,6 +293,41 @@ class DownloadManager:
                     if not job.retryable:
                         job.retryable = True
                         changed = True
+            if (
+                job.platform == Platform.XIAOHONGSHU
+                and job.source_kind == SourceKind.PROFILE
+            ):
+                now = utc_now()
+                migrated_xiaohongshu_profile_media = False
+                for item in job.items:
+                    if not (
+                        item.status == ItemStatus.COMPLETED
+                        and item.media_type == MediaType.IMAGE
+                        and XIAOHONGSHU_MEDIA_VERIFICATION_MARKER
+                        not in item.metadata
+                    ):
+                        continue
+                    item.status = ItemStatus.FAILED
+                    item.error = XIAOHONGSHU_PROFILE_MEDIA_REVALIDATION_MESSAGE
+                    item.auth_message = None
+                    item.retryable = True
+                    item.metadata[
+                        XIAOHONGSHU_PROFILE_MEDIA_REVALIDATION_MARKER
+                    ] = True
+                    item.updated_at = now
+                    migrated_xiaohongshu_profile_media = True
+                    changed = True
+                if migrated_xiaohongshu_profile_media:
+                    job.status = JobStatus.INTERRUPTED
+                    job.error = XIAOHONGSHU_PROFILE_MEDIA_REVALIDATION_MESSAGE
+                    job.warning = XIAOHONGSHU_PROFILE_MEDIA_REVALIDATION_MESSAGE
+                    job.auth_message = None
+                    job.verification_url = None
+                    job.active_item_id = None
+                    job.cancel_requested = False
+                    job.retryable = True
+                    job.discovery_complete = False
+                    job.finished_at = now
             if job.platform == Platform.DOUYIN and job.source_kind == SourceKind.PROFILE:
                 for item in job.items:
                     changed |= self._refresh_douyin_profile_item_from_cache(job, item)
@@ -593,6 +652,18 @@ class DownloadManager:
         auto_start: bool = True,
     ) -> DownloadJob:
         url_info = identify_url(url)
+        cookie_profile, cookie_profile_auto_selected = (
+            self._resolve_xiaohongshu_chrome_profile(
+                url_info.platform,
+                cookie_browser,
+                cookie_profile,
+                cookie_profile_auto_selected=(
+                    url_info.platform == Platform.XIAOHONGSHU
+                    and cookie_browser == "chrome"
+                    and cookie_profile is None
+                ),
+            )
+        )
         root = Path(output_root or self.default_output_root).expanduser().resolve()
         root.mkdir(parents=True, exist_ok=True)
         job = DownloadJob(
@@ -603,6 +674,7 @@ class DownloadManager:
             output_root=str(root),
             cookie_browser=cookie_browser,
             cookie_profile=cookie_profile,
+            cookie_profile_auto_selected=cookie_profile_auto_selected,
         )
         with self._lock:
             self._jobs[job.id] = job
@@ -635,6 +707,9 @@ class DownloadManager:
                 targets = None
                 rediscover = True
             elif self._has_xiaohongshu_binding_rediscovery_pending(job):
+                targets = None
+                rediscover = True
+            elif self._has_xiaohongshu_profile_media_revalidation_pending(job):
                 targets = None
                 rediscover = True
             elif job.items:
@@ -783,6 +858,36 @@ class DownloadManager:
         with self._lock:
             return self._require_job(job_id).model_copy(deep=True)
 
+    def bind_xiaohongshu_verification_profile(self, job_id: str) -> DownloadJob:
+        """Bind a legacy Xiaohongshu verification action to one persisted profile."""
+        with self._lock:
+            job = self._require_job(job_id)
+            if (
+                job.platform == Platform.XIAOHONGSHU
+                and job.status == JobStatus.NEEDS_AUTH
+                and job.cookie_browser == "chrome"
+            ):
+                old_profile = job.cookie_profile
+                old_auto_selected = job.cookie_profile_auto_selected
+                (
+                    job.cookie_profile,
+                    job.cookie_profile_auto_selected,
+                ) = self._resolve_xiaohongshu_chrome_profile(
+                    job.platform,
+                    job.cookie_browser,
+                    job.cookie_profile,
+                    cookie_profile_auto_selected=(
+                        job.cookie_profile_auto_selected
+                        or job.cookie_profile is None
+                    ),
+                )
+                if (
+                    job.cookie_profile != old_profile
+                    or job.cookie_profile_auto_selected != old_auto_selected
+                ):
+                    self._commit_locked(job)
+            return job.model_copy(deep=True)
+
     def list_jobs(self) -> list[DownloadJob]:
         with self._lock:
             return [
@@ -823,6 +928,15 @@ class DownloadManager:
         *,
         rediscover: bool,
     ) -> None:
+        (
+            job.cookie_profile,
+            job.cookie_profile_auto_selected,
+        ) = self._resolve_xiaohongshu_chrome_profile(
+            job.platform,
+            job.cookie_browser,
+            job.cookie_profile,
+            cookie_profile_auto_selected=job.cookie_profile_auto_selected,
+        )
         cancel_event = threading.Event()
         self._cancel_events[job.id] = cancel_event
         job.cancel_requested = False
@@ -852,6 +966,15 @@ class DownloadManager:
             requested_media_ids: set[str] = set()
             with self._lock:
                 job = self._require_job(job_id)
+                (
+                    job.cookie_profile,
+                    job.cookie_profile_auto_selected,
+                ) = self._resolve_xiaohongshu_chrome_profile(
+                    job.platform,
+                    job.cookie_browser,
+                    job.cookie_profile,
+                    cookie_profile_auto_selected=job.cookie_profile_auto_selected,
+                )
                 if requested_item_ids is not None:
                     requested_media_ids = {
                         item.media_id
@@ -1085,6 +1208,14 @@ class DownloadManager:
                         ):
                             item.metadata["profile_url"] = job.source_url
                             item.metadata["profile_owner_verified"] = True
+                        if job.platform == Platform.XIAOHONGSHU:
+                            item.metadata[
+                                XIAOHONGSHU_MEDIA_VERIFICATION_MARKER
+                            ] = XIAOHONGSHU_MEDIA_VERIFICATION_VERSION
+                            item.metadata.pop(
+                                XIAOHONGSHU_PROFILE_MEDIA_REVALIDATION_MARKER,
+                                None,
+                            )
                         item.progress.percent = 100.0
                         item.error = None
                         item.updated_at = utc_now()
@@ -1829,6 +1960,38 @@ class DownloadManager:
         return MediaDownloader(config)
 
     @staticmethod
+    def _resolve_xiaohongshu_chrome_profile(
+        platform: Platform,
+        cookie_browser: str | None,
+        cookie_profile: str | None,
+        *,
+        cookie_profile_auto_selected: bool = False,
+    ) -> tuple[str | None, bool]:
+        if platform != Platform.XIAOHONGSHU:
+            return cookie_profile, False
+        if cookie_browser is None:
+            return None, False
+        if cookie_browser != "chrome":
+            raise TemporaryAccessError(XIAOHONGSHU_COOKIE_BROWSER_ERROR)
+        if cookie_profile is not None:
+            profile = cookie_profile.strip()
+            if chrome_profile_has_cookies(
+                profile,
+                "xiaohongshu.com",
+                XIAOHONGSHU_AUTH_COOKIE_NAMES,
+            ):
+                return profile, cookie_profile_auto_selected
+            if not cookie_profile_auto_selected:
+                raise TemporaryAccessError(XIAOHONGSHU_CHROME_PROFILE_ERROR)
+        profile = select_chrome_profile_with_cookies(
+            "xiaohongshu.com",
+            XIAOHONGSHU_AUTH_COOKIE_NAMES,
+        )
+        if profile is None:
+            raise TemporaryAccessError(XIAOHONGSHU_CHROME_PROFILE_ERROR)
+        return profile, True
+
+    @staticmethod
     def _legacy_douyin_markdown_item_source(value: str) -> str | None:
         match = _LEGACY_DOUYIN_MARKDOWN_ITEM_RE.fullmatch(value)
         if not match or match.group(2) != match.group(4):
@@ -2449,6 +2612,22 @@ class DownloadManager:
             for item in job.items
         )
 
+    @staticmethod
+    def _has_xiaohongshu_profile_media_revalidation_pending(
+        job: DownloadJob,
+    ) -> bool:
+        return (
+            job.platform == Platform.XIAOHONGSHU
+            and job.source_kind == SourceKind.PROFILE
+            and any(
+                item.metadata.get(
+                    XIAOHONGSHU_PROFILE_MEDIA_REVALIDATION_MARKER
+                )
+                is True
+                for item in job.items
+            )
+        )
+
     @classmethod
     def _trusted_xiaohongshu_previous_items(
         cls,
@@ -2636,6 +2815,8 @@ class DownloadManager:
     def _should_rediscover_on_retry(job: DownloadJob) -> bool:
         if DownloadManager._has_xiaohongshu_binding_rediscovery_pending(job):
             return True
+        if DownloadManager._has_xiaohongshu_profile_media_revalidation_pending(job):
+            return True
         if (
             job.platform == Platform.XIAOHONGSHU
             and job.source_kind in {SourceKind.ITEM, SourceKind.SHORT_LINK}
@@ -2730,10 +2911,18 @@ class DownloadManager:
             recovery_pending = (
                 old.metadata.get(DOUYIN_PROFILE_REDISCOVERY_ITEM_MARKER) is True
             )
+            xiaohongshu_media_revalidation_pending = (
+                old.metadata.get(XIAOHONGSHU_PROFILE_MEDIA_REVALIDATION_MARKER)
+                is True
+            )
             removed_after_refresh = (
                 old.metadata.get(DOUYIN_PROFILE_REMOVED_ITEM_MARKER) is True
             )
-            if recovery_pending or removed_after_refresh:
+            if (
+                recovery_pending
+                or removed_after_refresh
+                or xiaohongshu_media_revalidation_pending
+            ):
                 fresh.attempts = old.attempts
                 fresh.created_at = old.created_at
                 fresh.output_paths = list(old.output_paths)
@@ -2745,6 +2934,10 @@ class DownloadManager:
                 old_metadata.pop(DOUYIN_PROFILE_REDISCOVERY_ITEM_MARKER, None)
                 old_metadata.pop(DOUYIN_PROFILE_REFRESH_REQUIRED_MARKER, None)
                 old_metadata.pop(DOUYIN_PROFILE_REMOVED_ITEM_MARKER, None)
+                old_metadata.pop(
+                    XIAOHONGSHU_PROFILE_MEDIA_REVALIDATION_MARKER,
+                    None,
+                )
                 fresh.metadata = {**old_metadata, **fresh.metadata}
                 merged.append(fresh)
                 continue

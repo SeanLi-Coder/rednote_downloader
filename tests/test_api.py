@@ -4,12 +4,21 @@ import os
 import threading
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from app import main as main_module
 from app.build_info import APP_ID, APP_VERSION, BUILD_ID, calculate_build_id
+from app.errors import TemporaryAccessError
 from app.main import app
-from app.models import DownloadItem, DownloadJob, Platform, SourceKind
+from app.models import (
+    DownloadItem,
+    DownloadJob,
+    ItemStatus,
+    JobStatus,
+    Platform,
+    SourceKind,
+)
 from app.runtime import clear_runtime_identity, configure_runtime_identity
 
 
@@ -182,12 +191,16 @@ def test_douyin_item_verification_always_opens_original_video(
         verification_url="https://www.douyin.com/user/wrong-profile",
     )
     monkeypatch.setattr(main_module.manager, "get_job", lambda job_id: job)
-    monkeypatch.setattr(main_module, "_open_chrome", opened.append)
+    monkeypatch.setattr(
+        main_module,
+        "_open_chrome",
+        lambda url, profile: opened.append((url, profile)),
+    )
 
     response = main_module.open_verification(job.id)
 
     assert response == {"status": "opened", "url": source_url}
-    assert opened == [source_url]
+    assert opened == [(source_url, None)]
 
 
 def test_douyin_profile_verification_never_opens_untrusted_url(
@@ -204,12 +217,354 @@ def test_douyin_profile_verification_never_opens_untrusted_url(
         verification_url="https://evil.example/phish",
     )
     monkeypatch.setattr(main_module.manager, "get_job", lambda job_id: job)
-    monkeypatch.setattr(main_module, "_open_chrome", opened.append)
+    monkeypatch.setattr(
+        main_module,
+        "_open_chrome",
+        lambda url, profile: opened.append((url, profile)),
+    )
 
     response = main_module.open_verification(job.id)
 
     assert response == {"status": "opened", "url": source_url}
-    assert opened == [source_url]
+    assert opened == [(source_url, None)]
+
+
+def test_xiaohongshu_profile_verification_opens_bound_needs_auth_note(
+    monkeypatch, tmp_path
+) -> None:
+    profile_id = "62f8ad0b000000001e01f1b9"
+    note_id = "693e3a810000000019025182"
+    source_url = f"https://www.xiaohongshu.com/user/profile/{profile_id}"
+    note_url = (
+        f"https://www.xiaohongshu.com/explore/{note_id}"
+        "?xsec_token=SAFE_TOKEN%3D&xsec_source=pc_user"
+    )
+    job = DownloadJob(
+        id="xhs-profile-verification",
+        source_url=source_url,
+        platform=Platform.XIAOHONGSHU,
+        source_kind=SourceKind.PROFILE,
+        output_root=str(tmp_path),
+        status=JobStatus.NEEDS_AUTH,
+        verification_url=note_url,
+        cookie_profile="Profile 1",
+        items=[
+            DownloadItem(
+                id="blocked-note",
+                media_id=note_id,
+                source_url=note_url,
+                status=ItemStatus.NEEDS_AUTH,
+                metadata={
+                    "xiaohongshu_profile_id": profile_id,
+                    "profile_note_membership_verified": True,
+                },
+            )
+        ],
+    )
+    opened: list[tuple[str, str | None]] = []
+    monkeypatch.setattr(main_module.manager, "get_job", lambda job_id: job)
+    monkeypatch.setattr(
+        main_module,
+        "_open_chrome",
+        lambda url, profile: opened.append((url, profile)),
+    )
+
+    response = main_module.open_verification(job.id)
+
+    assert opened == [(note_url, "Profile 1")]
+    assert response["status"] == "opened"
+    assert "xsec_token" not in response["url"]
+    assert response["url"].endswith("xsec_source=pc_user")
+
+
+@pytest.mark.parametrize(
+    ("stored_profile", "auto_selected"),
+    [(None, False), ("Profile 9", True)],
+)
+def test_xiaohongshu_verification_refreshes_automatic_profile_before_opening(
+    monkeypatch,
+    tmp_path,
+    stored_profile: str | None,
+    auto_selected: bool,
+) -> None:
+    profile_id = "62f8ad0b000000001e01f1b9"
+    note_id = "693e3a810000000019025182"
+    source_url = f"https://www.xiaohongshu.com/user/profile/{profile_id}"
+    note_url = f"https://www.xiaohongshu.com/explore/{note_id}"
+    job = DownloadJob(
+        id="legacy-xhs-null-profile-verification",
+        source_url=source_url,
+        platform=Platform.XIAOHONGSHU,
+        source_kind=SourceKind.PROFILE,
+        output_root=str(tmp_path),
+        status=JobStatus.NEEDS_AUTH,
+        verification_url=note_url,
+        cookie_browser="chrome",
+        cookie_profile=stored_profile,
+        cookie_profile_auto_selected=auto_selected,
+        items=[
+            DownloadItem(
+                id="blocked-note",
+                media_id=note_id,
+                source_url=note_url,
+                status=ItemStatus.NEEDS_AUTH,
+                metadata={
+                    "xiaohongshu_profile_id": profile_id,
+                    "profile_note_membership_verified": True,
+                },
+            )
+        ],
+    )
+    bound_job = job.model_copy(
+        deep=True,
+        update={
+            "cookie_profile": "Profile 3",
+            "cookie_profile_auto_selected": True,
+        },
+    )
+    bound_calls: list[str] = []
+    opened: list[tuple[str, str | None]] = []
+    monkeypatch.setattr(main_module.manager, "get_job", lambda job_id: job)
+    monkeypatch.setattr(
+        main_module.manager,
+        "bind_xiaohongshu_verification_profile",
+        lambda job_id: bound_calls.append(job_id) or bound_job,
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_open_chrome",
+        lambda url, profile: opened.append((url, profile)),
+    )
+
+    response = main_module.open_verification(job.id)
+
+    assert bound_calls == [job.id]
+    assert opened == [(note_url, "Profile 3")]
+    assert response == {"status": "opened", "url": note_url}
+
+
+def test_legacy_xiaohongshu_verification_without_session_does_not_open_chrome(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    source_url = "https://www.xiaohongshu.com/user/profile/example"
+    job = DownloadJob(
+        id="legacy-xhs-no-verification-profile",
+        source_url=source_url,
+        platform=Platform.XIAOHONGSHU,
+        source_kind=SourceKind.PROFILE,
+        output_root=str(tmp_path),
+        status=JobStatus.NEEDS_AUTH,
+        cookie_browser="chrome",
+        cookie_profile=None,
+    )
+    monkeypatch.setattr(main_module.manager, "get_job", lambda job_id: job)
+    monkeypatch.setattr(
+        main_module.manager,
+        "bind_xiaohongshu_verification_profile",
+        lambda job_id: (_ for _ in ()).throw(
+            TemporaryAccessError("No authenticated Xiaohongshu Chrome profile")
+        ),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_open_chrome",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("Chrome must not open with an unbound default profile")
+        ),
+    )
+
+    with pytest.raises(HTTPException) as error:
+        main_module.open_verification(job.id)
+
+    assert error.value.status_code == 400
+    assert "No authenticated" in str(error.value.detail)
+
+
+def test_xiaohongshu_profile_verification_accepts_refreshed_canonical_note(
+    monkeypatch, tmp_path
+) -> None:
+    profile_id = "62f8ad0b000000001e01f1b9"
+    note_id = "693e3a810000000019025182"
+    source_url = f"https://www.xiaohongshu.com/user/profile/{profile_id}"
+    saved_url = (
+        f"https://www.xiaohongshu.com/explore/{note_id}"
+        "?xsec_token=expired&xsec_source=pc_user"
+    )
+    refreshed_url = f"https://www.xiaohongshu.com/explore/{note_id}"
+    job = DownloadJob(
+        id="xhs-profile-canonical-verification",
+        source_url=source_url,
+        platform=Platform.XIAOHONGSHU,
+        source_kind=SourceKind.PROFILE,
+        output_root=str(tmp_path),
+        status=JobStatus.NEEDS_AUTH,
+        verification_url=refreshed_url,
+        cookie_profile="Profile 1",
+        items=[
+            DownloadItem(
+                id="blocked-note",
+                media_id=note_id,
+                source_url=saved_url,
+                status=ItemStatus.NEEDS_AUTH,
+                metadata={
+                    "xiaohongshu_profile_id": profile_id,
+                    "profile_note_membership_verified": True,
+                },
+            )
+        ],
+    )
+    opened: list[tuple[str, str | None]] = []
+    monkeypatch.setattr(main_module.manager, "get_job", lambda job_id: job)
+    monkeypatch.setattr(
+        main_module,
+        "_open_chrome",
+        lambda url, profile: opened.append((url, profile)),
+    )
+
+    response = main_module.open_verification(job.id)
+
+    assert opened == [(refreshed_url, "Profile 1")]
+    assert response == {"status": "opened", "url": refreshed_url}
+
+
+def test_xiaohongshu_short_link_verification_opens_bound_note(
+    monkeypatch, tmp_path
+) -> None:
+    note_id = "693e3a810000000019025182"
+    note_url = f"https://www.xiaohongshu.com/explore/{note_id}"
+    job = DownloadJob(
+        id="xhs-short-verification",
+        source_url="https://xhslink.com/a/stable-code",
+        platform=Platform.XIAOHONGSHU,
+        source_kind=SourceKind.SHORT_LINK,
+        resolved_source_kind=SourceKind.ITEM,
+        resolved_source_id=note_id,
+        output_root=str(tmp_path),
+        status=JobStatus.NEEDS_AUTH,
+        verification_url=note_url,
+        cookie_profile="Profile 1",
+        items=[
+            DownloadItem(
+                id="blocked-note",
+                media_id=note_id,
+                source_url=note_url,
+                status=ItemStatus.NEEDS_AUTH,
+                metadata={
+                    "xiaohongshu_resolved_source_kind": SourceKind.ITEM.value,
+                    "xiaohongshu_resolved_source_url": note_url,
+                },
+            )
+        ],
+    )
+    opened: list[tuple[str, str | None]] = []
+    monkeypatch.setattr(main_module.manager, "get_job", lambda job_id: job)
+    monkeypatch.setattr(
+        main_module,
+        "_open_chrome",
+        lambda url, profile: opened.append((url, profile)),
+    )
+
+    response = main_module.open_verification(job.id)
+
+    assert opened == [(note_url, "Profile 1")]
+    assert response == {"status": "opened", "url": note_url}
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "untrusted-verification-url",
+        "wrong-note-id",
+        "wrong-profile-membership",
+        "multiple-needs-auth-items",
+    ],
+)
+def test_xiaohongshu_profile_verification_falls_back_for_unbound_state(
+    monkeypatch, tmp_path, tamper: str
+) -> None:
+    profile_id = "62f8ad0b000000001e01f1b9"
+    note_id = "693e3a810000000019025182"
+    source_url = f"https://www.xiaohongshu.com/user/profile/{profile_id}"
+    note_url = f"https://www.xiaohongshu.com/explore/{note_id}"
+    item = DownloadItem(
+        id="blocked-note",
+        media_id=note_id,
+        source_url=note_url,
+        status=ItemStatus.NEEDS_AUTH,
+        metadata={
+            "xiaohongshu_profile_id": profile_id,
+            "profile_note_membership_verified": True,
+        },
+    )
+    verification_url = note_url
+    items = [item]
+    if tamper == "untrusted-verification-url":
+        verification_url = "https://evil.example/phish"
+    elif tamper == "wrong-note-id":
+        verification_url = "https://www.xiaohongshu.com/explore/aaaaaaaaaaaaaaaaaaaaaaaa"
+    elif tamper == "wrong-profile-membership":
+        item.metadata["xiaohongshu_profile_id"] = "different-profile"
+    elif tamper == "multiple-needs-auth-items":
+        items.append(
+            DownloadItem(
+                id="other-blocked-note",
+                media_id="bbbbbbbbbbbbbbbbbbbbbbbb",
+                source_url="https://www.xiaohongshu.com/explore/bbbbbbbbbbbbbbbbbbbbbbbb",
+                status=ItemStatus.NEEDS_AUTH,
+            )
+        )
+    job = DownloadJob(
+        id="tampered-xhs-profile-verification",
+        source_url=source_url,
+        platform=Platform.XIAOHONGSHU,
+        source_kind=SourceKind.PROFILE,
+        output_root=str(tmp_path),
+        status=JobStatus.NEEDS_AUTH,
+        verification_url=verification_url,
+        cookie_profile="Profile 1",
+        items=items,
+    )
+    opened: list[tuple[str, str | None]] = []
+    monkeypatch.setattr(main_module.manager, "get_job", lambda job_id: job)
+    monkeypatch.setattr(
+        main_module,
+        "_open_chrome",
+        lambda url, profile: opened.append((url, profile)),
+    )
+
+    response = main_module.open_verification(job.id)
+
+    assert opened == [(source_url, "Profile 1")]
+    assert response == {"status": "opened", "url": source_url}
+
+
+def test_xiaohongshu_verification_rejects_tampered_insecure_original_source(
+    monkeypatch, tmp_path
+) -> None:
+    source_url = "http://www.xiaohongshu.com/user/profile/example"
+    job = DownloadJob(
+        id="insecure-xhs-source",
+        source_url=source_url,
+        platform=Platform.XIAOHONGSHU,
+        source_kind=SourceKind.PROFILE,
+        output_root=str(tmp_path),
+        status=JobStatus.NEEDS_AUTH,
+    )
+    monkeypatch.setattr(main_module.manager, "get_job", lambda job_id: job)
+    monkeypatch.setattr(
+        main_module,
+        "_open_chrome",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("Chrome must not open an insecure persisted source")
+        ),
+    )
+
+    with pytest.raises(HTTPException) as error:
+        main_module.open_verification(job.id)
+
+    assert error.value.status_code == 422
+    assert "no longer trusted" in str(error.value.detail)
 
 
 def test_public_job_hides_internal_douyin_media_identity(tmp_path) -> None:
@@ -319,11 +674,15 @@ def test_public_xiaohongshu_urls_redact_xsec_token_but_keep_internal_url(
 
     opened = []
     monkeypatch.setattr(main_module.manager, "get_job", lambda job_id: job)
-    monkeypatch.setattr(main_module, "_open_chrome", opened.append)
+    monkeypatch.setattr(
+        main_module,
+        "_open_chrome",
+        lambda url, profile: opened.append((url, profile)),
+    )
 
     response = main_module.open_verification(job.id)
 
-    assert opened == [source_url]
+    assert opened == [(source_url, None)]
     assert secret not in response["url"]
     assert "xsec_token" not in response["url"]
 

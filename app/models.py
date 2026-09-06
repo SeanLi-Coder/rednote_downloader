@@ -131,6 +131,7 @@ class DownloadJob(BaseModel):
     verification_url: str | None = None
     cookie_browser: str | None = "chrome"
     cookie_profile: str | None = None
+    cookie_profile_auto_selected: bool = False
     cookie_fallback_used: bool = False
     discovery_complete: bool = True
     cancel_requested: bool = False
