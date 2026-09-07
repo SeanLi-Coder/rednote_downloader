@@ -47,9 +47,11 @@ from app.downloader import (
 from app.douyin import DouyinProfile
 from app.errors import (
     AuthenticationRequiredError,
+    DiscoveryError,
     DownloadCancelledError,
     DouyinMediaRefreshRequiredError,
     MediaDownloadError,
+    SiteIssueCode,
     TemporaryAccessError,
 )
 from app.models import DownloadItem, MediaType, Platform, SourceKind
@@ -1363,13 +1365,144 @@ def test_douyin_item_discovery_reports_transient_profile_limiting(
     monkeypatch.setattr(
         "app.downloader.discover_item_metadata_from_profile",
         lambda *args, **kwargs: (_ for _ in ()).throw(
-            TemporaryAccessError("temporary profile limiting")
+            TemporaryAccessError(
+                "temporary profile limiting",
+                issue_code=SiteIssueCode.RATE_LIMITED,
+            )
         ),
     )
     engine = MediaDownloader(DownloaderConfig(cookie_browser="chrome"))
 
-    with pytest.raises(TemporaryAccessError, match="no lower-quality"):
+    with pytest.raises(
+        TemporaryAccessError,
+        match="verified author-feed request failed",
+    ) as captured:
         engine.discover(source_url, Platform.DOUYIN, SourceKind.ITEM)
+
+    assert captured.value.issue_code == SiteIssueCode.RATE_LIMITED
+    assert "temporary profile limiting" in str(captured.value)
+
+
+def test_douyin_item_author_feed_preserves_local_configuration_failure(
+    monkeypatch,
+) -> None:
+    media_id = "7638230489560727931"
+    source_url = f"https://www.douyin.com/video/{media_id}"
+    video_uri = "v0200fg10000fixturevideoid"
+
+    class DirectItemYoutubeDL(FakeYoutubeDL):
+        def extract_info(self, url: str, download: bool, process: bool = True):
+            return {
+                "id": media_id,
+                "title": "Verified title",
+                "channel": "Verified author",
+                "channel_id": "MS4wLjABAAAAexpected-owner",
+                "formats": [
+                    {
+                        "url": (
+                            "https://api-play.amemv.com/aweme/v1/play/"
+                            f"?video_id={video_uri}&ratio=720p"
+                        )
+                    }
+                ],
+            }
+
+    monkeypatch.setattr("app.downloader.YoutubeDL", DirectItemYoutubeDL)
+    monkeypatch.setattr(
+        "app.downloader.discover_item_metadata_from_profile",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            DiscoveryError(
+                "ffprobe was not found in the bundled runtime",
+                issue_code=SiteIssueCode.LOCAL_CONFIGURATION,
+            )
+        ),
+    )
+    engine = MediaDownloader(DownloaderConfig(cookie_browser="chrome"))
+
+    with pytest.raises(MediaDownloadError) as captured:
+        engine.discover(source_url, Platform.DOUYIN, SourceKind.ITEM)
+
+    assert captured.value.issue_code == SiteIssueCode.LOCAL_CONFIGURATION
+    assert "required local component is unavailable" in str(captured.value)
+    assert "ffprobe was not found" in str(captured.value)
+
+
+def test_douyin_live_photo_wrapper_preserves_local_configuration_failure(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    profile_id = "verified-profile"
+    media_id = "1111111111111111111"
+    profile_url = f"https://www.douyin.com/user/{profile_id}"
+    cached = {
+        "media_kind": "image",
+        "media_id": media_id,
+        "owner_id": profile_id,
+        "title": "Verified image post",
+        "author": "Verified Author",
+        "create_time": 1_756_656_000,
+        "image_assets": [
+            {
+                "index": 1,
+                "width": 1440,
+                "height": 2560,
+                "candidates": ["https://p3-pc-sign.douyinpic.com/image-1"],
+            }
+        ],
+        "live_photo_assets": [
+            {
+                "index": 1,
+                "width": 2160,
+                "height": 3840,
+                "candidates": ["https://v26-web.douyinvod.com/live-1.mp4"],
+                "video_uri": "v0200fg10000verifiedlivephoto",
+                "duration_ms": 2_000,
+            }
+        ],
+    }
+    item = DownloadItem(
+        id="item-id",
+        media_id=media_id,
+        source_url=f"https://www.douyin.com/video/{media_id}",
+        title="Verified image post",
+        media_type=MediaType.IMAGE,
+        metadata={
+            "profile_url": profile_url,
+            "profile_owner_verified": True,
+            "douyin_profile_media": cached,
+        },
+    )
+    monkeypatch.setattr(
+        "app.downloader.is_complete_profile_media_metadata",
+        lambda *args: True,
+    )
+    monkeypatch.setattr("app.downloader.YoutubeDL", FakeYoutubeDL)
+    engine = MediaDownloader(DownloaderConfig(cookie_browser="chrome"))
+    monkeypatch.setattr(
+        engine,
+        "_download_first_available_asset",
+        lambda ydl, assets, *args, media_type, **kwargs: (
+            tmp_path / "image.webp",
+            assets[0],
+        ),
+    )
+    monkeypatch.setattr(
+        engine,
+        "_select_highest_douyin_live_photo_asset",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            MediaDownloadError(
+                "ffprobe was not found while checking Live Photo",
+                issue_code=SiteIssueCode.LOCAL_CONFIGURATION,
+            )
+        ),
+    )
+
+    with pytest.raises(MediaDownloadError) as captured:
+        engine.download_item(item, Platform.DOUYIN, tmp_path)
+
+    assert captured.value.issue_code == SiteIssueCode.LOCAL_CONFIGURATION
+    assert "Live Photo 1 failed" in str(captured.value)
+    assert "ffprobe was not found" in str(captured.value)
 
 
 def test_douyin_item_enrichment_never_lowers_native_quality_floor(
@@ -7692,7 +7825,10 @@ def test_douyin_regional_transfer_requires_strict_probe_source_binding(
 
     engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
     ydl = AssetYoutubeDL()
-    with pytest.raises(MediaDownloadError, match="Untrusted Douyin media URL"):
+    with pytest.raises(
+        DouyinMediaRefreshRequiredError,
+        match="Untrusted Douyin media URL",
+    ) as captured:
         engine._download_first_available_asset(
             ydl,
             [
@@ -7725,6 +7861,7 @@ def test_douyin_regional_transfer_requires_strict_probe_source_binding(
             require_quality_fingerprint=True,
         )
 
+    assert captured.value.issue_code == SiteIssueCode.SECURITY_BLOCKED
     assert ydl.calls == 0
     assert not list(tmp_path.iterdir())
 
@@ -8346,6 +8483,57 @@ def test_rate_limit_errors_do_not_request_chrome_verification() -> None:
             DownloadError("访问频繁，请稍后重试"),
             "https://www.douyin.com/video/7664225419386607205",
         )
+
+
+def test_explicit_captcha_takes_priority_over_rate_limit_wording() -> None:
+    engine = MediaDownloader(DownloaderConfig(cookie_browser="chrome"))
+    source_url = "https://www.douyin.com/video/7664225419386607205"
+
+    with pytest.raises(AuthenticationRequiredError) as captured:
+        engine._raise_download_error(
+            DownloadError("HTTP Error 429: CAPTCHA required"),
+            source_url,
+        )
+
+    assert captured.value.issue_code == SiteIssueCode.VERIFICATION_REQUIRED
+    assert captured.value.verification_url == source_url
+
+
+def test_plain_login_error_is_not_mislabeled_as_captcha() -> None:
+    engine = MediaDownloader(DownloaderConfig(cookie_browser="chrome"))
+
+    with pytest.raises(AuthenticationRequiredError) as captured:
+        engine._raise_download_error(
+            DownloadError("Sign in required to continue"),
+            "https://www.youtube.com/watch?v=LXb3EKWsInQ",
+        )
+
+    assert captured.value.issue_code == SiteIssueCode.LOGIN_REQUIRED
+    assert "No CAPTCHA was detected" in str(captured.value)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Unable to assign input format",
+        "The catalog input could not be parsed",
+        "Please verify checksum before muxing",
+        "Unsupported cookies-from-browser profile",
+        "A CAPTCHA is not required for this response",
+    ],
+)
+def test_authentication_substrings_do_not_create_false_chrome_prompt(
+    message: str,
+) -> None:
+    engine = MediaDownloader(DownloaderConfig(cookie_browser="chrome"))
+
+    with pytest.raises(MediaDownloadError) as captured:
+        engine._raise_download_error(
+            DownloadError(message),
+            "https://www.youtube.com/watch?v=LXb3EKWsInQ",
+        )
+
+    assert not isinstance(captured.value, AuthenticationRequiredError)
 
 
 def test_xhs_output_path_starts_with_date_and_sanitizes_title(tmp_path) -> None:

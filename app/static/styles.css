@@ -671,6 +671,8 @@ svg {
   margin: 2px 0 0;
   color: #c8af83;
   font-size: 11px;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .auth-button {

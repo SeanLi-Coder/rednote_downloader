@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from app.errors import SiteIssueCode
 from app.models import (
     DownloadItem,
     DownloadJob,
@@ -65,3 +66,16 @@ def test_model_round_trip_preserves_progress_and_status() -> None:
     assert restored.items[0].progress.downloaded_bytes == 4_096
     assert restored.items[0].progress.total_bytes == 8_192
     assert restored.items[0].progress.percent == 50.0
+
+
+def test_model_round_trip_preserves_structured_site_issues() -> None:
+    job = make_job()
+    job.issue_code = SiteIssueCode.RATE_LIMITED
+    job.issue_message = "The website temporarily limited this request"
+    job.items[1].issue_code = SiteIssueCode.MEDIA_LINK_EXPIRED
+
+    restored = DownloadJob.model_validate_json(job.model_dump_json())
+
+    assert restored.issue_code == SiteIssueCode.RATE_LIMITED
+    assert restored.issue_message == "The website temporarily limited this request"
+    assert restored.items[1].issue_code == SiteIssueCode.MEDIA_LINK_EXPIRED

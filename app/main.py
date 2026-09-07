@@ -21,6 +21,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from .browser import open_chrome
 from .build_info import APP_ID, APP_VERSION, BUILD_ID, calculate_build_id
 from .downloader import DownloaderConfig
+from .errors import SiteIssueCode
 from .models import DownloadJob, ItemStatus, JobStatus, Platform, SourceKind
 from .platforms import UnsupportedUrlError, identify_url
 from .runtime import (
@@ -484,6 +485,15 @@ def _is_trusted_xiaohongshu_verification_source(
 def open_verification(job_id: str) -> dict[str, str]:
     try:
         job = manager.get_job(job_id)
+        if job.status != JobStatus.NEEDS_AUTH or job.issue_code not in {
+            None,
+            SiteIssueCode.UNKNOWN,
+            SiteIssueCode.LOGIN_REQUIRED,
+            SiteIssueCode.VERIFICATION_REQUIRED,
+        }:
+            raise ItemNotRetryableError(
+                "This task does not currently require Chrome login or verification"
+            )
         source = identify_url(job.source_url)
         if source.platform != job.platform or source.kind != job.source_kind:
             raise UnsupportedUrlError("The original task URL is no longer verifiable")

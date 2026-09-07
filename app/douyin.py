@@ -21,25 +21,35 @@ from .errors import (
     AuthenticationRequiredError,
     DiscoveryError,
     DownloadCancelledError,
+    SiteIssueCode,
     TemporaryAccessError,
+    is_explicit_rate_limit_message,
 )
 
 
 AUTH_TEXT_PATTERNS = (
-    "captcha",
     "verify you are human",
-    "security verification",
-    "安全验证",
-    "验证码",
+    "complete the verification",
+    "complete the captcha",
     "请完成下列验证",
+    "请完成验证",
+    "请拖动滑块",
     "登录后查看",
+    "登录后继续",
+    "请先登录",
+    "当前未登录",
+    "登录状态已过期",
+    "session expired",
+    "not logged in",
 )
 TRANSIENT_TEXT_PATTERNS = (
-    "访问频繁",
-    "请求频繁",
-    "too many requests",
-    "try again later",
-    "网络环境存在风险",
+    re.compile(r"(?:^|\s)(?:当前)?访问(?:过于)?频繁[，,\s]*(?:请)?稍后"),
+    re.compile(r"(?:^|\s)(?:当前)?请求(?:过于)?频繁[，,\s]*(?:请)?稍后"),
+    re.compile(r"\btoo many requests\b"),
+)
+REJECTED_TEXT_PATTERNS = (
+    re.compile(r"网络环境存在风险[，,\s]*(?:请)?稍后"),
+    re.compile(r"\btry again later\b"),
 )
 EXPLICIT_AUTH_PATH_MARKERS = ("/captcha", "/login", "/passport/", "/verify")
 
@@ -115,14 +125,50 @@ def _visible_text(value: str) -> str:
     return re.sub(r"\s+", " ", " ".join(parser.values)).lower()
 
 
-def _looks_like_auth_page(text: str) -> bool:
+def _auth_page_issue_code(text: str) -> SiteIssueCode | None:
     lowered = _visible_text(text)
-    return any(pattern in lowered for pattern in AUTH_TEXT_PATTERNS)
+    if any(
+        pattern in lowered
+        for pattern in (
+            "verify you are human",
+            "complete the verification",
+            "complete the captcha",
+            "请完成下列验证",
+            "请完成验证",
+            "请拖动滑块",
+        )
+    ):
+        return SiteIssueCode.VERIFICATION_REQUIRED
+    if any(
+        marker in lowered
+        for marker in (
+            "登录后查看",
+            "登录后继续",
+            "请先登录",
+            "当前未登录",
+            "登录状态已过期",
+            "session expired",
+            "not logged in",
+        )
+    ):
+        return SiteIssueCode.LOGIN_REQUIRED
+    return None
+
+
+def _looks_like_auth_page(text: str) -> bool:
+    return _auth_page_issue_code(text) is not None
 
 
 def _looks_like_transient_limit(text: str) -> bool:
     lowered = _visible_text(text)
-    return any(pattern in lowered for pattern in TRANSIENT_TEXT_PATTERNS)
+    return is_explicit_rate_limit_message(lowered) or any(
+        pattern.search(lowered) for pattern in TRANSIENT_TEXT_PATTERNS
+    )
+
+
+def _looks_like_request_rejected(text: str) -> bool:
+    lowered = _visible_text(text)
+    return any(pattern.search(lowered) for pattern in REJECTED_TEXT_PATTERNS)
 
 
 def _is_trusted_douyin_page_url(value: str) -> bool:
@@ -138,14 +184,43 @@ def _is_trusted_douyin_page_url(value: str) -> bool:
         return False
 
 
-def _is_explicit_douyin_auth_url(value: str) -> bool:
+def _explicit_douyin_auth_url_issue_code(value: str) -> SiteIssueCode | None:
     if not _is_trusted_douyin_page_url(value):
-        return False
+        return None
     try:
         path = unquote(urlsplit(value).path).lower()
     except (TypeError, ValueError):
-        return False
-    return any(marker in path for marker in EXPLICIT_AUTH_PATH_MARKERS)
+        return None
+    if any(marker in path for marker in ("/captcha", "/verify", "/safe/")):
+        return SiteIssueCode.VERIFICATION_REQUIRED
+    if "/login" in path or "/passport/" in path:
+        return SiteIssueCode.LOGIN_REQUIRED
+    return None
+
+
+def _is_explicit_douyin_auth_url(value: str) -> bool:
+    return _explicit_douyin_auth_url_issue_code(value) is not None
+
+
+def _douyin_authentication_error(
+    issue_code: SiteIssueCode,
+    verification_url: str,
+) -> AuthenticationRequiredError:
+    if issue_code == SiteIssueCode.LOGIN_REQUIRED:
+        message = (
+            "Douyin requires a current Chrome login session. Open the original "
+            "task URL in Chrome, log in, then retry. No CAPTCHA was detected."
+        )
+    else:
+        message = (
+            "Douyin displayed an explicit CAPTCHA or verification page. Open the "
+            "original task URL in Chrome, complete the visible challenge, then retry."
+        )
+    return AuthenticationRequiredError(
+        message,
+        verification_url=verification_url,
+        issue_code=issue_code,
+    )
 
 
 def _profile_id(url: str) -> str | None:
@@ -779,7 +854,8 @@ def discover_item_metadata_from_profile(
                 return parsed[1]
             detail_error = TemporaryAccessError(
                 "Douyin returned the requested item detail without complete, "
-                "verified media metadata."
+                "verified media metadata.",
+                issue_code=SiteIssueCode.SITE_RESPONSE_CHANGED,
             )
 
     awemes = fetch_signed_profile_awemes(
@@ -800,7 +876,8 @@ def discover_item_metadata_from_profile(
         ):
             raise TemporaryAccessError(
                 "Douyin returned the requested profile item without complete, "
-                "verified media metadata. Retry after a short wait."
+                "verified media metadata. Retry after a short wait.",
+                issue_code=SiteIssueCode.SITE_RESPONSE_CHANGED,
             )
         return parsed[1]
     if detail_error is not None:
@@ -860,7 +937,8 @@ def _profile_discovery_budget_remaining(
         raise TemporaryAccessError(
             "Douyin profile discovery stopped after 120 seconds without new "
             "verified profile media. Retry after a short wait; Chrome verification "
-            "is not required."
+            "is not required.",
+            issue_code=SiteIssueCode.NETWORK_ERROR,
         ) from exc
     _raise_if_profile_discovery_cancelled(should_cancel)
     return remaining
@@ -880,7 +958,8 @@ def _profile_discovery_timeout_ms(
         raise TemporaryAccessError(
             "Douyin profile discovery stopped after 120 seconds without new "
             "verified profile media. Retry after a short wait; Chrome verification "
-            "is not required."
+            "is not required.",
+            issue_code=SiteIssueCode.NETWORK_ERROR,
         )
     return min(max(int(requested_ms), 1), remaining_ms)
 
@@ -987,7 +1066,8 @@ def discover_profile(
         from playwright.sync_api import sync_playwright
     except ImportError as exc:
         raise DiscoveryError(
-            "Playwright is required for Douyin profile discovery"
+            "Playwright is required for Douyin profile discovery",
+            issue_code=SiteIssueCode.LOCAL_CONFIGURATION,
         ) from exc
 
     browser_cookies: list[dict[str, Any]] = []
@@ -1193,12 +1273,9 @@ def discover_profile(
                     ),
                 )
                 _raise_if_profile_discovery_cancelled(should_cancel)
-                if _is_explicit_douyin_auth_url(page.url):
-                    raise AuthenticationRequiredError(
-                        "Douyin redirected to an explicit login or verification page. "
-                        "Complete it in Chrome and retry.",
-                        verification_url=url,
-                    )
+                auth_issue = _explicit_douyin_auth_url_issue_code(page.url)
+                if auth_issue is not None:
+                    raise _douyin_authentication_error(auth_issue, url)
                 if not _is_trusted_douyin_page_url(page.url):
                     raise DiscoveryError(
                         "Douyin profile discovery redirected outside the trusted "
@@ -1214,12 +1291,9 @@ def discover_profile(
                 )
                 _raise_if_profile_discovery_cancelled(should_cancel)
 
-                if _is_explicit_douyin_auth_url(page.url):
-                    raise AuthenticationRequiredError(
-                        "Douyin redirected to an explicit login or verification page. "
-                        "Complete it in Chrome and retry.",
-                        verification_url=url,
-                    )
+                auth_issue = _explicit_douyin_auth_url_issue_code(page.url)
+                if auth_issue is not None:
+                    raise _douyin_authentication_error(auth_issue, url)
                 if not _is_trusted_douyin_page_url(page.url):
                     raise DiscoveryError(
                         "Douyin profile discovery redirected outside the trusted "
@@ -1245,16 +1319,19 @@ def discover_profile(
                     check_browser_budget()
                     body_text = page.content()
                 _raise_if_profile_discovery_cancelled(should_cancel)
+                auth_issue = _auth_page_issue_code(body_text)
+                if auth_issue is not None:
+                    raise _douyin_authentication_error(auth_issue, url)
                 if _looks_like_transient_limit(body_text):
                     raise TemporaryAccessError(
                         "Douyin profile discovery was temporarily rate-limited. Retry "
                         "after a short wait; Chrome verification is not required."
                     )
-                if _looks_like_auth_page(body_text):
-                    raise AuthenticationRequiredError(
-                        "Douyin requires verification. Open this profile in Chrome, "
-                        "finish the CAPTCHA or login, then retry the task.",
-                        verification_url=url,
+                if _looks_like_request_rejected(body_text):
+                    raise TemporaryAccessError(
+                        "Douyin temporarily rejected the profile request without "
+                        "showing a CAPTCHA or login page. Retry after a short wait.",
+                        issue_code=SiteIssueCode.REQUEST_REJECTED,
                     )
                 check_browser_budget()
 
@@ -1282,12 +1359,9 @@ def discover_profile(
                     before = len(discovered)
                     page.mouse.wheel(0, 5_000)
                     _raise_if_profile_discovery_cancelled(should_cancel)
-                    if _is_explicit_douyin_auth_url(page.url):
-                        raise AuthenticationRequiredError(
-                            "Douyin interrupted discovery with a verification "
-                            "challenge. Complete it in Chrome and retry.",
-                            verification_url=url,
-                        )
+                    auth_issue = _explicit_douyin_auth_url_issue_code(page.url)
+                    if auth_issue is not None:
+                        raise _douyin_authentication_error(auth_issue, url)
                     if not _is_trusted_douyin_page_url(page.url):
                         raise DiscoveryError(
                             "Douyin profile discovery redirected outside the trusted "
@@ -1308,12 +1382,9 @@ def discover_profile(
                             """
                         )
                     _raise_if_profile_discovery_cancelled(should_cancel)
-                    if _is_explicit_douyin_auth_url(page.url):
-                        raise AuthenticationRequiredError(
-                            "Douyin interrupted discovery with a verification "
-                            "challenge. Complete it in Chrome and retry.",
-                            verification_url=url,
-                        )
+                    auth_issue = _explicit_douyin_auth_url_issue_code(page.url)
+                    if auth_issue is not None:
+                        raise _douyin_authentication_error(auth_issue, url)
                     if not _is_trusted_douyin_page_url(page.url):
                         raise DiscoveryError(
                             "Douyin profile discovery redirected outside the trusted "
@@ -1328,12 +1399,9 @@ def discover_profile(
                         )
                     )
                     _raise_if_profile_discovery_cancelled(should_cancel)
-                    if _is_explicit_douyin_auth_url(page.url):
-                        raise AuthenticationRequiredError(
-                            "Douyin redirected to an explicit login or verification "
-                            "page. Complete it in Chrome and retry.",
-                            verification_url=url,
-                        )
+                    auth_issue = _explicit_douyin_auth_url_issue_code(page.url)
+                    if auth_issue is not None:
+                        raise _douyin_authentication_error(auth_issue, url)
                     if not _is_trusted_douyin_page_url(page.url):
                         raise DiscoveryError(
                             "Douyin profile discovery redirected outside the trusted "
@@ -1352,17 +1420,20 @@ def discover_profile(
                         check_browser_budget()
                         updated_body = page.content()
                     _raise_if_profile_discovery_cancelled(should_cancel)
+                    auth_issue = _auth_page_issue_code(updated_body)
+                    if auth_issue is not None:
+                        raise _douyin_authentication_error(auth_issue, url)
                     if _looks_like_transient_limit(updated_body):
                         raise TemporaryAccessError(
                             "Douyin profile discovery was temporarily rate-limited. "
                             "Retry after a short wait; Chrome verification is not "
                             "required."
                         )
-                    if _looks_like_auth_page(updated_body):
-                        raise AuthenticationRequiredError(
-                            "Douyin interrupted discovery with a verification challenge. "
-                            "Complete it in Chrome and retry.",
-                            verification_url=url,
+                    if _looks_like_request_rejected(updated_body):
+                        raise TemporaryAccessError(
+                            "Douyin temporarily rejected the profile request without "
+                            "showing a CAPTCHA or login page. Retry after a short wait.",
+                            issue_code=SiteIssueCode.REQUEST_REJECTED,
                         )
                     check_browser_budget()
                     unchanged_rounds = (
@@ -1415,9 +1486,39 @@ def discover_profile(
         raise
     except PlaywrightError as exc:
         message = str(exc)
-        if "timeout" in message.lower() or _looks_like_transient_limit(message):
+        lowered_message = message.lower()
+        if _looks_like_transient_limit(message):
             raise TemporaryAccessError(
-                "Douyin profile discovery temporarily timed out or was rate-limited. "
-                "Retry after a short wait; Chrome verification is not required."
+                "Douyin profile discovery was explicitly rate-limited. Retry after "
+                "a short wait; Chrome verification is not required.",
+                issue_code=SiteIssueCode.RATE_LIMITED,
             ) from exc
-        raise DiscoveryError(f"Douyin browser discovery failed: {message}") from exc
+        if _looks_like_request_rejected(message):
+            raise TemporaryAccessError(
+                "Douyin temporarily rejected browser profile discovery without "
+                "showing a CAPTCHA or login page. Retry after a short wait.",
+                issue_code=SiteIssueCode.REQUEST_REJECTED,
+            ) from exc
+        if "timeout" in lowered_message or "timed out" in lowered_message:
+            raise TemporaryAccessError(
+                "Douyin browser profile discovery timed out. Check the network and "
+                "retry; no CAPTCHA or rate-limit response was detected.",
+                issue_code=SiteIssueCode.NETWORK_ERROR,
+            ) from exc
+        if any(
+            marker in lowered_message
+            for marker in (
+                "executable doesn't exist",
+                "executable does not exist",
+                "browser was not found",
+            )
+        ):
+            raise DiscoveryError(
+                "The Playwright browser executable required for Douyin discovery "
+                "is not installed. Run the project setup command and restart it.",
+                issue_code=SiteIssueCode.LOCAL_CONFIGURATION,
+            ) from exc
+        raise DiscoveryError(
+            f"Douyin browser discovery failed: {message}",
+            issue_code=SiteIssueCode.SITE_RESPONSE_CHANGED,
+        ) from exc

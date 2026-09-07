@@ -7,6 +7,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .errors import SiteIssueCode
+
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -101,6 +103,7 @@ class DownloadItem(BaseModel):
     resolution: str | None = None
     error: str | None = None
     auth_message: str | None = None
+    issue_code: SiteIssueCode | None = None
     retryable: bool = True
     metadata: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=utc_now)
@@ -130,6 +133,8 @@ class DownloadJob(BaseModel):
     error: str | None = None
     warning: str | None = None
     auth_message: str | None = None
+    issue_code: SiteIssueCode | None = None
+    issue_message: str | None = None
     verification_url: str | None = None
     cookie_browser: str | None = "chrome"
     cookie_profile: str | None = None

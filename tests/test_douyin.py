@@ -5,9 +5,12 @@ from http.cookiejar import CookieJar
 import pytest
 
 from app.douyin import (
+    _auth_page_issue_code,
+    _explicit_douyin_auth_url_issue_code,
     _is_explicit_douyin_auth_url,
     _is_target_post_response,
     _looks_like_auth_page,
+    _looks_like_request_rejected,
     _looks_like_transient_limit,
     _minimal_aweme_metadata,
     _parse_profile_awemes,
@@ -20,6 +23,7 @@ from app.errors import (
     AuthenticationRequiredError,
     DiscoveryError,
     DownloadCancelledError,
+    SiteIssueCode,
     TemporaryAccessError,
 )
 
@@ -99,8 +103,44 @@ def test_douyin_rate_limit_text_is_not_treated_as_captcha() -> None:
     assert not _looks_like_auth_page(
         '<script>const route = "captcha";</script><main>正常主页</main>'
     )
-    assert _looks_like_transient_limit("网络环境存在风险，请稍后再试")
+    assert not _looks_like_transient_limit("网络环境存在风险，请稍后再试")
+    assert _looks_like_request_rejected("网络环境存在风险，请稍后再试")
     assert not _looks_like_auth_page("网络环境存在风险，请稍后再试")
+
+
+@pytest.mark.parametrize(
+    "visible_text",
+    [
+        "普通作品标题：验证码背后的设计",
+        "本期讨论 CAPTCHA 与安全验证的历史",
+        "登录后有哪些新功能",
+    ],
+)
+def test_douyin_auth_words_in_normal_visible_content_are_not_actionable(
+    visible_text: str,
+) -> None:
+    assert _auth_page_issue_code(f"<main>{visible_text}</main>") is None
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("<main>请先登录后继续</main>", SiteIssueCode.LOGIN_REQUIRED),
+        (
+            "<main>Please complete the CAPTCHA</main>",
+            SiteIssueCode.VERIFICATION_REQUIRED,
+        ),
+        (
+            "<script>const route='captcha';</script><main>正常主页</main>",
+            None,
+        ),
+    ],
+)
+def test_douyin_visible_auth_page_distinguishes_login_and_verification(
+    value: str,
+    expected: SiteIssueCode | None,
+) -> None:
+    assert _auth_page_issue_code(value) == expected
 
 
 @pytest.mark.parametrize(
@@ -114,6 +154,32 @@ def test_douyin_rate_limit_text_is_not_treated_as_captcha() -> None:
 )
 def test_douyin_explicit_auth_urls_are_trusted_and_actionable(url: str) -> None:
     assert _is_explicit_douyin_auth_url(url)
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("https://www.douyin.com/login", SiteIssueCode.LOGIN_REQUIRED),
+        (
+            "https://www.douyin.com/passport/web/login",
+            SiteIssueCode.LOGIN_REQUIRED,
+        ),
+        (
+            "https://sso.douyin.com/verify",
+            SiteIssueCode.VERIFICATION_REQUIRED,
+        ),
+        (
+            "https://www.douyin.com/captcha/?from=profile",
+            SiteIssueCode.VERIFICATION_REQUIRED,
+        ),
+        ("https://evil.example/login", None),
+    ],
+)
+def test_douyin_auth_url_distinguishes_login_and_verification(
+    url: str,
+    expected: SiteIssueCode | None,
+) -> None:
+    assert _explicit_douyin_auth_url_issue_code(url) == expected
 
 
 @pytest.mark.parametrize(
@@ -386,8 +452,71 @@ def test_douyin_browser_timeout_does_not_request_chrome_verification(
         lambda: TimeoutPlaywrightContext(),
     )
 
-    with pytest.raises(TemporaryAccessError, match="Chrome verification is not required"):
+    with pytest.raises(TemporaryAccessError) as captured:
         discover_profile(profile_url, use_browser_cookies=True)
+
+    assert captured.value.issue_code == SiteIssueCode.NETWORK_ERROR
+    assert "no CAPTCHA or rate-limit response" in str(captured.value)
+
+
+@pytest.mark.parametrize(
+    ("browser_error", "expected_error", "expected_code"),
+    [
+        (
+            "当前访问频繁，请稍后再试",
+            TemporaryAccessError,
+            SiteIssueCode.RATE_LIMITED,
+        ),
+        (
+            "网络环境存在风险，请稍后再试",
+            TemporaryAccessError,
+            SiteIssueCode.REQUEST_REJECTED,
+        ),
+        (
+            "Executable doesn't exist at /missing/chrome",
+            DiscoveryError,
+            SiteIssueCode.LOCAL_CONFIGURATION,
+        ),
+    ],
+)
+def test_douyin_playwright_failure_has_structured_site_classification(
+    monkeypatch,
+    browser_error: str,
+    expected_error: type[Exception],
+    expected_code: SiteIssueCode,
+) -> None:
+    from playwright.sync_api import Error as PlaywrightError
+
+    profile_id = "MS4wLjABAAAAexpected"
+    profile_url = f"https://www.douyin.com/user/{profile_id}"
+
+    def signed_profile_failure(*args, **kwargs):
+        raise AuthenticationRequiredError(
+            "Signed profile unavailable",
+            verification_url=profile_url,
+        )
+
+    class FailingPlaywrightContext:
+        def __enter__(self):
+            raise PlaywrightError(browser_error)
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "app.douyin.fetch_signed_profile_awemes",
+        signed_profile_failure,
+    )
+    monkeypatch.setattr("app.douyin._extract_cookies", lambda profile: CookieJar())
+    monkeypatch.setattr(
+        "playwright.sync_api.sync_playwright",
+        lambda: FailingPlaywrightContext(),
+    )
+
+    with pytest.raises(expected_error) as captured:
+        discover_profile(profile_url, use_browser_cookies=True)
+
+    assert captured.value.issue_code == expected_code
 
 
 def test_douyin_browser_fallback_shares_budget_and_stops_without_progress(
@@ -816,16 +945,19 @@ def test_douyin_initial_html_hidden_auth_word_does_not_request_verification(
 
 
 @pytest.mark.parametrize(
-    ("scroll_text", "expect_rate_limit"),
+    ("scroll_text", "expected_issue"),
     [
-        (None, False),
-        ("网络环境存在风险，请稍后再试", True),
+        (None, None),
+        (
+            "网络环境存在风险，请稍后再试",
+            SiteIssueCode.REQUEST_REJECTED,
+        ),
     ],
 )
 def test_douyin_scroll_non_auth_content_does_not_request_verification(
     monkeypatch,
     scroll_text: str | None,
-    expect_rate_limit: bool,
+    expected_issue: SiteIssueCode | None,
 ) -> None:
     profile_id = "MS4wLjABAAAAexpected"
     profile_url = f"https://www.douyin.com/user/{profile_id}"
@@ -919,12 +1051,10 @@ def test_douyin_scroll_non_auth_content_does_not_request_verification(
 
     _install_fake_douyin_browser(monkeypatch, FakePage())
 
-    if expect_rate_limit:
-        with pytest.raises(
-            TemporaryAccessError,
-            match="temporarily rate-limited",
-        ):
+    if expected_issue is not None:
+        with pytest.raises(TemporaryAccessError) as captured:
             discover_profile(profile_url, max_scrolls=1)
+        assert captured.value.issue_code == expected_issue
         return
 
     result = discover_profile(profile_url, max_scrolls=1)
@@ -934,16 +1064,26 @@ def test_douyin_scroll_non_auth_content_does_not_request_verification(
 
 
 @pytest.mark.parametrize(
-    ("redirect_url", "expected_error"),
+    ("redirect_url", "expected_error", "expected_code"),
     [
-        ("https://www.douyin.com/login", AuthenticationRequiredError),
-        ("https://evil.example/login", DiscoveryError),
+        (
+            "https://www.douyin.com/login",
+            AuthenticationRequiredError,
+            SiteIssueCode.LOGIN_REQUIRED,
+        ),
+        (
+            "https://www.douyin.com/captcha",
+            AuthenticationRequiredError,
+            SiteIssueCode.VERIFICATION_REQUIRED,
+        ),
+        ("https://evil.example/login", DiscoveryError, None),
     ],
 )
 def test_douyin_browser_redirect_requires_trusted_explicit_auth_url(
     monkeypatch,
     redirect_url: str,
     expected_error: type[Exception],
+    expected_code: SiteIssueCode | None,
 ) -> None:
     profile_id = "MS4wLjABAAAAexpected"
     profile_url = f"https://www.douyin.com/user/{profile_id}"
@@ -1022,6 +1162,7 @@ def test_douyin_browser_redirect_requires_trusted_explicit_auth_url(
 
     if isinstance(captured.value, AuthenticationRequiredError):
         assert captured.value.verification_url == profile_url
+        assert captured.value.issue_code == expected_code
 
 
 def test_douyin_minimal_metadata_accepts_265_and_bitrate_uris() -> None:

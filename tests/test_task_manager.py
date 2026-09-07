@@ -10,6 +10,7 @@ from app.downloader import (
     DownloadOutcome,
     DownloaderConfig,
     EngineEvent,
+    safe_external_error_message,
 )
 from app.errors import (
     AuthenticationRequiredError,
@@ -17,6 +18,7 @@ from app.errors import (
     DouyinMediaRefreshRequiredError,
     DownloadCancelledError,
     MediaDownloadError,
+    SiteIssueCode,
     TemporaryAccessError,
 )
 from app.models import (
@@ -5941,6 +5943,163 @@ def test_douyin_item_redirect_auto_refresh_replaces_stale_metadata(
         manager.shutdown()
 
 
+def test_douyin_profile_auto_refresh_preserves_local_configuration_issue(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    profile_url = "https://www.douyin.com/user/expected-profile-owner"
+    media_id = "7677923079457231738"
+
+    class LocalFailureProfileEngine:
+        def __init__(self) -> None:
+            self.config = DownloaderConfig(cookie_profile="Default")
+            self.download_calls = 0
+
+        def discover(self, url, platform, kind, *, should_cancel):
+            return DiscoveryResult(
+                author="Expected author",
+                items=[
+                    DownloadItem(
+                        id="target",
+                        media_id=media_id,
+                        source_url=f"https://www.douyin.com/video/{media_id}",
+                        title="Verified video",
+                        author="Expected author",
+                        media_type=MediaType.VIDEO,
+                        metadata=complete_douyin_profile_metadata(
+                            profile_url,
+                            media_id,
+                        ),
+                    )
+                ],
+            )
+
+        def download_item(
+            self,
+            item,
+            platform,
+            output_dir,
+            *,
+            callback,
+            should_cancel,
+        ):
+            self.download_calls += 1
+            raise DouyinMediaRefreshRequiredError(
+                "Douyin media route requires a fresh item response"
+            )
+
+    def fail_profile_refresh(*args, **kwargs):
+        raise DiscoveryError(
+            "ffprobe was not found in the bundled runtime",
+            issue_code=SiteIssueCode.LOCAL_CONFIGURATION,
+        )
+
+    manager = DownloadManager(
+        state_dir=tmp_path / "state",
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    engine = LocalFailureProfileEngine()
+    monkeypatch.setattr(manager, "_engine_for_job", lambda job: engine)
+    monkeypatch.setattr(
+        "app.task_manager.discover_item_metadata_from_profile",
+        fail_profile_refresh,
+    )
+
+    try:
+        created = manager.create_job(profile_url, auto_start=True)
+        interrupted = wait_for_job(manager, created.id)
+
+        assert interrupted.status == JobStatus.INTERRUPTED
+        assert interrupted.issue_code == SiteIssueCode.LOCAL_CONFIGURATION
+        assert interrupted.items[0].issue_code == SiteIssueCode.LOCAL_CONFIGURATION
+        assert "required local component is unavailable" in (
+            interrupted.error or ""
+        )
+        assert "ffprobe was not found" in (interrupted.error or "")
+        assert engine.download_calls == 1
+    finally:
+        manager.shutdown()
+
+
+def test_douyin_direct_auto_refresh_preserves_local_configuration_issue(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    media_id = "7649279395044040154"
+    source_url = f"https://www.douyin.com/video/{media_id}"
+
+    class LocalFailureDirectEngine:
+        def __init__(self) -> None:
+            self.config = DownloaderConfig(cookie_profile="Default")
+            self.discovery_calls = 0
+            self.download_calls = 0
+
+        def discover(self, url, platform, kind, *, should_cancel):
+            self.discovery_calls += 1
+            if self.discovery_calls > 1:
+                raise DiscoveryError(
+                    "ffmpeg was not found in the bundled runtime",
+                    issue_code=SiteIssueCode.LOCAL_CONFIGURATION,
+                )
+            return DiscoveryResult(
+                author="Verified author",
+                items=[
+                    DownloadItem(
+                        id="target",
+                        media_id=media_id,
+                        source_url=source_url,
+                        title="Verified target",
+                        author="Verified author",
+                        media_type=MediaType.VIDEO,
+                        metadata=complete_douyin_item_metadata(
+                            source_url,
+                            media_id,
+                            video_uri="stale-video-uri",
+                        ),
+                    )
+                ],
+            )
+
+        def download_item(
+            self,
+            item,
+            platform,
+            output_dir,
+            *,
+            callback,
+            should_cancel,
+        ):
+            self.download_calls += 1
+            raise DouyinMediaRefreshRequiredError(
+                "Douyin media route requires a fresh item response"
+            )
+
+    manager = DownloadManager(
+        state_dir=tmp_path / "state",
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    engine = LocalFailureDirectEngine()
+    monkeypatch.setattr(manager, "_engine_for_job", lambda job: engine)
+
+    try:
+        created = manager.create_job(source_url, auto_start=True)
+        interrupted = wait_for_job(manager, created.id)
+
+        assert interrupted.status == JobStatus.INTERRUPTED
+        assert interrupted.issue_code == SiteIssueCode.LOCAL_CONFIGURATION
+        assert interrupted.items[0].issue_code == SiteIssueCode.LOCAL_CONFIGURATION
+        assert "required local component is unavailable" in (
+            interrupted.error or ""
+        )
+        assert "ffmpeg was not found" in (interrupted.error or "")
+        assert engine.discovery_calls == 2
+        assert engine.download_calls == 1
+    finally:
+        manager.shutdown()
+
+
 def test_douyin_profile_redirect_refresh_rejects_cross_wired_author(
     monkeypatch,
     tmp_path,
@@ -7219,6 +7378,271 @@ def test_cancel_while_temporary_limit_propagates_converges_to_cancelled(
     finally:
         release_discovery.set()
         manager.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_status", "expected_code"),
+    [
+        (
+            TemporaryAccessError(
+                "opaque temporary response",
+                issue_code=SiteIssueCode.RATE_LIMITED,
+            ),
+            JobStatus.FAILED,
+            SiteIssueCode.RATE_LIMITED,
+        ),
+        (
+            AuthenticationRequiredError(
+                "opaque browser challenge",
+                verification_url="https://www.youtube.com/@BlenderOfficial",
+                issue_code=SiteIssueCode.VERIFICATION_REQUIRED,
+            ),
+            JobStatus.NEEDS_AUTH,
+            SiteIssueCode.VERIFICATION_REQUIRED,
+        ),
+        (
+            RuntimeError("HTTP Error 503: Service Unavailable"),
+            JobStatus.FAILED,
+            SiteIssueCode.SITE_UNAVAILABLE,
+        ),
+    ],
+)
+def test_manager_records_structured_discovery_issue(
+    monkeypatch,
+    tmp_path,
+    failure: BaseException,
+    expected_status: JobStatus,
+    expected_code: SiteIssueCode,
+) -> None:
+    class DiscoveryFailureEngine:
+        def discover(self, url, platform, kind, *, should_cancel):
+            raise failure
+
+    manager = DownloadManager(
+        state_dir=tmp_path / "state",
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    monkeypatch.setattr(
+        manager,
+        "_engine_for_job",
+        lambda job: DiscoveryFailureEngine(),
+    )
+
+    try:
+        created = manager.create_job(
+            "https://www.youtube.com/@BlenderOfficial",
+            auto_start=True,
+        )
+        failed = wait_for_job(manager, created.id)
+
+        assert failed.status == expected_status
+        assert failed.issue_code == expected_code
+        assert failed.issue_message == safe_external_error_message(failure)
+        assert JsonJobStore(tmp_path / "state").get(created.id).issue_code == (
+            expected_code
+        )
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_status", "expected_item_status", "expected_code"),
+    [
+        (
+            TemporaryAccessError(
+                "opaque temporary media response",
+                issue_code=SiteIssueCode.MEDIA_LINK_EXPIRED,
+            ),
+            JobStatus.INTERRUPTED,
+            ItemStatus.FAILED,
+            SiteIssueCode.MEDIA_LINK_EXPIRED,
+        ),
+        (
+            AuthenticationRequiredError(
+                "opaque media verification challenge",
+                verification_url="https://www.youtube.com/watch?v=LXb3EKWsInQ",
+                issue_code=SiteIssueCode.VERIFICATION_REQUIRED,
+            ),
+            JobStatus.NEEDS_AUTH,
+            ItemStatus.NEEDS_AUTH,
+            SiteIssueCode.VERIFICATION_REQUIRED,
+        ),
+        (
+            RuntimeError("HTTP Error 403: Forbidden"),
+            JobStatus.INTERRUPTED,
+            ItemStatus.FAILED,
+            SiteIssueCode.REQUEST_REJECTED,
+        ),
+    ],
+)
+def test_manager_records_structured_item_issue(
+    monkeypatch,
+    tmp_path,
+    failure: BaseException,
+    expected_status: JobStatus,
+    expected_item_status: ItemStatus,
+    expected_code: SiteIssueCode,
+) -> None:
+    class ItemFailureEngine:
+        def discover(self, url, platform, kind, *, should_cancel):
+            return DiscoveryResult(
+                author="Test Author",
+                items=[
+                    DownloadItem(
+                        id="target",
+                        source_url="https://www.youtube.com/watch?v=LXb3EKWsInQ",
+                        title="Target",
+                        media_type=MediaType.VIDEO,
+                    )
+                ],
+            )
+
+        def download_item(
+            self,
+            item,
+            platform,
+            output_dir,
+            *,
+            callback,
+            should_cancel,
+        ):
+            raise failure
+
+    manager = DownloadManager(
+        state_dir=tmp_path / "state",
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    monkeypatch.setattr(manager, "_engine_for_job", lambda job: ItemFailureEngine())
+
+    try:
+        created = manager.create_job(
+            "https://www.youtube.com/watch?v=LXb3EKWsInQ",
+            auto_start=True,
+        )
+        failed = wait_for_job(manager, created.id)
+
+        assert failed.status == expected_status
+        assert failed.issue_code == expected_code
+        assert failed.items[0].status == expected_item_status
+        assert failed.items[0].issue_code == expected_code
+        persisted = JsonJobStore(tmp_path / "state").get(created.id)
+        assert persisted.items[0].issue_code == expected_code
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_code"),
+    [
+        (
+            MediaDownloadError(
+                "Downloaded video content did not match the verified media endpoint",
+                issue_code=SiteIssueCode.SITE_RESPONSE_CHANGED,
+            ),
+            SiteIssueCode.SITE_RESPONSE_CHANGED,
+        ),
+        (
+            MediaDownloadError(
+                "FFprobe was not found",
+                issue_code=SiteIssueCode.LOCAL_CONFIGURATION,
+            ),
+            SiteIssueCode.LOCAL_CONFIGURATION,
+        ),
+    ],
+)
+def test_douyin_systemic_item_issue_pauses_remaining_profile_queue(
+    monkeypatch,
+    tmp_path,
+    failure: BaseException,
+    expected_code: SiteIssueCode,
+) -> None:
+    profile_url = "https://www.douyin.com/user/verified-profile-owner"
+    media_ids = ["7670000000000000001", "7670000000000000002"]
+
+    class SystemicFailureEngine:
+        def __init__(self) -> None:
+            self.download_calls: list[str] = []
+
+        def discover(self, url, platform, kind, *, should_cancel):
+            return DiscoveryResult(
+                author="Verified author",
+                items=[
+                    DownloadItem(
+                        id=media_id,
+                        media_id=media_id,
+                        source_url=f"https://www.douyin.com/video/{media_id}",
+                        title=f"Verified {media_id}",
+                        media_type=MediaType.VIDEO,
+                        metadata=complete_douyin_profile_metadata(
+                            profile_url,
+                            media_id,
+                        ),
+                    )
+                    for media_id in media_ids
+                ],
+            )
+
+        def download_item(
+            self,
+            item,
+            platform,
+            output_dir,
+            *,
+            callback,
+            should_cancel,
+        ):
+            self.download_calls.append(item.id)
+            raise failure
+
+    manager = DownloadManager(
+        state_dir=tmp_path / "state",
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    engine = SystemicFailureEngine()
+    monkeypatch.setattr(manager, "_engine_for_job", lambda job: engine)
+
+    try:
+        created = manager.create_job(profile_url, auto_start=True)
+        interrupted = wait_for_job(manager, created.id)
+
+        assert interrupted.status == JobStatus.INTERRUPTED
+        assert interrupted.issue_code == expected_code
+        assert engine.download_calls == [media_ids[0]]
+        assert interrupted.items[0].status == ItemStatus.FAILED
+        assert interrupted.items[1].status == ItemStatus.QUEUED
+    finally:
+        manager.shutdown()
+
+
+def test_issue_backfill_does_not_replace_explicit_codes(tmp_path) -> None:
+    item = DownloadItem(
+        id="failed-item",
+        source_url="https://www.youtube.com/watch?v=LXb3EKWsInQ",
+        status=ItemStatus.FAILED,
+        error="HTTP Error 429: Too Many Requests",
+        issue_code=SiteIssueCode.MEDIA_LINK_EXPIRED,
+    )
+    job = DownloadJob(
+        id="explicit-issue",
+        source_url="https://www.youtube.com/watch?v=LXb3EKWsInQ",
+        platform=Platform.YOUTUBE,
+        source_kind=SourceKind.ITEM,
+        output_root=str(tmp_path / "downloads"),
+        status=JobStatus.FAILED,
+        error="HTTP Error 429: Too Many Requests",
+        issue_code=SiteIssueCode.SECURITY_BLOCKED,
+        items=[item],
+    )
+
+    changed = DownloadManager._backfill_job_issue_locked(job)
+
+    assert changed is True
+    assert job.issue_code == SiteIssueCode.SECURITY_BLOCKED
+    assert job.issue_message == item.error
+    assert job.items[0].issue_code == SiteIssueCode.MEDIA_LINK_EXPIRED
 
 
 def test_restore_finalizes_job_when_all_items_were_saved_before_crash(

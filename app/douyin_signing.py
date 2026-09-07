@@ -19,7 +19,9 @@ from .errors import (
     AuthenticationRequiredError,
     DiscoveryError,
     DownloadCancelledError,
+    SiteIssueCode,
     TemporaryAccessError,
+    is_explicit_rate_limit_message,
 )
 
 
@@ -52,17 +54,12 @@ _TRANSIENT_HTTP_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
 _TRUSTED_DOUYIN_AUTH_HOSTS = frozenset(
     {"douyin.com", "www.douyin.com", "sso.douyin.com"}
 )
-_EXPLICIT_AUTH_PATH_MARKERS = ("/captcha", "/login", "/passport/", "/verify")
-_EXPLICIT_AUTH_TEXT_MARKERS = (
-    "captcha",
-    "verify you are human",
-    "complete the verification",
-    "security verification",
-    "验证码",
-    "安全验证",
-    "请完成下列验证",
-    "请完成验证",
-    "登录后继续",
+_EXPLICIT_AUTH_PATH_MARKERS = (
+    "/captcha",
+    "/login",
+    "/passport/",
+    "/safe/",
+    "/verify",
 )
 _EXPLICIT_AUTH_API_MARKERS = (
     "captcha",
@@ -77,6 +74,10 @@ _EXPLICIT_AUTH_API_MARKERS = (
     "安全验证",
     "请登录",
     "登录后",
+    "当前未登录",
+    "登录状态已过期",
+    "session expired",
+    "not logged in",
 )
 
 # These two official runtimes are required by the current SecSDK glue bootstrap.
@@ -113,7 +114,7 @@ _ALLOWED_GLUE_ATTRIBUTES = {
     "type",
 }
 
-_START_SIGNED_FETCH_SCRIPT = """
+_START_SIGNED_FETCH_SCRIPT = r"""
 ({ path, params, timeoutMs }) => {
   const stateKey = "__originalMediaSignedDetail";
   const previous = window[stateKey];
@@ -133,14 +134,58 @@ _START_SIGNED_FETCH_SCRIPT = """
     signal: controller.signal,
   })
     .then(async (response) => {
+      const responseText = await response.text();
       let payload = null;
       try {
-        payload = JSON.parse(await response.text());
+        payload = JSON.parse(responseText);
       } catch (_) {
+        let authKind = null;
+        try {
+          const responseUrl = new URL(response.url);
+          const host = responseUrl.hostname.toLowerCase().replace(/[.]$/, "");
+          const trustedHost = host === "douyin.com" || host.endsWith(".douyin.com");
+          const standardPort = !responseUrl.port || responseUrl.port === "443";
+          const authPath = decodeURIComponent(responseUrl.pathname).toLowerCase();
+          if (responseUrl.protocol === "https:" && trustedHost && standardPort) {
+            if (["/captcha", "/verify", "/safe/"].some((value) => authPath.includes(value))) {
+              authKind = "verification_required";
+            } else if (authPath.includes("/login") || authPath.includes("/passport/")) {
+              authKind = "login_required";
+            }
+          }
+        } catch (_) {}
+        if (!authKind) {
+          try {
+            const documentValue = new DOMParser().parseFromString(responseText, "text/html");
+            documentValue.querySelectorAll("script,style,template,noscript").forEach((node) => node.remove());
+            const visibleText = (documentValue.body?.textContent || "").replace(/\s+/g, " ").toLowerCase();
+            if ([
+              "verify you are human",
+              "complete the verification",
+              "complete the captcha",
+              "请完成下列验证",
+              "请完成验证",
+              "请拖动滑块",
+            ].some((value) => visibleText.includes(value))) {
+              authKind = "verification_required";
+            } else if ([
+              "登录后继续",
+              "登录后查看",
+              "请先登录",
+              "当前未登录",
+              "登录状态已过期",
+              "session expired",
+              "not logged in",
+            ].some((value) => visibleText.includes(value))) {
+              authKind = "login_required";
+            }
+          } catch (_) {}
+        }
         window[stateKey] = {
           state: "error",
           reason: "invalid_json",
           httpStatus: response.status,
+          authKind,
         };
         return;
       }
@@ -185,7 +230,14 @@ class _TransientSigningFailure(_SigningFailure):
 
 
 class _AuthenticationSigningFailure(_SigningFailure):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        issue_code: SiteIssueCode = SiteIssueCode.LOGIN_REQUIRED,
+    ) -> None:
+        super().__init__(message)
+        self.issue_code = issue_code
 
 
 class _CookieAccessSigningFailure(_SigningFailure):
@@ -260,6 +312,19 @@ def _transient_reason_category(exc: BaseException) -> str:
     if any(value in message for value in ("timeout", "timed out", "network")):
         return "network-timeout"
     return "network-error"
+
+
+def _transient_site_issue_code(category: str) -> SiteIssueCode:
+    return {
+        "api-rate-limit": SiteIssueCode.RATE_LIMITED,
+        "http-429": SiteIssueCode.RATE_LIMITED,
+        "http-403": SiteIssueCode.REQUEST_REJECTED,
+        "signed-rejected": SiteIssueCode.REQUEST_REJECTED,
+        "http-5xx": SiteIssueCode.SITE_UNAVAILABLE,
+        "network-timeout": SiteIssueCode.NETWORK_ERROR,
+        "network-error": SiteIssueCode.NETWORK_ERROR,
+        "signer-timeout": SiteIssueCode.NETWORK_ERROR,
+    }.get(category, SiteIssueCode.SITE_RESPONSE_CHANGED)
 
 
 class _QuietCookieLogger:
@@ -417,18 +482,47 @@ class _VisibleTextParser(HTMLParser):
             self.values.append(data)
 
 
-def _has_explicit_auth_html(source_html: str) -> bool:
+def _explicit_auth_html_issue_code(source_html: str) -> SiteIssueCode | None:
     parser = _VisibleTextParser()
     try:
         parser.feed(source_html)
         parser.close()
     except Exception:
-        return False
+        return None
     visible_text = re.sub(r"\s+", " ", " ".join(parser.values)).lower()
-    return any(marker in visible_text for marker in _EXPLICIT_AUTH_TEXT_MARKERS)
+    if any(
+        marker in visible_text
+        for marker in (
+            "verify you are human",
+            "complete the verification",
+            "complete the captcha",
+            "请完成下列验证",
+            "请完成验证",
+            "请拖动滑块",
+        )
+    ):
+        return SiteIssueCode.VERIFICATION_REQUIRED
+    if any(
+        marker in visible_text
+        for marker in (
+            "登录后继续",
+            "登录后查看",
+            "请先登录",
+            "当前未登录",
+            "登录状态已过期",
+            "session expired",
+            "not logged in",
+        )
+    ):
+        return SiteIssueCode.LOGIN_REQUIRED
+    return None
 
 
-def _has_explicit_auth_api_message(payload: Any) -> bool:
+def _has_explicit_auth_html(source_html: str) -> bool:
+    return _explicit_auth_html_issue_code(source_html) is not None
+
+
+def _has_explicit_rate_limit_api_message(payload: Any) -> bool:
     if not isinstance(payload, dict):
         return False
     message = str(
@@ -437,7 +531,36 @@ def _has_explicit_auth_api_message(payload: Any) -> bool:
         or payload.get("message")
         or ""
     ).lower()
-    return any(marker in message for marker in _EXPLICIT_AUTH_API_MARKERS)
+    return is_explicit_rate_limit_message(message)
+
+
+def _explicit_auth_api_issue_code(payload: Any) -> SiteIssueCode | None:
+    if not isinstance(payload, dict):
+        return None
+    message = str(
+        payload.get("status_msg")
+        or payload.get("status_message")
+        or payload.get("message")
+        or ""
+    ).lower()
+    if not any(marker in message for marker in _EXPLICIT_AUTH_API_MARKERS):
+        return None
+    if any(
+        marker in message
+        for marker in (
+            "captcha",
+            "verification",
+            "verify you are human",
+            "验证码",
+            "安全验证",
+        )
+    ):
+        return SiteIssueCode.VERIFICATION_REQUIRED
+    return SiteIssueCode.LOGIN_REQUIRED
+
+
+def _has_explicit_auth_api_message(payload: Any) -> bool:
+    return _explicit_auth_api_issue_code(payload) is not None
 
 
 def _extract_sdk_glue_tags(source_html: str) -> tuple[str, ...]:
@@ -457,9 +580,11 @@ def _extract_sdk_glue_tags(source_html: str) -> tuple[str, ...]:
     except Exception as exc:
         raise _SigningFailure("Douyin SecSDK HTML could not be parsed") from exc
     if not parser.tags:
-        if _has_explicit_auth_html(source_html):
+        auth_issue = _explicit_auth_html_issue_code(source_html)
+        if auth_issue is not None:
             raise _AuthenticationSigningFailure(
-                "Douyin HTML displayed an explicit verification challenge"
+                "Douyin HTML displayed an explicit authentication request",
+                issue_code=auth_issue,
             )
         raise _TransientSigningFailure(
             "Douyin SecSDK glue was not present in the HTML",
@@ -544,7 +669,7 @@ def _is_allowed_douyin_origin(value: str) -> bool:
         return False
 
 
-def _is_explicit_auth_url(value: str) -> bool:
+def _explicit_auth_url_issue_code(value: str) -> SiteIssueCode | None:
     try:
         parsed = urlsplit(value)
         hostname = (parsed.hostname or "").lower()
@@ -555,11 +680,19 @@ def _is_explicit_auth_url(value: str) -> bool:
             or parsed.password is not None
             or parsed.port not in {None, 443}
         ):
-            return False
+            return None
         path = unquote(parsed.path).lower()
     except (TypeError, ValueError):
-        return False
-    return any(marker in path for marker in _EXPLICIT_AUTH_PATH_MARKERS)
+        return None
+    if not any(marker in path for marker in _EXPLICIT_AUTH_PATH_MARKERS):
+        return None
+    if "/captcha" in path or "/verify" in path or "/safe/" in path:
+        return SiteIssueCode.VERIFICATION_REQUIRED
+    return SiteIssueCode.LOGIN_REQUIRED
+
+
+def _is_explicit_auth_url(value: str) -> bool:
+    return _explicit_auth_url_issue_code(value) is not None
 
 
 def _fetch_source_html_with_urllib(
@@ -592,9 +725,11 @@ def _fetch_source_html_with_urllib(
             if budget is not None:
                 budget.remaining_seconds()
             status = getattr(response, "status", None)
-            if _is_explicit_auth_url(response.geturl()):
+            redirect_issue = _explicit_auth_url_issue_code(response.geturl())
+            if redirect_issue is not None:
                 raise _AuthenticationSigningFailure(
-                    "Douyin HTML redirected to an explicit verification page"
+                    "Douyin HTML redirected to an explicit login or verification page",
+                    issue_code=redirect_issue,
                 )
             if not _is_allowed_douyin_origin(response.geturl()):
                 raise _SigningFailure(
@@ -644,9 +779,11 @@ def _fetch_source_html_with_urllib(
             _raise_if_cancelled(should_cancel)
             if budget is not None:
                 budget.remaining_seconds()
-            if _is_explicit_auth_url(exc.geturl()):
+            redirect_issue = _explicit_auth_url_issue_code(exc.geturl())
+            if redirect_issue is not None:
                 raise _AuthenticationSigningFailure(
-                    "Douyin HTML redirected to an explicit verification page"
+                    "Douyin HTML redirected to an explicit login or verification page",
+                    issue_code=redirect_issue,
                 ) from exc
             if not _is_allowed_douyin_origin(exc.geturl()):
                 raise _SigningFailure(
@@ -672,9 +809,11 @@ def _fetch_source_html_with_urllib(
                     source_html = body.decode(charset, errors="replace")
                 except Exception:
                     source_html = ""
-                if _has_explicit_auth_html(source_html):
+                auth_issue = _explicit_auth_html_issue_code(source_html)
+                if auth_issue is not None:
                     raise _AuthenticationSigningFailure(
-                        "Douyin HTML displayed an explicit verification challenge"
+                        "Douyin HTML displayed an explicit authentication request",
+                        issue_code=auth_issue,
                     ) from exc
                 raise _TransientSigningFailure(
                     "Douyin HTML request was temporarily rejected",
@@ -765,9 +904,11 @@ def _extract_glue_with_context_fallback(
         try:
             budget.remaining_seconds()
             status = response.status
-            if _is_explicit_auth_url(response.url):
+            redirect_issue = _explicit_auth_url_issue_code(response.url)
+            if redirect_issue is not None:
                 raise _AuthenticationSigningFailure(
-                    "Douyin HTML redirected to an explicit verification page"
+                    "Douyin HTML redirected to an explicit login or verification page",
+                    issue_code=redirect_issue,
                 )
             if not _is_allowed_douyin_origin(response.url):
                 raise _SigningFailure(
@@ -785,9 +926,11 @@ def _extract_glue_with_context_fallback(
             if type(status) is int and status == 403:
                 source_html = response.text()
                 budget.remaining_seconds()
-                if _has_explicit_auth_html(source_html):
+                auth_issue = _explicit_auth_html_issue_code(source_html)
+                if auth_issue is not None:
                     raise _AuthenticationSigningFailure(
-                        "Douyin HTML displayed an explicit verification challenge"
+                        "Douyin HTML displayed an explicit authentication request",
+                        issue_code=auth_issue,
                     )
                 raise _TransientSigningFailure(
                     "Douyin browser HTML request was temporarily rejected",
@@ -955,6 +1098,17 @@ def _wait_for_signed_response(
             return result
         if state not in {"missing", "pending"}:
             http_status = result.get("httpStatus")
+            auth_kind = result.get("authKind")
+            if auth_kind == SiteIssueCode.VERIFICATION_REQUIRED.value:
+                raise _AuthenticationSigningFailure(
+                    "Douyin signed response displayed an explicit verification page",
+                    issue_code=SiteIssueCode.VERIFICATION_REQUIRED,
+                )
+            if auth_kind == SiteIssueCode.LOGIN_REQUIRED.value:
+                raise _AuthenticationSigningFailure(
+                    "Douyin signed response displayed an explicit login page",
+                    issue_code=SiteIssueCode.LOGIN_REQUIRED,
+                )
             if type(http_status) is int and http_status in _TRANSIENT_HTTP_STATUSES:
                 raise _TransientSigningFailure(
                     "Douyin signed request returned a temporary HTTP status",
@@ -1012,9 +1166,11 @@ def _validated_payload(
             f"Douyin {request_name} request requires authentication"
         )
     if type(http_status) is int and http_status == 403:
-        if _has_explicit_auth_api_message(payload):
+        auth_issue = _explicit_auth_api_issue_code(payload)
+        if auth_issue is not None:
             raise _AuthenticationSigningFailure(
-                f"Douyin {request_name} API requires authentication"
+                f"Douyin {request_name} API requires authentication",
+                issue_code=auth_issue,
             )
         raise _TransientSigningFailure(
             f"Douyin {request_name} request was temporarily rejected",
@@ -1028,9 +1184,16 @@ def _validated_payload(
         raise _SigningFailure(f"Douyin {request_name} request returned no JSON object")
     status_code = payload.get("status_code")
     if type(status_code) is not int or status_code != 0:
-        if _has_explicit_auth_api_message(payload):
+        auth_issue = _explicit_auth_api_issue_code(payload)
+        if auth_issue is not None:
             raise _AuthenticationSigningFailure(
-                f"Douyin {request_name} API requires authentication"
+                f"Douyin {request_name} API requires authentication",
+                issue_code=auth_issue,
+            )
+        if _has_explicit_rate_limit_api_message(payload):
+            raise _TransientSigningFailure(
+                f"Douyin {request_name} API explicitly rate-limited the request",
+                category="api-rate-limit",
             )
         raise _TransientSigningFailure(
             f"Douyin {request_name} API temporarily rejected the request",
@@ -1244,47 +1407,110 @@ def _raise_signing_error(
     cause: Exception,
 ) -> None:
     if isinstance(cause, _SigningNoProgressTimeout):
+        code = _transient_site_issue_code(cause.category)
         raise TemporaryAccessError(
             "Douyin signed discovery stopped after 120 seconds without verified "
             "progress. Retry after a short wait; Chrome verification is not "
-            f"required. Reason category: {cause.category}."
+            f"required. Reason category: {cause.category}.",
+            issue_code=code,
         ) from cause
     if isinstance(cause, _TransientSigningFailure):
+        code = _transient_site_issue_code(cause.category)
+        message = {
+            SiteIssueCode.RATE_LIMITED: (
+                "Douyin explicitly rate-limited a signed request after automatic "
+                "retries. Wait a minute or two and retry; no lower-quality media "
+                "was downloaded."
+            ),
+            SiteIssueCode.REQUEST_REJECTED: (
+                "Douyin temporarily rejected a signed request after automatic "
+                "retries, without displaying a CAPTCHA or login page. Wait briefly "
+                "and retry."
+            ),
+            SiteIssueCode.SITE_UNAVAILABLE: (
+                "Douyin returned a temporary server error after automatic retries. "
+                "The queue was paused; wait briefly and retry."
+            ),
+            SiteIssueCode.NETWORK_ERROR: (
+                "The Douyin signed request encountered a network or timeout error "
+                "after automatic retries. Check the connection and retry."
+            ),
+            SiteIssueCode.SITE_RESPONSE_CHANGED: (
+                "Douyin returned incomplete or changed signed response data after "
+                "automatic retries. The response could not be verified, so the task "
+                "was paused without downloading a fallback."
+            ),
+        }[code]
         raise TemporaryAccessError(
-            "Douyin temporarily limited a signed request after automatic retries. "
-            "Wait a minute or two and retry; no lower-quality media was downloaded. "
-            f"Reason category: {cause.category}."
+            f"{message} Reason category: {cause.category}.",
+            issue_code=code,
         ) from cause
     if isinstance(cause, _CookieAccessSigningFailure):
         raise TemporaryAccessError(
             "Chrome cookies could not be read. Fully quit Chrome and retry, approve "
             "any system cookie-access prompt, or disable Chrome Cookie in settings "
             "to continue explicitly without login and create a new task. Opening a "
-            "verification page is not required."
+            "verification page is not required.",
+            issue_code=SiteIssueCode.COOKIE_UNAVAILABLE,
         ) from cause
     if isinstance(cause, _AuthenticationSigningFailure):
+        if cause.issue_code == SiteIssueCode.LOGIN_REQUIRED:
+            if "no current douyin chrome cookies" in str(cause).lower():
+                login_message = (
+                    "No current Douyin session cookies were found in the selected "
+                    "Chrome profile. Open the original task URL in that profile to "
+                    "establish a site session; sign in only if Douyin asks, then retry."
+                )
+            else:
+                login_message = (
+                    "Douyin explicitly requested a current login session. Sign in to "
+                    "Douyin in Chrome, return to the original link, then retry."
+                )
+            raise AuthenticationRequiredError(
+                login_message,
+                verification_url=verification_url,
+                issue_code=SiteIssueCode.LOGIN_REQUIRED,
+            ) from cause
         raise AuthenticationRequiredError(
-            "Douyin requires current Chrome cookies or an explicit verification. "
-            "Open the provided URL in Chrome, finish any CAPTCHA or login, then retry.",
+            "Douyin displayed an explicit CAPTCHA or verification page. Open the "
+            "provided URL in Chrome, finish the visible verification, then retry.",
             verification_url=verification_url,
+            issue_code=SiteIssueCode.VERIFICATION_REQUIRED,
         ) from cause
     if isinstance(cause, _SigningFailure):
         raise DiscoveryError(
             "Douyin signed data failed identity or integrity validation. Retry the "
             "original link; Chrome verification is not required unless Douyin "
-            "explicitly shows a CAPTCHA or login page."
+            "explicitly shows a CAPTCHA or login page.",
+            issue_code=SiteIssueCode.SITE_RESPONSE_CHANGED,
         ) from cause
     message = str(cause).lower()
+    if isinstance(cause, ImportError) or any(
+        marker in message
+        for marker in (
+            "no module named 'playwright'",
+            "executable doesn't exist",
+            "executable does not exist",
+            "browser was not found",
+        )
+    ):
+        raise DiscoveryError(
+            "The Playwright browser runtime required for Douyin signing is not "
+            "installed. Run the project setup command and restart it.",
+            issue_code=SiteIssueCode.LOCAL_CONFIGURATION,
+        ) from cause
     if any(marker in message for marker in ("timeout", "timed out", "network")):
         raise TemporaryAccessError(
             "Douyin signed discovery temporarily failed before a verified response "
             "was available. Retry after a short wait; Chrome verification is not "
-            "required. Reason category: network-timeout."
+            "required. Reason category: network-timeout.",
+            issue_code=SiteIssueCode.NETWORK_ERROR,
         ) from cause
     raise DiscoveryError(
         "Douyin signed discovery failed before a verified response was available. "
         "Retry the original link; Chrome verification is not required unless Douyin "
-        "explicitly shows a CAPTCHA or login page."
+        "explicitly shows a CAPTCHA or login page.",
+        issue_code=SiteIssueCode.SITE_RESPONSE_CHANGED,
     ) from cause
 
 

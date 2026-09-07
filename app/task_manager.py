@@ -38,7 +38,9 @@ from .errors import (
     DouyinMediaRefreshRequiredError,
     DownloadCancelledError,
     MediaDownloadError,
+    SiteIssueCode,
     TemporaryAccessError,
+    classify_site_issue,
 )
 from .models import (
     ACTIVE_JOB_STATUSES,
@@ -75,6 +77,24 @@ class ItemNotRetryableError(RuntimeError):
 
 
 Listener = Callable[[ManagerEvent, DownloadJob], None]
+NON_RETRYABLE_SITE_ISSUES = frozenset(
+    {
+        SiteIssueCode.CONTENT_UNAVAILABLE,
+        SiteIssueCode.REGION_RESTRICTED,
+    }
+)
+QUEUE_PAUSE_SITE_ISSUES = frozenset(
+    {
+        SiteIssueCode.RATE_LIMITED,
+        SiteIssueCode.REQUEST_REJECTED,
+        SiteIssueCode.MEDIA_LINK_EXPIRED,
+        SiteIssueCode.SITE_UNAVAILABLE,
+        SiteIssueCode.NETWORK_ERROR,
+        SiteIssueCode.COOKIE_UNAVAILABLE,
+        SiteIssueCode.SECURITY_BLOCKED,
+        SiteIssueCode.LOCAL_CONFIGURATION,
+    }
+)
 LEGACY_DOUYIN_RESULT_ERROR = (
     "This legacy Douyin profile result must be manually reviewed; "
     "create a new task before downloading again."
@@ -625,6 +645,7 @@ class DownloadManager:
                 self._clear_activity_locked(job)
                 changed = True
             changed |= self._sanitize_persisted_errors(job)
+            changed |= self._backfill_job_issue_locked(job)
             if changed:
                 job.refresh_counts()
                 if legacy_douyin_result:
@@ -953,6 +974,8 @@ class DownloadManager:
         self._clear_activity_locked(job)
         job.error = None
         job.auth_message = None
+        job.issue_code = None
+        job.issue_message = None
         job.verification_url = None
         job.finished_at = None
         job.updated_at = utc_now()
@@ -1085,6 +1108,8 @@ class DownloadManager:
                     job.cookie_fallback_used = result.cookie_fallback_used
                     job.discovery_complete = result.discovery_complete
                     job.warning = result.warning
+                    if result.warning:
+                        self._record_issue_locked(job, result.warning)
                     job.status = JobStatus.DOWNLOADING
                     self._clear_activity_locked(job)
                     job.refresh_counts()
@@ -1147,6 +1172,7 @@ class DownloadManager:
                     item.attempts += 1
                     item.error = None
                     item.auth_message = None
+                    item.issue_code = None
                     item.updated_at = utc_now()
                     job.active_item_id = item.id
                     job.status = JobStatus.DOWNLOADING
@@ -1235,6 +1261,7 @@ class DownloadManager:
                             )
                         item.progress.percent = 100.0
                         item.error = None
+                        item.issue_code = None
                         item.updated_at = utc_now()
                         job.cookie_fallback_used |= outcome.cookie_fallback_used
                         job.active_item_id = None
@@ -1253,6 +1280,12 @@ class DownloadManager:
                             item.status = ItemStatus.FAILED
                             item.error = safe_message
                             item.auth_message = None
+                            self._record_issue_locked(
+                                job,
+                                safe_message,
+                                item=item,
+                                cause=exc,
+                            )
                             item.retryable = True
                             if (
                                 job.platform == Platform.DOUYIN
@@ -1290,6 +1323,13 @@ class DownloadManager:
                             item.status = ItemStatus.NEEDS_AUTH
                             item.error = safe_message
                             item.auth_message = safe_message
+                            self._record_issue_locked(
+                                job,
+                                safe_message,
+                                item=item,
+                                authentication_required=True,
+                                cause=exc,
+                            )
                             item.updated_at = utc_now()
                             job.active_item_id = None
                             job.status = JobStatus.NEEDS_AUTH
@@ -1314,6 +1354,7 @@ class DownloadManager:
                         item = self._find_item(job, item_id)
                         item.status = ItemStatus.CANCELLED
                         item.error = "Cancelled by user"
+                        item.issue_code = None
                         item.updated_at = utc_now()
                         job.active_item_id = None
                         job.refresh_counts()
@@ -1321,13 +1362,28 @@ class DownloadManager:
                     raise
                 except Exception as exc:
                     safe_message = safe_external_error_message(exc)
+                    pause_queue = False
                     with self._lock:
                         job = self._require_job(job_id)
                         item = self._find_item(job, item_id)
                         item.status = ItemStatus.FAILED
                         item.error = safe_message
                         item.auth_message = None
-                        item.retryable = True
+                        self._record_issue_locked(
+                            job,
+                            safe_message,
+                            item=item,
+                            cause=exc,
+                        )
+                        item.retryable = item.issue_code not in NON_RETRYABLE_SITE_ISSUES
+                        pause_queue = (
+                            item.issue_code in QUEUE_PAUSE_SITE_ISSUES
+                            or (
+                                job.platform == Platform.DOUYIN
+                                and item.issue_code
+                                == SiteIssueCode.SITE_RESPONSE_CHANGED
+                            )
+                        )
                         if (
                             binding_error == XIAOHONGSHU_ITEM_BINDING_ERROR
                             and self._is_xiaohongshu_direct_job(job)
@@ -1338,9 +1394,22 @@ class DownloadManager:
                             job.discovery_complete = False
                         item.updated_at = utc_now()
                         job.active_item_id = None
+                        if pause_queue:
+                            job.status = JobStatus.INTERRUPTED
+                            job.error = safe_message
+                            job.auth_message = None
+                            job.verification_url = None
+                            job.finished_at = utc_now()
+                            job.retryable = True
                         job.refresh_counts()
                         self._commit_locked(job)
-                    self._notify(self.get_job(job_id), "item_failed", item_id)
+                    self._notify(
+                        self.get_job(job_id),
+                        "interrupted" if pause_queue else "item_failed",
+                        item_id,
+                    )
+                    if pause_queue:
+                        return
 
             self._finish_job(job_id)
         except TemporaryAccessError as exc:
@@ -1355,6 +1424,7 @@ class DownloadManager:
                     self._clear_activity_locked(job)
                     job.error = safe_message
                     job.auth_message = None
+                    self._record_issue_locked(job, safe_message, cause=exc)
                     job.verification_url = None
                     job.active_item_id = None
                     job.finished_at = utc_now()
@@ -1364,6 +1434,7 @@ class DownloadManager:
                         item.status = ItemStatus.FAILED
                         item.error = safe_message
                         item.auth_message = None
+                        item.issue_code = job.issue_code
                         item.retryable = True
                         item.updated_at = utc_now()
                     job.refresh_counts()
@@ -1383,6 +1454,12 @@ class DownloadManager:
                     self._clear_activity_locked(job)
                     job.error = safe_message
                     job.auth_message = safe_message
+                    self._record_issue_locked(
+                        job,
+                        safe_message,
+                        authentication_required=True,
+                        cause=exc,
+                    )
                     job.verification_url = self._verification_url(
                         job,
                         exc.verification_url or job.source_url,
@@ -1407,6 +1484,8 @@ class DownloadManager:
                 self._clear_activity_locked(job)
                 job.error = safe_message
                 job.auth_message = None
+                self._record_issue_locked(job, safe_message, cause=exc)
+                job.retryable = job.issue_code not in NON_RETRYABLE_SITE_ISSUES
                 job.verification_url = None
                 job.active_item_id = None
                 job.finished_at = utc_now()
@@ -1518,10 +1597,19 @@ class DownloadManager:
             ):
                 raise
             except Exception as exc:
+                issue_code = classify_site_issue(exc)
+                if issue_code == SiteIssueCode.LOCAL_CONFIGURATION:
+                    raise TemporaryAccessError(
+                        "Douyin automatic item refresh could not start because a "
+                        "required local component is unavailable. Details: "
+                        f"{safe_external_error_message(exc)}",
+                        issue_code=issue_code,
+                    ) from exc
                 raise TemporaryAccessError(
                     "Douyin automatic item refresh did not pass identity or "
                     "integrity validation. The task was paused without downloading "
-                    "a fallback."
+                    "a fallback.",
+                    issue_code=issue_code,
                 ) from exc
             if not refreshed_metadata or not is_complete_profile_media_metadata(
                 refreshed_metadata,
@@ -1591,10 +1679,19 @@ class DownloadManager:
             ):
                 raise
             except Exception as exc:
+                issue_code = classify_site_issue(exc)
+                if issue_code == SiteIssueCode.LOCAL_CONFIGURATION:
+                    raise TemporaryAccessError(
+                        "Douyin automatic media refresh could not start because a "
+                        "required local component is unavailable. Details: "
+                        f"{safe_external_error_message(exc)}",
+                        issue_code=issue_code,
+                    ) from exc
                 raise TemporaryAccessError(
                     "Douyin automatic media refresh did not pass identity or "
                     "integrity validation. The task was paused without downloading "
-                    "a fallback."
+                    "a fallback.",
+                    issue_code=issue_code,
                 ) from exc
             fresh_current = next(
                 (
@@ -1999,6 +2096,11 @@ class DownloadManager:
             elif job.total_items and job.completed_items == job.total_items:
                 job.status = JobStatus.COMPLETED
                 job.error = None
+                if job.warning:
+                    self._record_issue_locked(job, job.warning)
+                else:
+                    job.issue_code = None
+                    job.issue_message = None
             elif job.completed_items and job.failed_items:
                 job.status = JobStatus.PARTIAL
                 job.error = f"{job.failed_items} item(s) failed"
@@ -2011,6 +2113,8 @@ class DownloadManager:
             else:
                 job.status = JobStatus.PARTIAL
                 job.error = "Some items were not processed"
+            if job.status in {JobStatus.FAILED, JobStatus.PARTIAL}:
+                self._backfill_job_issue_locked(job)
             job.finished_at = utc_now()
             self._commit_locked(job)
         self._notify(self.get_job(job_id), "finished")
@@ -2022,6 +2126,8 @@ class DownloadManager:
         DownloadManager._clear_activity_locked(job)
         job.error = "Cancelled by user"
         job.auth_message = None
+        job.issue_code = None
+        job.issue_message = None
         job.verification_url = None
         job.active_item_id = None
         job.cancel_requested = False
@@ -2036,6 +2142,7 @@ class DownloadManager:
                 item.status = ItemStatus.CANCELLED
                 item.error = "Cancelled by user"
                 item.auth_message = None
+                item.issue_code = None
                 item.updated_at = now
         job.refresh_counts()
 
@@ -2837,7 +2944,7 @@ class DownloadManager:
     @staticmethod
     def _sanitize_persisted_errors(job: DownloadJob) -> bool:
         changed = False
-        for attribute in ("error", "warning", "auth_message"):
+        for attribute in ("error", "warning", "auth_message", "issue_message"):
             value = getattr(job, attribute)
             if value is None:
                 continue
@@ -2854,6 +2961,127 @@ class DownloadManager:
                 if safe_value != value:
                     setattr(item, attribute, safe_value)
                     changed = True
+        return changed
+
+    @staticmethod
+    def _record_issue_locked(
+        job: DownloadJob,
+        message: str,
+        *,
+        item: DownloadItem | None = None,
+        authentication_required: bool = False,
+        cause: BaseException | None = None,
+    ) -> None:
+        code = classify_site_issue(
+            cause or message,
+            authentication_required=authentication_required,
+        )
+        if item is not None:
+            item.issue_code = code
+        if code != SiteIssueCode.UNKNOWN or job.issue_code in {
+            None,
+            SiteIssueCode.UNKNOWN,
+        }:
+            job.issue_code = code
+            job.issue_message = message
+
+    @classmethod
+    def _backfill_job_issue_locked(cls, job: DownloadJob) -> bool:
+        """Backfill structured issue data for current and older persisted jobs."""
+
+        changed = False
+        for item in job.items:
+            message = item.auth_message or item.error
+            if not message:
+                if item.issue_code is not None:
+                    item.issue_code = None
+                    changed = True
+                continue
+            if item.issue_code is not None:
+                if item.issue_code in NON_RETRYABLE_SITE_ISSUES and item.retryable:
+                    item.retryable = False
+                    changed = True
+                continue
+            expected = classify_site_issue(
+                message,
+                authentication_required=item.status == ItemStatus.NEEDS_AUTH,
+            )
+            if item.issue_code != expected:
+                item.issue_code = expected
+                changed = True
+            if expected in NON_RETRYABLE_SITE_ISSUES and item.retryable:
+                item.retryable = False
+                changed = True
+
+        if job.status in {JobStatus.COMPLETED, JobStatus.CANCELLED} and not job.warning:
+            if job.issue_code is not None:
+                job.issue_code = None
+                changed = True
+            if job.issue_message is not None:
+                job.issue_message = None
+                changed = True
+            return changed
+
+        if job.issue_code is not None and job.issue_message is not None:
+            if (
+                job.issue_code in NON_RETRYABLE_SITE_ISSUES
+                and not any(item.retryable for item in job.items if item.error)
+                and job.retryable
+            ):
+                job.retryable = False
+                changed = True
+            return changed
+
+        summary_only = bool(
+            job.error
+            and re.fullmatch(r"\d+ item\(s\) failed", job.error.strip())
+        )
+        candidates = [job.auth_message, job.issue_message]
+        candidates.extend(
+            item.auth_message or item.error
+            for item in job.items
+            if item.auth_message or item.error
+        )
+        candidates.append(job.warning)
+        if not summary_only:
+            candidates.append(job.error)
+        messages = [message for message in candidates if message]
+        if not messages:
+            return changed
+        classified = [
+            (
+                message,
+                classify_site_issue(
+                    message,
+                    authentication_required=(
+                        job.status == JobStatus.NEEDS_AUTH
+                        and message == job.auth_message
+                    ),
+                ),
+            )
+            for message in messages
+        ]
+        message, expected = next(
+            (
+                (candidate, code)
+                for candidate, code in classified
+                if code != SiteIssueCode.UNKNOWN
+            ),
+            classified[0],
+        )
+        if job.issue_code is None:
+            job.issue_code = expected
+            changed = True
+        if job.issue_message is None:
+            job.issue_message = message
+            changed = True
+        if (
+            job.issue_code in NON_RETRYABLE_SITE_ISSUES
+            and not any(item.retryable for item in job.items if item.error)
+            and job.retryable
+        ):
+            job.retryable = False
+            changed = True
         return changed
 
     @staticmethod
@@ -3204,6 +3432,7 @@ class DownloadManager:
         item.status = ItemStatus.QUEUED
         item.error = None
         item.auth_message = None
+        item.issue_code = None
         item.progress = item.progress.model_copy(
             update={
                 "downloaded_bytes": 0,

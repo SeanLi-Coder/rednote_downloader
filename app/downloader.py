@@ -50,7 +50,10 @@ from .errors import (
     DouyinMediaRefreshRequiredError,
     DownloadCancelledError,
     MediaDownloadError,
+    SiteIssueCode,
     TemporaryAccessError,
+    classify_site_issue,
+    is_explicit_rate_limit_message,
 )
 from .models import DownloadItem, MediaType, Platform, SourceKind, TransferProgress
 from .platforms import identify_url
@@ -122,18 +125,17 @@ OUTPUT_TEMPLATE = (
     "[%(_filename_media_id,id|unknown-id)s].%(ext)s"
 )
 AUTH_ERROR_MARKERS = (
-    "captcha",
-    "sign in",
+    "captcha required",
+    "captcha challenge",
+    "complete the captcha",
+    "solve the captcha",
     "login required",
-    "log in",
     "authentication required",
     "confirm you're not a bot",
     "confirm you’re not a bot",
     "verify you are human",
     "fresh cookies",
     "cookies are needed",
-    "cookies-from-browser",
-    "please verify",
     "security verification",
     "验证码",
     "安全验证",
@@ -143,7 +145,6 @@ AUTH_ERROR_MARKERS = (
 TEMPORARY_ACCESS_MARKERS = (
     "访问频繁",
     "请求频繁",
-    "风控",
     "too many requests",
     "rate limit",
     "rate-limit",
@@ -158,6 +159,7 @@ COOKIE_LOAD_ERROR_MARKERS = (
     "failed to load cookies",
     "failed to decrypt",
     "could not decrypt",
+    "cookies-from-browser",
     "keyring",
 )
 XIAOHONGSHU_COOKIE_BROWSER_ERROR = (
@@ -290,6 +292,10 @@ class _DouyinRedirectRejected(_DouyinProbeRejected):
 
 class _DouyinProbeIntegrityChanged(_DouyinProbeRejected):
     pass
+
+
+class _DouyinProbeResponseChanged(_DouyinProbeRejected):
+    """The trusted endpoint returned a non-media response that may be temporary."""
 
 
 class _DouyinNoProgressTimeout(TemporaryAccessError):
@@ -469,12 +475,23 @@ def _item_key(platform: Platform, media_id: str | None, url: str, index: int) ->
 
 def _is_auth_error(message: str) -> bool:
     lowered = message.lower()
-    return any(marker in lowered for marker in AUTH_ERROR_MARKERS)
+    if any(marker in lowered for marker in AUTH_ERROR_MARKERS):
+        return True
+    return re.search(
+        r"(?<![a-z])(?:sign|log) in(?:\s+required|\s+to\b|[.!,:;]|$)|"
+        r"\blog into an account\b|"
+        r"\b(?:need|must) (?:to )?be logged in\b|"
+        r"\b(?:you (?:are|re)|you're) not logged in\b|"
+        r"\b(?:login|session) (?:has )?expired\b",
+        lowered,
+    ) is not None
 
 
 def _is_temporary_access_error(message: str) -> bool:
     lowered = message.lower()
-    return any(marker in lowered for marker in TEMPORARY_ACCESS_MARKERS)
+    return is_explicit_rate_limit_message(lowered) or any(
+        marker in lowered for marker in TEMPORARY_ACCESS_MARKERS
+    )
 
 
 def _is_cookie_load_error(message: str) -> bool:
@@ -998,22 +1015,48 @@ class MediaDownloader:
                 raise
             except TemporaryAccessError as exc:
                 raise TemporaryAccessError(
-                    "Douyin temporarily limited the verified author-feed request "
-                    "after automatic retries. Wait a minute or two and retry the "
-                    "original video; no lower-quality media was downloaded."
+                    "Douyin verified author-feed request failed after automatic "
+                    "retries. Site response: "
+                    f"{safe_external_error_message(exc)}",
+                    issue_code=classify_site_issue(exc),
                 ) from exc
             except AuthenticationRequiredError as exc:
+                issue_code = classify_site_issue(
+                    exc,
+                    authentication_required=True,
+                )
+                if issue_code == SiteIssueCode.LOGIN_REQUIRED:
+                    message = (
+                        "Douyin requires a current Chrome login session to verify "
+                        "the author's highest-quality renditions. Open the original "
+                        "video in Chrome, sign in, then retry."
+                    )
+                else:
+                    message = (
+                        "Douyin displayed an explicit CAPTCHA or verification page "
+                        "while checking the author's highest-quality renditions. "
+                        "Open the original video in Chrome, finish the visible "
+                        "verification, then retry."
+                    )
                 raise AuthenticationRequiredError(
-                    "Douyin could not verify the author's highest-quality "
-                    "renditions after automatic retries. Open the original video "
-                    "in Chrome, finish verification, then retry.",
+                    message,
                     verification_url=url,
+                    issue_code=issue_code,
                 ) from exc
             except DiscoveryError as exc:
+                issue_code = classify_site_issue(exc)
+                if issue_code == SiteIssueCode.LOCAL_CONFIGURATION:
+                    raise MediaDownloadError(
+                        "Douyin author-feed quality verification could not start "
+                        "because a required local component is unavailable. "
+                        f"Details: {safe_external_error_message(exc)}",
+                        issue_code=issue_code,
+                    ) from exc
                 raise MediaDownloadError(
                     "Douyin author-feed data failed identity or integrity validation. "
                     "Retry the original video; Chrome verification is not required "
-                    "unless Douyin explicitly shows a CAPTCHA or login page."
+                    "unless Douyin explicitly shows a CAPTCHA or login page.",
+                    issue_code=issue_code,
                 ) from exc
             if not enriched_media:
                 raise TemporaryAccessError(
@@ -1238,25 +1281,68 @@ class MediaDownloader:
         message = str(exc)
         normalized_message = message.lower()
         if "uploader profile instead of the requested video" in normalized_message:
-            raise MediaDownloadError(DOUYIN_ITEM_EXPANSION_MESSAGE) from exc
+            raise MediaDownloadError(
+                DOUYIN_ITEM_EXPANSION_MESSAGE,
+                issue_code=SiteIssueCode.SITE_RESPONSE_CHANGED,
+            ) from exc
         if "returned data for a different video while requesting" in normalized_message:
             raise MediaDownloadError(
                 f"{safe_external_error_message(message)}. The mismatched response "
-                "was blocked; Chrome verification was not requested."
+                "was blocked; Chrome verification was not requested.",
+                issue_code=SiteIssueCode.SITE_RESPONSE_CHANGED,
+            ) from exc
+        if _is_auth_error(message):
+            issue_code = (
+                SiteIssueCode.VERIFICATION_REQUIRED
+                if any(
+                    marker in normalized_message
+                    for marker in (
+                        "captcha required",
+                        "captcha challenge",
+                        "complete the captcha",
+                        "solve the captcha",
+                        "confirm you're not a bot",
+                        "confirm you’re not a bot",
+                        "verify you are human",
+                        "security verification",
+                        "验证码",
+                        "安全验证",
+                    )
+                )
+                else SiteIssueCode.LOGIN_REQUIRED
+            )
+            if issue_code == SiteIssueCode.VERIFICATION_REQUIRED:
+                auth_message = (
+                    "The site displayed an explicit CAPTCHA or verification challenge. "
+                    "Complete the visible challenge in Chrome and retry."
+                )
+            else:
+                issue_code = SiteIssueCode.LOGIN_REQUIRED
+                auth_message = (
+                    "The site requires a current Chrome login session or fresh browser "
+                    "cookies. Log in to the original task URL in Chrome and retry. No "
+                    "CAPTCHA was detected."
+                )
+            raise AuthenticationRequiredError(
+                auth_message,
+                verification_url=url,
+                issue_code=issue_code,
             ) from exc
         if _is_temporary_access_error(message):
             raise TemporaryAccessError(
                 "The site temporarily rate-limited the request. Retry after a short "
                 "wait; Chrome verification is not required unless the page explicitly "
-                "shows a CAPTCHA or login prompt."
+                "shows a CAPTCHA or login prompt.",
+                issue_code=SiteIssueCode.RATE_LIMITED,
             ) from exc
-        if _is_auth_error(message):
-            raise AuthenticationRequiredError(
-                "The site requires login, fresh browser cookies, or a CAPTCHA. "
-                "Complete verification in Chrome and retry.",
-                verification_url=url,
-            ) from exc
-        raise MediaDownloadError(safe_external_error_message(message)) from exc
+        safe_message = safe_external_error_message(message)
+        issue_code = classify_site_issue(message)
+        raise MediaDownloadError(
+            safe_message,
+            issue_code=(
+                issue_code if issue_code != SiteIssueCode.UNKNOWN else None
+            ),
+        ) from exc
 
     def _discover_with_ytdlp(
         self,
@@ -2199,7 +2285,8 @@ class MediaDownloader:
             raise MediaDownloadError(
                 "Douyin profile media metadata is incomplete. Retry the original "
                 "profile to refresh it; Chrome verification is not required for "
-                "this local metadata error."
+                "this local metadata error.",
+                issue_code=SiteIssueCode.SITE_RESPONSE_CHANGED,
             )
         cached_id = str(cached.get("media_id") or "").strip()
         if cached_id != expected_id:
@@ -2230,7 +2317,8 @@ class MediaDownloader:
             raise MediaDownloadError(
                 "Douyin profile media metadata is incomplete. Retry the original "
                 "profile to refresh it; Chrome verification is not required for "
-                "this local metadata error."
+                "this local metadata error.",
+                issue_code=SiteIssueCode.SITE_RESPONSE_CHANGED,
             )
         video_uri = str(cached.get("video_uri") or "").strip()
         if not re.fullmatch(r"[A-Za-z0-9_-]{10,200}", video_uri):
@@ -2580,7 +2668,10 @@ class MediaDownloader:
             if self._should_pause_douyin_probe_error(exc):
                 error_type = (
                     DouyinMediaRefreshRequiredError
-                    if isinstance(exc, _DouyinRedirectRejected)
+                    if isinstance(
+                        exc,
+                        (_DouyinRedirectRejected, _DouyinProbeResponseChanged),
+                    )
                     else TemporaryAccessError
                 )
                 raise error_type(
@@ -2875,6 +2966,8 @@ class MediaDownloader:
 
     @staticmethod
     def _is_retryable_douyin_probe_error(exc: Exception) -> bool:
+        if isinstance(exc, _DouyinProbeResponseChanged):
+            return True
         if isinstance(exc, _DouyinProbeRejected):
             return False
         if isinstance(exc, HTTPError):
@@ -2899,7 +2992,11 @@ class MediaDownloader:
     def _should_pause_douyin_probe_error(cls, exc: Exception) -> bool:
         return isinstance(
             exc,
-            (_DouyinRedirectRejected, _DouyinProbeIntegrityChanged),
+            (
+                _DouyinRedirectRejected,
+                _DouyinProbeIntegrityChanged,
+                _DouyinProbeResponseChanged,
+            ),
         ) or (
             cls._is_retryable_douyin_probe_error(exc)
         )
@@ -2928,6 +3025,25 @@ class MediaDownloader:
     def _safe_douyin_probe_failure(exc: Exception) -> str:
         if isinstance(exc, _DouyinProbeRejected):
             return str(exc)
+        if isinstance(exc, MediaDownloadError) and str(exc).startswith(
+            (
+                "Incomplete media response:",
+                "Media response changed after quality verification:",
+                "Highest-available video dimensions could not be verified",
+                "Media server returned a video below its declared",
+                "Downloaded video content did not match",
+                "Downloaded video codec did not match",
+                "Downloaded audio codec did not match",
+                "Downloaded video size did not match",
+                "Downloaded video bitrate was below",
+                "Downloaded video duration did not match",
+            )
+        ):
+            return safe_external_error_message(exc)
+        if isinstance(exc, CertificateVerifyError):
+            return "media TLS certificate validation failed"
+        if isinstance(exc, SSLError):
+            return "secure media connection failed"
         text = f"{type(exc).__name__} {exc}".lower()
         if "timeout" in text or "timed out" in text:
             return "media request or FFprobe timed out"
@@ -2951,7 +3067,15 @@ class MediaDownloader:
 
     @staticmethod
     def _douyin_probe_failure_requires_refresh(reason: str) -> bool:
-        return any(marker in reason for marker in _DOUYIN_REDIRECT_ERROR_MARKERS)
+        return any(
+            marker in reason
+            for marker in (
+                *_DOUYIN_REDIRECT_ERROR_MARKERS,
+                "media endpoint did not return video data",
+                "media endpoint did not return an MP4 file",
+                "media endpoint returned an empty file",
+            )
+        )
 
     @classmethod
     def _preferred_douyin_probe_failure(
@@ -3059,7 +3183,9 @@ class MediaDownloader:
                     "binary/octet-stream",
                 }
             ):
-                raise _DouyinProbeRejected("media endpoint did not return video data")
+                raise _DouyinProbeResponseChanged(
+                    "media endpoint did not return video data"
+                )
             payload = bytearray()
             last_range_report_at: float | None = None
             while len(payload) < DOUYIN_PROBE_BYTES:
@@ -3106,7 +3232,9 @@ class MediaDownloader:
                         )
                         last_range_report_at = now
             if len(payload) < 12 or payload[4:8] != b"ftyp":
-                raise _DouyinProbeRejected("media endpoint did not return an MP4 file")
+                raise _DouyinProbeResponseChanged(
+                    "media endpoint did not return an MP4 file"
+                )
             content_range = str(response.headers.get("Content-Range") or "")
             size_match = re.search(r"/(\d+)$", content_range)
             filesize = int(size_match.group(1)) if size_match else None
@@ -3332,7 +3460,7 @@ class MediaDownloader:
                     "binary/octet-stream",
                 }
             ):
-                raise _DouyinProbeRejected(
+                raise _DouyinProbeResponseChanged(
                     "media endpoint did not return video data"
                 )
             declared_length = str(
@@ -3380,7 +3508,9 @@ class MediaDownloader:
             with contextlib.suppress(Exception):
                 response.close()
         if downloaded <= 0:
-            raise _DouyinProbeRejected("media endpoint returned an empty file")
+            raise _DouyinProbeResponseChanged(
+                "media endpoint returned an empty file"
+            )
         if expected_filesize is not None and downloaded != expected_filesize:
             raise _DouyinProbeIntegrityChanged(
                 "media size changed between the range probe and local probe"
@@ -4010,7 +4140,9 @@ class MediaDownloader:
                     and exc.verification_url != verification_url
                 ):
                     raise AuthenticationRequiredError(
-                        str(exc), verification_url=verification_url
+                        str(exc),
+                        verification_url=verification_url,
+                        issue_code=exc.issue_code,
                     ) from exc
                 raise
         finally:
@@ -4132,7 +4264,8 @@ class MediaDownloader:
         )
         if not image_assets:
             raise MediaDownloadError(
-                "Douyin profile image has no highest-available assets"
+                "Douyin profile image has no highest-available assets",
+                issue_code=SiteIssueCode.SITE_RESPONSE_CHANGED,
             )
 
         if callback:
@@ -4201,7 +4334,8 @@ class MediaDownloader:
                     except Exception as exc:
                         raise MediaDownloadError(
                             f"Image {asset.index} failed: "
-                            f"{safe_external_error_message(exc)}"
+                            f"{safe_external_error_message(exc)}",
+                            issue_code=getattr(exc, "issue_code", None),
                         ) from exc
                 output_paths.append(str(path))
                 completed_assets.append(chosen)
@@ -4273,7 +4407,8 @@ class MediaDownloader:
                     except Exception as exc:
                         raise MediaDownloadError(
                             f"Live Photo {asset.index} failed: "
-                            f"{safe_external_error_message(exc)}"
+                            f"{safe_external_error_message(exc)}",
+                            issue_code=getattr(exc, "issue_code", None),
                         ) from exc
                 output_paths.append(str(path))
                 completed_assets.append(chosen)
@@ -4499,7 +4634,10 @@ class MediaDownloader:
             if self._should_pause_douyin_probe_error(exc):
                 error_type = (
                     DouyinMediaRefreshRequiredError
-                    if isinstance(exc, _DouyinRedirectRejected)
+                    if isinstance(
+                        exc,
+                        (_DouyinRedirectRejected, _DouyinProbeResponseChanged),
+                    )
                     else TemporaryAccessError
                 )
                 raise error_type(
@@ -4562,7 +4700,8 @@ class MediaDownloader:
                 supported.append(probe)
         if not supported:
             raise MediaDownloadError(
-                "Douyin Live Photo returned no supported playable candidate"
+                "Douyin Live Photo returned no supported playable candidate",
+                issue_code=SiteIssueCode.LOCAL_CONFIGURATION,
             )
         best = max(
             supported,
@@ -4581,7 +4720,8 @@ class MediaDownloader:
         best_rank = self._douyin_probe_quality_key(best)
         if any(self._douyin_probe_quality_key(value) > best_rank for value in unsupported):
             raise MediaDownloadError(
-                "Douyin Live Photo highest candidate uses an unsupported video codec"
+                "Douyin Live Photo highest candidate uses an unsupported video codec",
+                issue_code=SiteIssueCode.LOCAL_CONFIGURATION,
             )
 
         actual_width = int(best.get("width") or 0)
@@ -5438,6 +5578,7 @@ class MediaDownloader:
         errors: list[str] = []
         douyin_transient_errors: list[str] = []
         douyin_redirect_errors: list[TemporaryAccessError] = []
+        douyin_refresh_errors: list[DouyinMediaRefreshRequiredError] = []
         is_xiaohongshu_source = platform == Platform.XIAOHONGSHU
         is_douyin_source = platform == Platform.DOUYIN
         transfer_budget = _douyin_transfer_budget
@@ -5526,17 +5667,32 @@ class MediaDownloader:
                         raise MediaDownloadError(
                             "Untrusted Xiaohongshu media URL was blocked"
                         )
-                    if is_douyin_source and not (
-                        self._is_trusted_douyin_asset_url(candidate, media_type)
-                        or (
-                            allow_verified_douyin_redirect
-                            and self._is_douyin_regional_media_host(
-                                self._strict_https_hostname(candidate)
-                            )
+                    candidate_redirect_reason = (
+                        self._douyin_media_redirect_rejection_reason(
+                            candidate,
+                            media_type,
+                            allow_verified_regional=allow_verified_douyin_redirect,
                         )
-                    ):
-                        raise MediaDownloadError(
-                            "Untrusted Douyin media URL was blocked"
+                        if is_douyin_source
+                        else None
+                    )
+                    if is_douyin_source and candidate_redirect_reason is not None:
+                        redirect_error = self._douyin_redirect_rejection(
+                            candidate,
+                            candidate_redirect_reason,
+                        )
+                        raise DouyinMediaRefreshRequiredError(
+                            "Untrusted Douyin media URL was blocked before reading "
+                            "the response. The current item must be refreshed from "
+                            "its original task link. Redirect host: "
+                            f"{redirect_error.redirect_host or 'unavailable'}; "
+                            "Redirect host fingerprint: "
+                            f"{redirect_error.redirect_host_fingerprint or 'unavailable'}; "
+                            "Redirect port: "
+                            f"{redirect_error.redirect_port or 'unavailable'}; "
+                            "Redirect reason: "
+                            f"{redirect_error.redirect_reason}",
+                            issue_code=SiteIssueCode.SECURITY_BLOCKED,
                         )
                     referer = source_url
                     if is_xiaohongshu_source:
@@ -5645,6 +5801,14 @@ class MediaDownloader:
                         "application/json",
                         "application/problem+json",
                     }:
+                        if is_douyin_source:
+                            raise DouyinMediaRefreshRequiredError(
+                                "Douyin media endpoint returned text or metadata "
+                                "instead of the verified media file. The site may "
+                                "have expired or replaced this media route; refresh "
+                                "the current item from its original task link.",
+                                issue_code=SiteIssueCode.SITE_RESPONSE_CHANGED,
+                            )
                         raise MediaDownloadError(
                             "Media server returned a text or metadata response "
                             "instead of a media file"
@@ -5673,6 +5837,14 @@ class MediaDownloader:
                     if not first_chunk:
                         if transfer_budget is not None:
                             transfer_budget.remaining()
+                        if is_douyin_source:
+                            raise DouyinMediaRefreshRequiredError(
+                                "Douyin media endpoint returned an empty response "
+                                "instead of the verified media file. The site may "
+                                "have expired or replaced this media route; refresh "
+                                "the current item from its original task link.",
+                                issue_code=SiteIssueCode.MEDIA_LINK_EXPIRED,
+                            )
                         raise MediaDownloadError(
                             "Media server returned an empty response"
                         )
@@ -5858,6 +6030,16 @@ class MediaDownloader:
                             f"{safe_external_error_message(exc)}"
                         )
                         continue
+                    if is_douyin_source and isinstance(
+                        exc,
+                        DouyinMediaRefreshRequiredError,
+                    ):
+                        douyin_refresh_errors.append(exc)
+                        errors.append(
+                            f"Candidate {candidate_index}: "
+                            f"{safe_external_error_message(exc)}"
+                        )
+                        continue
                     raise
                 except Exception as exc:
                     self._close_douyin_probe_error(exc)
@@ -5928,14 +6110,19 @@ class MediaDownloader:
                 )
             if douyin_redirect_errors:
                 raise douyin_redirect_errors[-1]
+            if douyin_refresh_errors:
+                raise douyin_refresh_errors[-1]
             raise TemporaryAccessError(
                 "Douyin media transfer was temporarily unavailable. The task was "
                 "paused before downloading later items; wait briefly and continue "
                 "the task. Completed files were preserved. Transfer details: "
-                f"{detail}"
+                f"{detail}",
+                issue_code=classify_site_issue(detail),
             )
         if douyin_redirect_errors:
             raise douyin_redirect_errors[-1]
+        if douyin_refresh_errors:
+            raise douyin_refresh_errors[-1]
         detail = errors[-1] if errors else "No asset URLs were available"
         raise MediaDownloadError(
             f"All highest-available media URLs failed: {detail}"

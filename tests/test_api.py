@@ -189,6 +189,7 @@ def test_douyin_item_verification_always_opens_original_video(
         platform=Platform.DOUYIN,
         source_kind=SourceKind.ITEM,
         output_root=str(tmp_path),
+        status=JobStatus.NEEDS_AUTH,
         verification_url="https://www.douyin.com/user/wrong-profile",
     )
     monkeypatch.setattr(main_module.manager, "get_job", lambda job_id: job)
@@ -204,6 +205,35 @@ def test_douyin_item_verification_always_opens_original_video(
     assert opened == [(source_url, None)]
 
 
+def test_verification_rejects_job_that_does_not_currently_require_auth(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    source_url = "https://www.douyin.com/video/7664225419386607205"
+    job = DownloadJob(
+        id="not-auth-blocked",
+        source_url=source_url,
+        platform=Platform.DOUYIN,
+        source_kind=SourceKind.ITEM,
+        output_root=str(tmp_path),
+        status=JobStatus.FAILED,
+    )
+    monkeypatch.setattr(main_module.manager, "get_job", lambda job_id: job)
+    monkeypatch.setattr(
+        main_module,
+        "_open_chrome",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("Chrome must not open for a non-auth failure")
+        ),
+    )
+
+    with pytest.raises(HTTPException) as error:
+        main_module.open_verification(job.id)
+
+    assert error.value.status_code == 409
+    assert "does not currently require" in str(error.value.detail)
+
+
 def test_douyin_profile_verification_never_opens_untrusted_url(
     monkeypatch, tmp_path
 ) -> None:
@@ -215,6 +245,7 @@ def test_douyin_profile_verification_never_opens_untrusted_url(
         platform=Platform.DOUYIN,
         source_kind=SourceKind.PROFILE,
         output_root=str(tmp_path),
+        status=JobStatus.NEEDS_AUTH,
         verification_url="https://evil.example/phish",
     )
     monkeypatch.setattr(main_module.manager, "get_job", lambda job_id: job)
@@ -654,7 +685,9 @@ def test_public_xiaohongshu_urls_redact_xsec_token_but_keep_internal_url(
         platform=Platform.XIAOHONGSHU,
         source_kind=SourceKind.ITEM,
         output_root=str(tmp_path),
+        status=JobStatus.NEEDS_AUTH,
         verification_url=source_url,
+        cookie_profile="Default",
         items=[
             DownloadItem(
                 id="xhs-item",
@@ -683,7 +716,7 @@ def test_public_xiaohongshu_urls_redact_xsec_token_but_keep_internal_url(
 
     response = main_module.open_verification(job.id)
 
-    assert opened == [(source_url, None)]
+    assert opened == [(source_url, "Default")]
     assert secret not in response["url"]
     assert "xsec_token" not in response["url"]
 

@@ -115,7 +115,7 @@ def test_douyin_redirect_messages_execute_with_safe_legacy_and_reason_parsing(
         (
             "Douyin automatic item refresh was skipped because Chrome Cookie is "
             "disabled for this task",
-            "程序遵守该设置，没有读取 Chrome Cookie",
+            "程序遵守该任务设置，没有读取 Chrome Cookie",
         ),
         (
             "Douyin automatic item refresh returned media below the previously "
@@ -416,6 +416,143 @@ def test_nonretryable_failed_item_keeps_visible_error_without_retrying(
     result = json.loads(completed.stdout)
     assert "余下可见作品会继续下载" in result["error"]
     assert result["retryable"] is False
+
+
+def test_structured_issue_helpers_drive_titles_messages_and_auth_state(
+    tmp_path: Path,
+) -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is unavailable")
+    source = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(
+        encoding="utf-8"
+    )
+    tail = "  initialize();\n})();\n"
+    assert tail in source
+    assert "if (!isRunning(job) && isRetryableItem(item)" in source
+    source = source.replace(
+        tail,
+        "  window.__issueCode = issueCode;\n"
+        "  window.__issueTitleForJob = issueTitleForJob;\n"
+        "  window.__localizedIssueMessage = localizedIssueMessage;\n"
+        "  window.__localizedPrimaryJobIssueMessage = "
+        "localizedPrimaryJobIssueMessage;\n"
+        "  window.__authRequired = authRequired;\n"
+        "  window.__statusLabel = statusLabel;\n})();\n",
+    )
+    jobs = {
+        "rate": {
+            "status": "failed",
+            "issue_code": "rate_limited",
+            "issue_message": "opaque remote response 7f3a",
+            "items": [],
+        },
+        "login": {
+            "status": "needs_auth",
+            "issue_code": "login_required",
+            "issue_message": "opaque login response",
+            "items": [],
+        },
+        "captcha": {
+            "status": "needs_auth",
+            "issue_code": "verification_required",
+            "issue_message": "opaque challenge response",
+            "items": [],
+        },
+        "staleChild": {
+            "status": "failed",
+            "issue_code": "rate_limited",
+            "issue_message": "opaque rate response",
+            "items": [
+                {
+                    "status": "needs_auth",
+                    "issue_code": "verification_required",
+                }
+            ],
+        },
+        "cookieDisabled": {
+            "status": "failed",
+            "issue_code": "cookie_unavailable",
+            "issue_message": (
+                "Douyin automatic item refresh was skipped because Chrome Cookie "
+                "is disabled for this task"
+            ),
+            "items": [],
+        },
+        "legacyRiskControl": {
+            "status": "failed",
+            "issue_message": "网络环境存在风险，请稍后再试",
+            "items": [],
+        },
+    }
+    harness = (
+        "globalThis.window = {};\n"
+        "globalThis.document = {querySelector: () => null};\n"
+        f"const __jobs = {json.dumps(jobs)};\n"
+    )
+    trailer = """
+const output = {
+  rate: {
+    code: window.__issueCode(__jobs.rate),
+    title: window.__issueTitleForJob(__jobs.rate),
+    message: window.__localizedPrimaryJobIssueMessage(__jobs.rate),
+    auth: window.__authRequired(__jobs.rate),
+    status: window.__statusLabel(__jobs.rate),
+  },
+  login: {
+    title: window.__issueTitleForJob(__jobs.login),
+    auth: window.__authRequired(__jobs.login),
+    status: window.__statusLabel(__jobs.login),
+  },
+  captcha: {
+    title: window.__issueTitleForJob(__jobs.captcha),
+    auth: window.__authRequired(__jobs.captcha),
+    status: window.__statusLabel(__jobs.captcha),
+  },
+  staleAuth: window.__authRequired(__jobs.staleChild),
+  cookie: window.__localizedIssueMessage(__jobs.cookieDisabled),
+  legacyRiskControl: {
+    code: window.__issueCode(__jobs.legacyRiskControl),
+    title: window.__issueTitleForJob(__jobs.legacyRiskControl),
+    auth: window.__authRequired(__jobs.legacyRiskControl),
+  },
+};
+process.stdout.write(JSON.stringify(output));
+"""
+
+    completed = _run_node_script(
+        node,
+        harness + source + trailer,
+        tmp_path,
+        "structured-issue-helpers.js",
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    result = json.loads(completed.stdout)
+    assert result["rate"]["code"] == "rate_limited"
+    assert result["rate"]["title"] == "网站正在限流"
+    assert "网站明确返回了限流信号" in result["rate"]["message"]
+    assert "opaque remote response 7f3a" in result["rate"]["message"]
+    assert result["rate"]["auth"] is False
+    assert result["rate"]["status"] == "被限流"
+    assert result["login"] == {
+        "title": "需要登录或建立站点会话",
+        "auth": True,
+        "status": "需登录",
+    }
+    assert result["captcha"] == {
+        "title": "网站要求完成验证码",
+        "auth": True,
+        "status": "等验证码",
+    }
+    assert result["staleAuth"] is False
+    assert "开启 Chrome Cookie 后，从原链接创建一个新任务" in result["cookie"]
+    assert "继续旧任务仍会保持 Cookie 关闭" in result["cookie"]
+    assert result["legacyRiskControl"] == {
+        "code": "request_rejected",
+        "title": "网站拒绝了本次请求",
+        "auth": False,
+    }
 
 
 def test_discovery_activity_and_active_item_progress_are_visible(

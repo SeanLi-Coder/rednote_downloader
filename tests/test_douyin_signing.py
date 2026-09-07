@@ -13,12 +13,16 @@ from app.douyin_signing import (
     _SigningFailure,
     _TransientSigningFailure,
     _build_signing_document,
+    _explicit_auth_api_issue_code,
+    _explicit_auth_html_issue_code,
+    _explicit_auth_url_issue_code,
     _extract_sdk_glue_tags,
     _extract_glue_with_context_fallback,
     _fetch_source_html_with_urllib,
     _is_allowed_douyin_origin,
     _is_douyin_url,
     _is_explicit_auth_url,
+    _raise_signing_error,
     _validate_detail_response,
     _validate_profile_response,
     _wait_for_signed_response,
@@ -29,6 +33,7 @@ from app.errors import (
     AuthenticationRequiredError,
     DiscoveryError,
     DownloadCancelledError,
+    SiteIssueCode,
     TemporaryAccessError,
 )
 
@@ -354,6 +359,55 @@ def test_signing_source_origin_and_explicit_auth_redirect_are_distinct() -> None
 
 
 @pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("https://www.douyin.com/login", SiteIssueCode.LOGIN_REQUIRED),
+        (
+            "https://www.douyin.com/passport/web/login",
+            SiteIssueCode.LOGIN_REQUIRED,
+        ),
+        (
+            "https://www.douyin.com/passport/safe/verify",
+            SiteIssueCode.VERIFICATION_REQUIRED,
+        ),
+        ("https://sso.douyin.com/captcha", SiteIssueCode.VERIFICATION_REQUIRED),
+        ("https://evil.example/login", None),
+    ],
+)
+def test_explicit_auth_url_distinguishes_login_and_verification(
+    url: str,
+    expected: SiteIssueCode | None,
+) -> None:
+    assert _explicit_auth_url_issue_code(url) == expected
+
+
+@pytest.mark.parametrize(
+    ("source_html", "expected"),
+    [
+        (
+            "<html><body>Please complete the CAPTCHA</body></html>",
+            SiteIssueCode.VERIFICATION_REQUIRED,
+        ),
+        (
+            "<html><body>登录状态已过期，请先登录</body></html>",
+            SiteIssueCode.LOGIN_REQUIRED,
+        ),
+        (
+            "<html><body>Normal post"
+            "<script>const words = ['captcha', '请先登录'];</script>"
+            "</body></html>",
+            None,
+        ),
+    ],
+)
+def test_explicit_auth_html_uses_visible_text_only(
+    source_html: str,
+    expected: SiteIssueCode | None,
+) -> None:
+    assert _explicit_auth_html_issue_code(source_html) == expected
+
+
+@pytest.mark.parametrize(
     "source_html",
     [
         "<html><script>window.noGlue = true;</script></html>",
@@ -404,8 +458,51 @@ def test_validate_detail_response_requires_auth_for_explicit_403_login() -> None
     response = _detail_response(http_status=403)
     response["payload"]["status_msg"] = "Please login to continue"
 
-    with pytest.raises(_AuthenticationSigningFailure, match="authentication"):
+    with pytest.raises(
+        _AuthenticationSigningFailure,
+        match="authentication",
+    ) as captured:
         _validate_detail_response(response, AWEME_ID, SEC_UID)
+
+    assert captured.value.issue_code == SiteIssueCode.LOGIN_REQUIRED
+
+
+@pytest.mark.parametrize(
+    ("status_message", "expected"),
+    [
+        ("Please login to continue", SiteIssueCode.LOGIN_REQUIRED),
+        ("Complete the CAPTCHA to continue", SiteIssueCode.VERIFICATION_REQUIRED),
+        ("Temporary API response", None),
+    ],
+)
+def test_explicit_auth_api_message_distinguishes_login_and_verification(
+    status_message: str,
+    expected: SiteIssueCode | None,
+) -> None:
+    assert (
+        _explicit_auth_api_issue_code({"status_msg": status_message})
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("status_message", "expected_category"),
+    [
+        ("请求频繁，请稍后再试", "api-rate-limit"),
+        ("Temporary API response", "api-status-nonzero"),
+    ],
+)
+def test_nonzero_api_status_classifies_explicit_rate_limit_only(
+    status_message: str,
+    expected_category: str,
+) -> None:
+    response = _detail_response(status_code=4)
+    response["payload"]["status_msg"] = status_message
+
+    with pytest.raises(_TransientSigningFailure) as captured:
+        _validate_detail_response(response, AWEME_ID, SEC_UID)
+
+    assert captured.value.category == expected_category
 
 
 def test_invalid_json_http_503_is_treated_as_transient() -> None:
@@ -447,6 +544,35 @@ def test_invalid_json_http_403_is_treated_as_transient_rejection() -> None:
         _wait_for_signed_response(page, 1_000, lambda: False)
 
 
+@pytest.mark.parametrize(
+    ("auth_kind", "expected"),
+    [
+        (SiteIssueCode.LOGIN_REQUIRED.value, SiteIssueCode.LOGIN_REQUIRED),
+        (
+            SiteIssueCode.VERIFICATION_REQUIRED.value,
+            SiteIssueCode.VERIFICATION_REQUIRED,
+        ),
+    ],
+)
+def test_invalid_json_signed_response_preserves_auth_kind(
+    auth_kind: str,
+    expected: SiteIssueCode,
+) -> None:
+    page = FakePage(
+        {
+            "state": "error",
+            "reason": "invalid_json",
+            "httpStatus": 200,
+            "authKind": auth_kind,
+        }
+    )
+
+    with pytest.raises(_AuthenticationSigningFailure) as captured:
+        _wait_for_signed_response(page, 1_000, lambda: False)
+
+    assert captured.value.issue_code == expected
+
+
 def test_missing_sdk_glue_is_transient_but_unsafe_glue_is_not() -> None:
     with pytest.raises(_TransientSigningFailure, match="not present"):
         _extract_sdk_glue_tags("<html><body>temporary shell</body></html>")
@@ -462,7 +588,7 @@ def test_missing_sdk_glue_is_transient_but_unsafe_glue_is_not() -> None:
 @pytest.mark.parametrize(
     "source_html",
     [
-        "<html><body>captcha</body></html>",
+        "<html><body>complete the captcha</body></html>",
         "<html><body>请完成下列验证 验证码</body></html>",
         (
             "<html><body>verify you are human"
@@ -473,11 +599,10 @@ def test_missing_sdk_glue_is_transient_but_unsafe_glue_is_not() -> None:
 def test_visible_verification_without_sdk_glue_requires_authentication(
     source_html,
 ) -> None:
-    with pytest.raises(
-        _AuthenticationSigningFailure,
-        match="verification challenge",
-    ):
+    with pytest.raises(_AuthenticationSigningFailure) as captured:
         _extract_sdk_glue_tags(source_html)
+
+    assert captured.value.issue_code == SiteIssueCode.VERIFICATION_REQUIRED
 
 
 def test_auth_words_inside_hidden_script_do_not_trigger_verification() -> None:
@@ -487,6 +612,61 @@ def test_auth_words_inside_hidden_script_do_not_trigger_verification() -> None:
             "<script>const messages = ['captcha', '验证码'];</script>"
             "</body></html>"
         )
+
+
+@pytest.mark.parametrize(
+    ("category", "expected"),
+    [
+        ("http-429", SiteIssueCode.RATE_LIMITED),
+        ("http-403", SiteIssueCode.REQUEST_REJECTED),
+        ("http-5xx", SiteIssueCode.SITE_UNAVAILABLE),
+        ("network-timeout", SiteIssueCode.NETWORK_ERROR),
+    ],
+)
+def test_no_progress_timeout_preserves_last_site_category(
+    category: str,
+    expected: SiteIssueCode,
+) -> None:
+    failure = douyin_signing._SigningNoProgressTimeout(
+        "bounded discovery expired",
+        category=category,
+    )
+
+    with pytest.raises(TemporaryAccessError) as captured:
+        _raise_signing_error(VIDEO_URL, failure)
+
+    assert captured.value.issue_code == expected
+    assert f"Reason category: {category}" in str(captured.value)
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [
+        (
+            _AuthenticationSigningFailure(
+                "login response",
+                issue_code=SiteIssueCode.LOGIN_REQUIRED,
+            ),
+            SiteIssueCode.LOGIN_REQUIRED,
+        ),
+        (
+            _AuthenticationSigningFailure(
+                "captcha response",
+                issue_code=SiteIssueCode.VERIFICATION_REQUIRED,
+            ),
+            SiteIssueCode.VERIFICATION_REQUIRED,
+        ),
+    ],
+)
+def test_raise_signing_error_preserves_authentication_kind(
+    failure: _AuthenticationSigningFailure,
+    expected: SiteIssueCode,
+) -> None:
+    with pytest.raises(AuthenticationRequiredError) as captured:
+        _raise_signing_error(VIDEO_URL, failure)
+
+    assert captured.value.issue_code == expected
+    assert captured.value.verification_url == VIDEO_URL
 
 
 def test_nonzero_api_status_is_transient_unless_auth_is_explicit() -> None:
@@ -1080,10 +1260,7 @@ def test_browser_html_sso_verify_redirect_requires_authentication(
         ),
     )
 
-    with pytest.raises(
-        _AuthenticationSigningFailure,
-        match="explicit verification page",
-    ):
+    with pytest.raises(_AuthenticationSigningFailure) as captured:
         _extract_glue_with_context_fallback(
             context,
             VIDEO_URL,
@@ -1093,6 +1270,7 @@ def test_browser_html_sso_verify_redirect_requires_authentication(
             lambda: False,
         )
 
+    assert captured.value.issue_code == SiteIssueCode.VERIFICATION_REQUIRED
     assert response.disposed is True
 
 
@@ -1110,7 +1288,7 @@ def test_browser_html_403_with_visible_captcha_requires_authentication(
         ),
     )
 
-    with pytest.raises(_AuthenticationSigningFailure, match="verification challenge"):
+    with pytest.raises(_AuthenticationSigningFailure) as captured:
         _extract_glue_with_context_fallback(
             context,
             VIDEO_URL,
@@ -1120,6 +1298,7 @@ def test_browser_html_403_with_visible_captcha_requires_authentication(
             lambda: False,
         )
 
+    assert captured.value.issue_code == SiteIssueCode.VERIFICATION_REQUIRED
     assert response.disposed is True
 
 
@@ -1215,10 +1394,7 @@ def test_urllib_html_sso_verify_redirect_requires_authentication(
         lambda *args, **kwargs: RedirectingOpener(),
     )
 
-    with pytest.raises(
-        _AuthenticationSigningFailure,
-        match="explicit verification page",
-    ):
+    with pytest.raises(_AuthenticationSigningFailure) as captured:
         _fetch_source_html_with_urllib(
             VIDEO_URL,
             object(),
@@ -1226,6 +1402,7 @@ def test_urllib_html_sso_verify_redirect_requires_authentication(
             1_000,
         )
 
+    assert captured.value.issue_code == SiteIssueCode.VERIFICATION_REQUIRED
     assert response.closed is True
 
 
@@ -1925,7 +2102,7 @@ def test_profile_transient_exhaustion_is_not_mislabeled_as_captcha(
         lambda duration_ms, should_cancel, **kwargs: delays.append(duration_ms),
     )
 
-    with pytest.raises(TemporaryAccessError, match="temporarily limited") as captured:
+    with pytest.raises(TemporaryAccessError, match="rate-limited") as captured:
         fetch_signed_profile_awemes(
             PROFILE_URL,
             SEC_UID,
@@ -1934,6 +2111,7 @@ def test_profile_transient_exhaustion_is_not_mislabeled_as_captcha(
         )
 
     assert delays == [5_000, 10_000]
+    assert captured.value.issue_code == SiteIssueCode.RATE_LIMITED
     assert "Reason category: http-429" in str(captured.value)
 
 

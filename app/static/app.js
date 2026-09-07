@@ -4,6 +4,7 @@
   const elements = {
     authAlert: document.querySelector("#auth-alert"),
     authMessage: document.querySelector("#auth-message"),
+    authTitle: document.querySelector("#auth-title"),
     authOpenButton: document.querySelector("#auth-open-button"),
     authRetryButton: document.querySelector("#auth-retry-button"),
     cancelButton: document.querySelector("#cancel-button"),
@@ -76,6 +77,62 @@
     unknown: "状态未知"
   };
 
+  const issueTitles = {
+    rate_limited: "网站正在限流",
+    verification_required: "网站要求完成验证码",
+    login_required: "需要登录或建立站点会话",
+    request_rejected: "网站拒绝了本次请求",
+    site_processing: "作品仍在网站处理中",
+    content_unavailable: "作品已删除、私密或不可见",
+    region_restricted: "作品在当前地区不可用",
+    site_response_changed: "网站返回的数据发生变化",
+    media_link_expired: "媒体地址已失效",
+    site_unavailable: "网站服务暂时异常",
+    network_error: "网络连接暂时异常",
+    cookie_unavailable: "Chrome Cookie 读取失败",
+    security_blocked: "异常媒体响应已安全拦截",
+    local_configuration: "本机运行环境需要处理",
+    unknown: "任务执行遇到异常"
+  };
+
+  const issueStatusLabels = {
+    rate_limited: "被限流",
+    verification_required: "等验证码",
+    login_required: "需登录",
+    request_rejected: "请求被拒",
+    site_processing: "网站处理中",
+    content_unavailable: "不可用",
+    region_restricted: "地区受限",
+    site_response_changed: "响应异常",
+    media_link_expired: "地址失效",
+    site_unavailable: "网站异常",
+    network_error: "网络异常",
+    cookie_unavailable: "Cookie 异常",
+    security_blocked: "已拦截",
+    local_configuration: "环境异常",
+    unknown: "失败"
+  };
+
+  const issueGuidance = {
+    rate_limited: "网站明确返回了限流信号。程序已经停止继续请求，避免整批作品连续失败；请等待一两分钟后再继续。",
+    verification_required: "网站明确显示了验证码或安全验证页面。请在 Chrome 打开当前任务的原链接，完成页面上实际出现的验证后重试。",
+    login_required: "当前需要有效的 Chrome 站点会话。请用任务绑定的 Chrome Profile 打开原链接；只有页面明确要求时才登录，没有看到验证码时不需要做验证码操作。",
+    request_rejected: "网站拒绝了本次请求，但没有明确要求验证码。程序已经暂停，请稍后重试；反复出现时请检查登录状态、代理或 VPN。",
+    site_processing: "网站仍在处理、审核或转码这个作品，目前还没有提供可下载原文件。请等网站处理完成后再重试。",
+    content_unavailable: "网站明确表示作品已删除、设为私密或当前不可见。程序没有保存替代内容。",
+    region_restricted: "网站明确表示该作品在当前地区不可用。程序没有尝试绕过地区限制。",
+    site_response_changed: "网站返回了空数据、非媒体内容、字段变化或与目标不一致的数据。程序已拦截并暂停，没有下载串号或低清替代文件；请稍后从原链接继续。",
+    media_link_expired: "网站之前签发的媒体地址已经失效。程序不会继续使用旧地址；继续任务时会从原链接刷新当前作品。",
+    site_unavailable: "网站服务器返回了 5xx 或暂时不可用。程序已暂停后续请求，请稍后继续。",
+    network_error: "网络连接、DNS、TLS 或读取过程暂时失败。程序已停止等待并保留已完成文件；请检查网络后继续。",
+    cookie_unavailable: "程序无法读取任务绑定的 Chrome Cookie。请完全退出 Chrome 后重试并允许系统访问，或关闭 Cookie 后重新创建任务。",
+    security_blocked: "媒体地址发生了未通过安全校验的跳转或响应变化。程序在读取文件前已拦截，不会保存未知站点返回的内容。",
+    local_configuration: "本机缺少或无法启动必要组件。请按下面的具体提示修复环境并完全重启程序。",
+    unknown: "程序遇到了尚未归类的异常。完整的安全错误信息显示在下方，请据此重试或反馈。"
+  };
+
+  const knownIssueCodes = new Set(Object.keys(issueTitles));
+
   function firstDefined(...values) {
     return values.find((value) => value !== undefined && value !== null && value !== "");
   }
@@ -143,6 +200,110 @@
       return "pending";
     }
     return "unknown";
+  }
+
+  function runtimeIssueMessage(entity) {
+    return asText(firstDefined(
+      entity?.issue_message,
+      entity?.issueMessage,
+      entity?.auth_message,
+      entity?.authMessage,
+      entity?.error_message,
+      entity?.error,
+      entity?.warning,
+      entity?.reason,
+      entity?.message,
+      ""
+    ));
+  }
+
+  function inferRuntimeIssueCode(entity) {
+    const text = runtimeIssueMessage(entity).toLowerCase();
+    if (!text) return null;
+    const explicitlyNotAuth = /captcha (?:verification )?is not required|a captcha is not required|chrome verification is not required|verification (?:page )?is not required/i.test(text);
+    if (!explicitlyNotAuth && /captcha required|captcha challenge|complete (?:the )?captcha|solve the captcha|verify you are human|请完成验证码|请完成验证|请拖动滑块/i.test(text)) return "verification_required";
+    const reason = text.match(/reason category:\s*([a-z0-9-]+)/i)?.[1];
+    if (reason === "http-429") return "rate_limited";
+    if (["http-403", "signed-rejected"].includes(reason)) return "request_rejected";
+    if (reason === "http-5xx") return "site_unavailable";
+    if (["network-timeout", "network-error", "signer-timeout"].includes(reason)) return "network_error";
+    if (reason?.startsWith("api-") || reason === "no-progress-timeout") return "site_response_changed";
+    if (/http(?: error)?\s*429|too many requests|rate[- ]limit|(?:访问|请求|操作)(?:过于|太)?频繁|频繁操作/i.test(text)) return "rate_limited";
+    if (/chrome cookies could not be read|cookie database|failed to (?:load|decrypt).*cookie|unsupported cookie-browser|bound chrome profile/i.test(text)) return "cookie_unavailable";
+    if (/still processing|being (?:processed|transcoded)|under review|正在处理|审核中|转码中/i.test(text)) return "site_processing";
+    if (/not available in your country|geo[- ]restricted|region restricted|http error 451/i.test(text)) return "region_restricted";
+    if (/media endpoint returned (?:an empty response|http (?:401|404|410))|media (?:link|url) expired|signature expired|url has expired|saved access token/i.test(text)) return "media_link_expired";
+    if (/http(?: error)?\s*(?:404|410)|video (?:is )?unavailable|video not available|this video is private|content is unavailable|private video|has been (?:removed|deleted)|no longer available/i.test(text)) return "content_unavailable";
+    if (/untrusted|outside the trusted|unrecognized douyin cdn|redirect could not be trusted|nonstandard-port|blocked media route|tls certificate validation failed/i.test(text)) return "security_blocked";
+    if (/different (?:video|author|note)|cross-wired|identity or integrity|integrity validation|incomplete verified|missing aweme|no verified media identity|response changed|did not match the verified|did not return (?:video data|an mp4 file|a verified)|returned (?:text or metadata|an empty file|no verified)|blank browser response|no trusted notes/i.test(text)) return "site_response_changed";
+    if (/media endpoint returned http 425|http(?: error)?\s*403|forbidden|access denied|request rejected|temporarily rejected|风控|网络环境存在风险|(?:your )?ip (?:address )?is blocked/i.test(text)) return "request_rejected";
+    if (/http(?: error)?\s*5\d\d|service unavailable|server unavailable|server error|bad gateway/i.test(text)) return "site_unavailable";
+    if (/media endpoint returned http 408|secure media connection failed|incomplete media response|network error|network request failed|connection (?:failed|reset|refused)|timed out|timeout|no media progress/i.test(text)) return "network_error";
+    if (/ffprobe was not found|ffprobe was found but could not be started|ffmpeg was not found/i.test(text)) return "local_configuration";
+    if (canonicalStatus(entity) === "needs_auth") {
+      if (!explicitlyNotAuth && /captcha|verification challenge|verify you are human|验证码|安全验证/i.test(text)) return "verification_required";
+      return "login_required";
+    }
+    return "unknown";
+  }
+
+  function issueCode(entity) {
+    const explicit = String(firstDefined(entity?.issue_code, entity?.issueCode, "")).trim().toLowerCase();
+    return knownIssueCodes.has(explicit) ? explicit : inferRuntimeIssueCode(entity);
+  }
+
+  function primaryJobIssueCode(job) {
+    const direct = issueCode(job);
+    if (direct && direct !== "unknown") return direct;
+    const itemCode = getItems(job)
+      .filter(isFailed)
+      .map(issueCode)
+      .find((code) => code && code !== "unknown");
+    return itemCode || direct;
+  }
+
+  function primaryJobIssueMessage(job) {
+    const direct = runtimeIssueMessage(job);
+    if (job?.issue_message || job?.issueMessage || (direct && !/^\d+ item\(s\) failed$/i.test(direct))) {
+      return direct;
+    }
+    const code = primaryJobIssueCode(job);
+    const item = getItems(job).find((candidate) => isFailed(candidate) && issueCode(candidate) === code);
+    return runtimeIssueMessage(item) || direct;
+  }
+
+  function issueTitleForJob(job) {
+    return issueTitles[primaryJobIssueCode(job)] || issueTitles.unknown;
+  }
+
+  function localizedIssueMessage(entity, job = entity) {
+    const raw = runtimeIssueMessage(entity);
+    const code = issueCode(entity) || "unknown";
+    const guidance = issueGuidance[code] || issueGuidance.unknown;
+    if (!raw) return guidance;
+    const localized = localizeRuntimeMessage(raw, job);
+    if (code !== "unknown") {
+      return localized === raw
+        ? `${guidance} 技术详情：${raw}`
+        : `${guidance} 具体情况：${localized}`;
+    }
+    if (localized !== raw) return localized;
+    return `${guidance} 技术详情：${raw}`;
+  }
+
+  function localizedPrimaryJobIssueMessage(job) {
+    const raw = primaryJobIssueMessage(job);
+    const code = primaryJobIssueCode(job) || "unknown";
+    const guidance = issueGuidance[code] || issueGuidance.unknown;
+    if (!raw) return guidance;
+    const localized = localizeRuntimeMessage(raw, job);
+    if (code !== "unknown") {
+      return localized === raw
+        ? `${guidance} 技术详情：${raw}`
+        : `${guidance} 具体情况：${localized}`;
+    }
+    if (localized !== raw) return localized;
+    return `${guidance} 技术详情：${raw}`;
   }
 
   function statusTone(entity) {
@@ -502,7 +663,11 @@
     return firstDefined(job?.created_at, job?.createdAt, job?.started_at, job?.startedAt, job?.timestamp);
   }
 
-  function statusLabel(entity) {
+  function statusLabel(entity, job = null) {
+    if (["failed", "needs_auth"].includes(canonicalStatus(entity)) || rawStatus(entity) === "interrupted") {
+      const code = job && entity !== job ? issueCode(entity) : primaryJobIssueCode(entity);
+      if (code && code !== "unknown" && issueStatusLabels[code]) return issueStatusLabels[code];
+    }
     const exactLabels = {
       discovering: "解析中",
       interrupted: "已中断",
@@ -580,7 +745,10 @@
       : item?.retryable === false
         ? "该记录不能自动重试，请查看具体原因"
         : "下载失败，请重试";
-    return localizeRuntimeMessage(firstDefined(item?.error_message, item?.error, item?.reason, item?.message, fallback), job);
+    const errorEntity = runtimeIssueMessage(item)
+      ? item
+      : { ...item, issue_message: fallback };
+    return localizedIssueMessage(errorEntity, job);
   }
 
   function localizedProbeDetails(text) {
@@ -781,6 +949,15 @@
     if (text.includes("Douyin could not create a verified signed request")) {
       return "这是旧版本把通用签名失败误标成了验证码。请直接从原链接重试；只有抖音明确显示验证码或登录页面时才需要打开 Chrome。";
     }
+    if (text.includes("No current Douyin session cookies were found")) {
+      return `任务绑定的 Chrome Profile 中没有找到当前可用的抖音会话 Cookie。请用该 Profile 打开${verificationTarget(job)}建立站点会话；只有抖音页面明确要求时才登录，然后回来重试。本次没有检测到验证码。`;
+    }
+    if (text.includes("Douyin explicitly requested a current login session") || text.includes("Douyin requires a current Chrome login session") || text.includes("The site requires a current Chrome login session")) {
+      return `网站明确要求有效的 Chrome 登录状态。请在 Chrome 打开${verificationTarget(job)}并登录，然后回到这里重试；本次没有检测到验证码。`;
+    }
+    if (text.includes("displayed an explicit CAPTCHA or verification")) {
+      return `网站明确显示了验证码或安全验证页面。请在 Chrome 打开${verificationTarget(job)}，完成页面上实际出现的验证后重试。`;
+    }
     if (text.includes("Douyin requires current Chrome cookies or an explicit verification")) {
       return `抖音明确要求最新 Chrome Cookie、登录或验证码。请在 Chrome 打开${verificationTarget(job)}完成验证后再重试。`;
     }
@@ -795,7 +972,7 @@
       return `抖音作者接口正在短时限流或临时拒绝请求${detail ? `（${detail}）` : ""}，程序自动退避重试后仍未恢复。请等待一两分钟后重试；程序没有改下低清版本，也不需要先打开作者主页验证。`;
     }
     if (text.includes("Douyin automatic item refresh was skipped because Chrome Cookie is disabled")) {
-      return "检测到抖音媒体路由异常，但这个任务已关闭 Chrome Cookie，程序遵守该设置，没有读取 Chrome Cookie，也没有复用旧媒体地址。请开启 Chrome Cookie 后继续任务，以便只刷新当前作品。";
+      return "检测到抖音媒体路由异常，但这个任务创建时已关闭 Chrome Cookie，程序遵守该任务设置，没有读取 Chrome Cookie，也没有复用旧媒体地址。请开启 Chrome Cookie 后，从原链接创建一个新任务；继续旧任务仍会保持 Cookie 关闭。";
     }
     if (text.includes("Douyin automatic item refresh returned media below the previously verified quality floor")) {
       return "抖音为当前作品返回了新的媒体地址，但其分辨率、编码或码率低于任务此前已验证的质量档。程序没有覆盖旧证据，也没有下载降档文件；请稍后继续任务。";
@@ -817,6 +994,9 @@
       return douyinRedirectMessage(text, "画质探测");
     }
     if (text.includes("Douyin media redirect could not be trusted")) {
+      return douyinRedirectMessage(text, "原文件下载");
+    }
+    if (text.includes("Untrusted Douyin media URL was blocked before reading")) {
       return douyinRedirectMessage(text, "原文件下载");
     }
     if (text.includes("media endpoint redirected to an unrecognized Douyin CDN host")) {
@@ -855,11 +1035,15 @@
     if (
       text.includes("Douyin author-feed quality renditions were unavailable") ||
       text.includes("Douyin author-feed data did not include a verified direct highest-quality rendition") ||
+      text.includes("Douyin item discovery returned no verified author-feed direct rendition")
+    ) {
+      return "抖音作者接口本次没有返回可验证的最高画质直连。程序没有改下可能较低的原始档；请等待一两分钟后直接继续当前任务，不需要打开 Chrome 验证。";
+    }
+    if (
       text.includes("Douyin highest-quality verification requires the verified author feed") ||
       text.includes("This saved Douyin task predates author-feed highest-quality verification") ||
       text.includes("This saved Douyin Live Photo task predates author-feed highest-quality verification") ||
-      text.includes("Douyin Live Photo has no structured author-feed quality renditions") ||
-      text.includes("Douyin item discovery returned no verified author-feed direct rendition")
+      text.includes("Douyin Live Photo has no structured author-feed quality renditions")
     ) {
       return "当前任务缺少作者接口返回的最高画质直连，程序已暂停并拒绝只下载可能较低的原始档。请开启“自动读取 Chrome Cookie”，再从原始主页或视频链接创建一个新任务；已有文件不会删除。";
     }
@@ -1000,7 +1184,13 @@
   }
 
   function authRequired(job) {
-    return Boolean(job?.needs_auth || job?.auth_required || canonicalStatus(job) === "needs_auth" || getItems(job).some((item) => canonicalStatus(item) === "needs_auth"));
+    const status = canonicalStatus(job);
+    if (status === "needs_auth") {
+      const code = primaryJobIssueCode(job);
+      return !code || code === "unknown" || code === "login_required" || code === "verification_required";
+    }
+    if (status !== "unknown") return false;
+    return getItems(job).some((item) => canonicalStatus(item) === "needs_auth");
   }
 
   function extractJob(payload) {
@@ -1448,7 +1638,7 @@
       node.querySelector(".item-meta").textContent = itemMetadata(item);
       const status = node.querySelector(".item-status");
       status.classList.add(tone);
-      status.textContent = statusLabel(item);
+      status.textContent = statusLabel(item, job);
       node.querySelector(".item-progress span").style.width = `${percent}%`;
       node.querySelector(".item-error").textContent = itemError(item, job);
 
@@ -1467,7 +1657,7 @@
       }
 
       const retryButton = node.querySelector(".item-retry-button");
-      if (isRetryableItem(item) && id !== undefined && id !== null) {
+      if (!isRunning(job) && isRetryableItem(item) && id !== undefined && id !== null) {
         retryButton.hidden = false;
         retryButton.setAttribute("aria-label", `重试：${itemTitle(item, index)}`);
         retryButton.addEventListener("click", () => retryJob(job._id, id, retryButton));
@@ -1561,14 +1751,13 @@
     elements.authAlert.hidden = !needsAuth;
     elements.authRetryButton.hidden = job?.retryable === false;
     if (needsAuth) {
-      elements.authMessage.textContent = localizeRuntimeMessage(firstDefined(
-        job?.auth_message,
-        job?.action_message,
-        job?.error_message,
-        job?.error,
-        "请打开对应网站，完成登录或验证码后回到这里继续。"
-      ), job);
-      const xiaohongshuLogin = isXiaohongshuLoginSessionIssue(job);
+      const authCode = primaryJobIssueCode(job);
+      if (elements.authTitle) {
+        elements.authTitle.textContent = issueTitles[authCode] || "网站要求登录或验证";
+      }
+      elements.authMessage.textContent = localizedPrimaryJobIssueMessage(job);
+      const loginRequired = authCode === "login_required";
+      const xiaohongshuLogin = loginRequired || isXiaohongshuLoginSessionIssue(job);
       elements.authOpenButton.textContent = isXiaohongshuVerificationItem(job)
         ? xiaohongshuLogin
           ? "打开 Chrome 登录作品"
@@ -1578,8 +1767,8 @@
             ? "打开 Chrome 登录主页"
             : "打开 Chrome 验证主页"
           : platform.key === "xiaohongshu"
-            ? "打开 Chrome 验证作品"
-            : "打开 Chrome 验证视频";
+            ? loginRequired ? "打开 Chrome 登录作品" : "打开 Chrome 验证作品"
+            : loginRequired ? "打开 Chrome 登录视频" : "打开 Chrome 验证视频";
     }
     const items = getItems(job);
     const discoveryFailureMessage = canonicalStatus(job) === "failed" && (items.length === 0 || job?.discovery_complete === false)
@@ -1587,12 +1776,19 @@
       : "";
     const discoveryIncomplete = job?.discovery_complete === false;
     const cookieFallback = Boolean(job?.cookie_fallback_used);
-    const warningMessage = discoveryFailureMessage || localizeRuntimeMessage(job?.warning, job);
+    const nonAuthNeedsAuthState = canonicalStatus(job) === "needs_auth" && !needsAuth;
+    const failureIssueMessage = !needsAuth && (canonicalStatus(job) === "failed" || rawStatus(job) === "partial" || nonAuthNeedsAuthState)
+      ? localizedPrimaryJobIssueMessage(job)
+      : "";
+    const warningMessage = failureIssueMessage || discoveryFailureMessage || localizeRuntimeMessage(job?.warning, job);
     const hasWarning = (discoveryIncomplete && (!isRunning(job) || Boolean(warningMessage))) || cookieFallback || Boolean(warningMessage);
     elements.warningAlert.hidden = !hasWarning;
     if (hasWarning) {
-      elements.warningTitle.textContent = discoveryFailureMessage
-        ? "任务暂时失败"
+      elements.warningAlert.setAttribute("role", failureIssueMessage ? "alert" : "status");
+      elements.warningTitle.textContent = failureIssueMessage
+        ? issueTitleForJob(job)
+        : discoveryFailureMessage
+        ? "主页解析暂时失败"
         : discoveryIncomplete
         ? "主页发现可能不完整"
         : cookieFallback
@@ -1604,12 +1800,18 @@
           : "站点未确认已经发现主页全部作品，请稍后继续发现。"
       );
     }
+    const failedItemHasCurrentIssue = items.some((item) => (
+      isFailed(item)
+      && issueCode(item)
+      && issueCode(item) === primaryJobIssueCode(job)
+    ));
+    const continueDiscovery = discoveryIncomplete && !failedItemHasCurrentIssue;
     const hasUnprocessedItems = counts.total !== null && counts.success + counts.failed < counts.total;
     const resumable = ["cancelled", "interrupted"].includes(rawStatus(job)) || discoveryIncomplete || (rawStatus(job) === "partial" && hasUnprocessedItems);
     const hasRetryableItems = items.some(isRetryableItem);
-    const canRetryDiscovery = items.length === 0 && (needsAuth || canonicalStatus(job) === "failed" || resumable);
+    const canRetryDiscovery = items.length === 0 && (needsAuth || nonAuthNeedsAuthState || canonicalStatus(job) === "failed" || resumable);
     elements.retryAllButton.hidden = job?.retryable === false || isRunning(job) || (!hasRetryableItems && !resumable && !canRetryDiscovery);
-    elements.retryAllLabel.textContent = discoveryIncomplete
+    elements.retryAllLabel.textContent = continueDiscovery
       ? "继续发现"
       : resumable
         ? "继续任务"
@@ -1693,10 +1895,16 @@
     const nextRawStatus = rawStatus(job);
     const nextStatus = canonicalStatus(job);
     if (previousStatus && previousStatus !== nextRawStatus) {
-      if (nextRawStatus === "partial") showToast(`${getAuthor(job)} 的任务部分完成，请查看明细`, "error");
+      if (nextRawStatus === "partial") showToast(`${getAuthor(job)}：${issueTitleForJob(job)}，请查看明细`, "error");
       else if (nextStatus === "completed") showToast(`${getAuthor(job)} 的任务已完成`);
-      if (nextStatus === "failed") showToast(`${getAuthor(job)} 的任务失败，请查看明细`, "error");
-      if (nextStatus === "needs_auth") showToast("任务需要登录或验证码验证", "error");
+      if (nextRawStatus === "interrupted") showToast(`${getAuthor(job)}：${issueTitleForJob(job)}，任务已暂停，可继续`, "error");
+      else if (nextStatus === "failed") showToast(`${getAuthor(job)}：${issueTitleForJob(job)}，请查看明细`, "error");
+      if (nextStatus === "needs_auth") showToast(
+        primaryJobIssueCode(job) === "login_required"
+          ? "任务需要有效的 Chrome 登录状态"
+          : "网站明确要求完成验证码或安全验证",
+        "error"
+      );
     }
 
     const hasItemData = ["items", "media", "downloads", "results", "entries"].some((key) => Object.hasOwn(incoming, key));
