@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import threading
+from datetime import datetime, timezone
 
 import pytest
 from fastapi import HTTPException
@@ -763,3 +764,23 @@ def test_public_job_removes_malformed_douyin_media_cache(malformed, tmp_path) ->
 
     assert "douyin_item_media" not in public.items[0].metadata
     assert "douyin_profile_media" not in public.items[0].metadata
+
+
+def test_public_job_includes_discovery_activity_state(tmp_path) -> None:
+    started_at = datetime(2026, 9, 7, 2, 0, tzinfo=timezone.utc)
+    job = DownloadJob(
+        id="activity-publication",
+        source_url="https://www.douyin.com/user/example",
+        platform=Platform.DOUYIN,
+        source_kind=SourceKind.PROFILE,
+        output_root=str(tmp_path),
+        status=JobStatus.DISCOVERING,
+        activity_message="Fetching Douyin signed profile page 3/300",
+        activity_started_at=started_at,
+    )
+
+    public = main_module._public_job(job)
+
+    assert public.activity_message == "Fetching Douyin signed profile page 3/300"
+    assert public.activity_started_at == started_at
+    assert public.warning is None

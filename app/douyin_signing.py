@@ -24,6 +24,7 @@ from .errors import (
 
 
 CancelCallback = Callable[[], bool]
+StatusCallback = Callable[[str], None]
 
 _SIGNING_PAGE_URL = "https://www.douyin.com/__original_media_signing__"
 _DETAIL_API_PATH = "/aweme/v1/web/aweme/detail/"
@@ -42,6 +43,7 @@ _PROFILE_RETRY_BASE_MS = 1_000
 _PROFILE_SIGNING_SESSION_ATTEMPTS = 3
 _PROFILE_SIGNING_RETRY_BASE_MS = 5_000
 _POLL_INTERVAL_MS = 200
+_SIGNED_NO_PROGRESS_TIMEOUT_SECONDS = 120.0
 _MAX_GLUE_TAGS = 16
 _MAX_GLUE_BYTES = 1_000_000
 _MAX_SOURCE_HTML_BYTES = 5_000_000
@@ -177,7 +179,9 @@ class _SigningFailure(RuntimeError):
 
 
 class _TransientSigningFailure(_SigningFailure):
-    pass
+    def __init__(self, message: str, *, category: str = "transient") -> None:
+        super().__init__(message)
+        self.category = category
 
 
 class _AuthenticationSigningFailure(_SigningFailure):
@@ -186,6 +190,76 @@ class _AuthenticationSigningFailure(_SigningFailure):
 
 class _CookieAccessSigningFailure(_SigningFailure):
     pass
+
+
+class _SigningNoProgressTimeout(_TransientSigningFailure):
+    pass
+
+
+class _NoProgressBudget:
+    def __init__(self, timeout_seconds: float) -> None:
+        self.timeout_seconds = max(float(timeout_seconds), 0.001)
+        self._deadline = time.monotonic() + self.timeout_seconds
+        self._last_failure_category: str | None = None
+
+    def _raise_timeout(self) -> None:
+        raise _SigningNoProgressTimeout(
+            "Douyin signed discovery made no verified progress within the "
+            f"{self.timeout_seconds:g}-second safety window",
+            category=self._last_failure_category or "no-progress-timeout",
+        )
+
+    def remaining_seconds(self) -> float:
+        remaining = self._deadline - time.monotonic()
+        if remaining <= 0:
+            self._raise_timeout()
+        return remaining
+
+    def clamp_timeout_ms(self, requested_ms: int) -> int:
+        remaining = self.remaining_seconds()
+        requested = max(int(requested_ms), 1)
+        remaining_ms = int(remaining * 1_000)
+        if remaining_ms < 1:
+            self._raise_timeout()
+        return min(requested, remaining_ms)
+
+    def note_failure(self, exc: BaseException) -> None:
+        if not isinstance(exc, _SigningNoProgressTimeout):
+            self._last_failure_category = _transient_reason_category(exc)
+
+    def refresh(self) -> None:
+        self._deadline = time.monotonic() + self.timeout_seconds
+        self._last_failure_category = None
+
+
+def new_signed_discovery_budget() -> _NoProgressBudget:
+    return _NoProgressBudget(_SIGNED_NO_PROGRESS_TIMEOUT_SECONDS)
+
+
+def _emit_status(status_callback: StatusCallback | None, message: str) -> None:
+    if status_callback:
+        status_callback(message)
+
+
+def _http_retry_category(status: int) -> str:
+    if status == 403:
+        return "http-403"
+    if status == 429:
+        return "http-429"
+    if status >= 500:
+        return "http-5xx"
+    return f"http-{status}"
+
+
+def _transient_reason_category(exc: BaseException) -> str:
+    if isinstance(exc, _TransientSigningFailure):
+        return exc.category
+    if isinstance(exc, _SigningFailure):
+        return "source-validation"
+    message = str(exc).lower()
+    if any(value in message for value in ("timeout", "timed out", "network")):
+        return "network-timeout"
+    return "network-error"
 
 
 class _QuietCookieLogger:
@@ -368,7 +442,10 @@ def _has_explicit_auth_api_message(payload: Any) -> bool:
 
 def _extract_sdk_glue_tags(source_html: str) -> tuple[str, ...]:
     if not isinstance(source_html, str) or not source_html.strip():
-        raise _TransientSigningFailure("Douyin returned an empty HTML response")
+        raise _TransientSigningFailure(
+            "Douyin returned an empty HTML response",
+            category="signer-html",
+        )
     if len(source_html.encode("utf-8")) > _MAX_SOURCE_HTML_BYTES:
         raise _SigningFailure("Douyin HTML response was unexpectedly large")
     parser = _SdkGlueParser()
@@ -385,7 +462,8 @@ def _extract_sdk_glue_tags(source_html: str) -> tuple[str, ...]:
                 "Douyin HTML displayed an explicit verification challenge"
             )
         raise _TransientSigningFailure(
-            "Douyin SecSDK glue was not present in the HTML"
+            "Douyin SecSDK glue was not present in the HTML",
+            category="signer-html",
         )
     if len(parser.tags) > _MAX_GLUE_TAGS:
         raise _SigningFailure("Douyin returned too many SecSDK glue tags")
@@ -489,6 +567,9 @@ def _fetch_source_html_with_urllib(
     cookie_jar: CookieJar,
     user_agent: str,
     timeout_ms: int,
+    *,
+    budget: _NoProgressBudget | None = None,
+    should_cancel: CancelCallback | None = None,
 ) -> str:
     request = Request(
         verification_url,
@@ -501,9 +582,15 @@ def _fetch_source_html_with_urllib(
     )
     opener = build_opener(HTTPCookieProcessor(cookie_jar))
     try:
+        _raise_if_cancelled(should_cancel)
+        if budget is not None:
+            budget.remaining_seconds()
         with opener.open(
             request, timeout=max(timeout_ms / 1_000, 0.001)
         ) as response:
+            _raise_if_cancelled(should_cancel)
+            if budget is not None:
+                budget.remaining_seconds()
             status = getattr(response, "status", None)
             if _is_explicit_auth_url(response.geturl()):
                 raise _AuthenticationSigningFailure(
@@ -515,7 +602,8 @@ def _fetch_source_html_with_urllib(
                 )
             if type(status) is int and status in _TRANSIENT_HTTP_STATUSES:
                 raise _TransientSigningFailure(
-                    "Douyin HTML request was temporarily limited"
+                    "Douyin HTML request was temporarily limited",
+                    category=_http_retry_category(status),
                 )
             if type(status) is int and status == 401:
                 raise _AuthenticationSigningFailure(
@@ -523,7 +611,8 @@ def _fetch_source_html_with_urllib(
                 )
             if type(status) is int and status == 403:
                 raise _TransientSigningFailure(
-                    "Douyin HTML request was temporarily rejected"
+                    "Douyin HTML request was temporarily rejected",
+                    category="http-403",
                 )
             if type(status) is not int or not 200 <= status < 300:
                 raise _SigningFailure("Douyin HTML returned an invalid HTTP status")
@@ -538,9 +627,11 @@ def _fetch_source_html_with_urllib(
                     raise _SigningFailure(
                         "Douyin HTML returned an invalid content length"
                     ) from exc
-            body = response.read(_MAX_SOURCE_HTML_BYTES + 1)
-            if len(body) > _MAX_SOURCE_HTML_BYTES:
-                raise _SigningFailure("Douyin HTML response was unexpectedly large")
+            body = _read_limited_source_body(
+                response,
+                budget=budget,
+                should_cancel=should_cancel,
+            )
             charset = response.headers.get_content_charset() or "utf-8"
             try:
                 return body.decode(charset)
@@ -550,6 +641,9 @@ def _fetch_source_html_with_urllib(
                 ) from exc
     except UrllibHTTPError as exc:
         try:
+            _raise_if_cancelled(should_cancel)
+            if budget is not None:
+                budget.remaining_seconds()
             if _is_explicit_auth_url(exc.geturl()):
                 raise _AuthenticationSigningFailure(
                     "Douyin HTML redirected to an explicit verification page"
@@ -560,7 +654,8 @@ def _fetch_source_html_with_urllib(
                 ) from exc
             if exc.code in _TRANSIENT_HTTP_STATUSES:
                 raise _TransientSigningFailure(
-                    "Douyin HTML request was temporarily limited"
+                    "Douyin HTML request was temporarily limited",
+                    category=_http_retry_category(exc.code),
                 ) from exc
             if exc.code == 401:
                 raise _AuthenticationSigningFailure(
@@ -568,7 +663,11 @@ def _fetch_source_html_with_urllib(
                 ) from exc
             if exc.code == 403:
                 try:
-                    body = exc.read(_MAX_SOURCE_HTML_BYTES + 1)
+                    body = _read_limited_source_body(
+                        exc,
+                        budget=budget,
+                        should_cancel=should_cancel,
+                    )
                     charset = exc.headers.get_content_charset() or "utf-8"
                     source_html = body.decode(charset, errors="replace")
                 except Exception:
@@ -578,7 +677,8 @@ def _fetch_source_html_with_urllib(
                         "Douyin HTML displayed an explicit verification challenge"
                     ) from exc
                 raise _TransientSigningFailure(
-                    "Douyin HTML request was temporarily rejected"
+                    "Douyin HTML request was temporarily rejected",
+                    category="http-403",
                 ) from exc
             raise _SigningFailure(
                 "Douyin HTML returned an invalid HTTP status"
@@ -588,6 +688,32 @@ def _fetch_source_html_with_urllib(
                 exc.close()
 
 
+def _read_limited_source_body(
+    response: Any,
+    *,
+    budget: _NoProgressBudget | None,
+    should_cancel: CancelCallback | None,
+) -> bytes:
+    body = bytearray()
+    reader = getattr(response, "read1", None)
+    if not callable(reader):
+        reader = response.read
+    while True:
+        _raise_if_cancelled(should_cancel)
+        if budget is not None:
+            budget.remaining_seconds()
+        remaining = _MAX_SOURCE_HTML_BYTES + 1 - len(body)
+        chunk = reader(min(64 * 1_024, remaining))
+        _raise_if_cancelled(should_cancel)
+        if budget is not None:
+            budget.remaining_seconds()
+        if not chunk:
+            return bytes(body)
+        body.extend(chunk)
+        if len(body) > _MAX_SOURCE_HTML_BYTES:
+            raise _SigningFailure("Douyin HTML response was unexpectedly large")
+
+
 def _extract_glue_with_context_fallback(
     context: Any,
     verification_url: str,
@@ -595,31 +721,49 @@ def _extract_glue_with_context_fallback(
     user_agent: str,
     timeout_ms: int,
     should_cancel: CancelCallback | None,
+    *,
+    budget: _NoProgressBudget | None = None,
+    status_callback: StatusCallback | None = None,
 ) -> tuple[tuple[str, ...], bool]:
+    budget = budget or _NoProgressBudget(_SIGNED_NO_PROGRESS_TIMEOUT_SECONDS)
+    _emit_status(status_callback, "Fetching Douyin signing HTML")
     try:
         source_html = _fetch_source_html_with_urllib(
             verification_url,
             cookie_jar,
             user_agent,
-            timeout_ms,
+            budget.clamp_timeout_ms(timeout_ms),
+            budget=budget,
+            should_cancel=should_cancel,
         )
+        budget.remaining_seconds()
         return _extract_sdk_glue_tags(source_html), True
     except DownloadCancelledError:
         raise
     except _AuthenticationSigningFailure:
         raise
-    except Exception:
+    except Exception as exc:
         _raise_if_cancelled(should_cancel)
+        budget.note_failure(exc)
+        budget.remaining_seconds()
+        _emit_status(
+            status_callback,
+            "Retrying Douyin signing HTML in the browser context "
+            f"(reason: {_transient_reason_category(exc)})",
+        )
         try:
             response = context.request.get(
                 verification_url,
-                timeout=timeout_ms,
+                timeout=budget.clamp_timeout_ms(timeout_ms),
             )
         except Exception as exc:
+            budget.remaining_seconds()
             raise _TransientSigningFailure(
-                "Douyin browser HTML request temporarily failed"
+                "Douyin browser HTML request temporarily failed",
+                category=_transient_reason_category(exc),
             ) from exc
         try:
+            budget.remaining_seconds()
             status = response.status
             if _is_explicit_auth_url(response.url):
                 raise _AuthenticationSigningFailure(
@@ -631,7 +775,8 @@ def _extract_glue_with_context_fallback(
                 )
             if type(status) is int and status in _TRANSIENT_HTTP_STATUSES:
                 raise _TransientSigningFailure(
-                    "Douyin browser HTML request was temporarily limited"
+                    "Douyin browser HTML request was temporarily limited",
+                    category=_http_retry_category(status),
                 )
             if type(status) is int and status == 401:
                 raise _AuthenticationSigningFailure(
@@ -639,12 +784,14 @@ def _extract_glue_with_context_fallback(
                 )
             if type(status) is int and status == 403:
                 source_html = response.text()
+                budget.remaining_seconds()
                 if _has_explicit_auth_html(source_html):
                     raise _AuthenticationSigningFailure(
                         "Douyin HTML displayed an explicit verification challenge"
                     )
                 raise _TransientSigningFailure(
-                    "Douyin browser HTML request was temporarily rejected"
+                    "Douyin browser HTML request was temporarily rejected",
+                    category="http-403",
                 )
             if (
                 type(status) is not int
@@ -653,7 +800,9 @@ def _extract_glue_with_context_fallback(
                 raise _SigningFailure(
                     "Douyin HTML returned an invalid browser response"
                 )
-            return _extract_sdk_glue_tags(response.text()), False
+            source_html = response.text()
+            budget.remaining_seconds()
+            return _extract_sdk_glue_tags(source_html), False
         finally:
             with contextlib.suppress(Exception):
                 response.dispose()
@@ -665,55 +814,107 @@ def _raise_if_cancelled(should_cancel: CancelCallback | None) -> None:
 
 
 @contextlib.contextmanager
-def _serialized_signed_fetch(should_cancel: CancelCallback | None):
-    while not _SIGNED_FETCH_LOCK.acquire(timeout=_POLL_INTERVAL_MS / 1_000):
+def _serialized_signed_fetch(
+    should_cancel: CancelCallback | None,
+    *,
+    budget: _NoProgressBudget | None = None,
+    status_callback: StatusCallback | None = None,
+):
+    budget = budget or _NoProgressBudget(_SIGNED_NO_PROGRESS_TIMEOUT_SECONDS)
+    waiting_reported = False
+    acquired = False
+    while not acquired:
         _raise_if_cancelled(should_cancel)
+        remaining = budget.remaining_seconds()
+        acquired = _SIGNED_FETCH_LOCK.acquire(
+            timeout=min(_POLL_INTERVAL_MS / 1_000, remaining)
+        )
+        if not acquired and not waiting_reported:
+            _emit_status(
+                status_callback,
+                "Waiting for the Douyin signed request slot",
+            )
+            waiting_reported = True
     try:
         _raise_if_cancelled(should_cancel)
+        budget.remaining_seconds()
         yield
     finally:
-        _SIGNED_FETCH_LOCK.release()
+        if acquired:
+            _SIGNED_FETCH_LOCK.release()
 
 
 def _wait_with_cancel(
     page: Any,
     duration_ms: int,
     should_cancel: CancelCallback | None,
+    *,
+    budget: _NoProgressBudget | None = None,
 ) -> None:
     remaining = max(0, duration_ms)
     while remaining:
         _raise_if_cancelled(should_cancel)
         interval = min(_POLL_INTERVAL_MS, remaining)
+        if budget is not None:
+            interval = min(interval, budget.clamp_timeout_ms(interval))
         page.wait_for_timeout(interval)
         remaining -= interval
     _raise_if_cancelled(should_cancel)
+    if budget is not None:
+        budget.remaining_seconds()
 
 
 def _wait_without_page_with_cancel(
     duration_ms: int,
     should_cancel: CancelCallback | None,
+    *,
+    budget: _NoProgressBudget | None = None,
 ) -> None:
     deadline = time.monotonic() + max(duration_ms, 0) / 1_000
     while True:
         _raise_if_cancelled(should_cancel)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
+            if budget is not None:
+                budget.remaining_seconds()
             return
-        time.sleep(min(_POLL_INTERVAL_MS / 1_000, remaining))
+        interval = min(_POLL_INTERVAL_MS / 1_000, remaining)
+        if budget is not None:
+            interval = min(interval, budget.remaining_seconds())
+        time.sleep(interval)
 
 
 def _wait_for_signer(
     page: Any,
     timeout_ms: int,
     should_cancel: CancelCallback | None,
+    *,
+    budget: _NoProgressBudget | None = None,
 ) -> None:
-    deadline = time.monotonic() + timeout_ms / 1_000
+    effective_timeout_ms = (
+        budget.clamp_timeout_ms(timeout_ms) if budget is not None else timeout_ms
+    )
+    deadline = time.monotonic() + effective_timeout_ms / 1_000
     while time.monotonic() < deadline:
         _raise_if_cancelled(should_cancel)
+        if budget is not None:
+            budget.remaining_seconds()
         if page.evaluate("() => typeof window.useWebSecsdkApi === 'function'"):
             return
-        page.wait_for_timeout(_POLL_INTERVAL_MS)
-    raise _TransientSigningFailure("Douyin SecSDK did not become ready")
+        interval = min(
+            _POLL_INTERVAL_MS,
+            max(1, int((deadline - time.monotonic()) * 1_000)),
+        )
+        if budget is not None:
+            interval = min(interval, budget.clamp_timeout_ms(interval))
+        page.wait_for_timeout(interval)
+    _raise_if_cancelled(should_cancel)
+    if budget is not None:
+        budget.remaining_seconds()
+    raise _TransientSigningFailure(
+        "Douyin SecSDK did not become ready",
+        category="signer-timeout",
+    )
 
 
 def _start_signed_fetch(
@@ -732,13 +933,20 @@ def _wait_for_signed_response(
     page: Any,
     timeout_ms: int,
     should_cancel: CancelCallback | None,
+    *,
+    budget: _NoProgressBudget | None = None,
 ) -> dict[str, Any]:
-    deadline = time.monotonic() + timeout_ms / 1_000
+    effective_timeout_ms = (
+        budget.clamp_timeout_ms(timeout_ms) if budget is not None else timeout_ms
+    )
+    deadline = time.monotonic() + effective_timeout_ms / 1_000
     while time.monotonic() < deadline:
         if should_cancel and should_cancel():
             with contextlib.suppress(Exception):
                 page.evaluate(_ABORT_SIGNED_FETCH_SCRIPT)
             raise DownloadCancelledError("Task cancelled")
+        if budget is not None:
+            budget.remaining_seconds()
         result = page.evaluate(_READ_SIGNED_FETCH_SCRIPT)
         if not isinstance(result, dict):
             raise _SigningFailure("Douyin returned an invalid signed response")
@@ -749,11 +957,13 @@ def _wait_for_signed_response(
             http_status = result.get("httpStatus")
             if type(http_status) is int and http_status in _TRANSIENT_HTTP_STATUSES:
                 raise _TransientSigningFailure(
-                    "Douyin signed request returned a temporary HTTP status"
+                    "Douyin signed request returned a temporary HTTP status",
+                    category=_http_retry_category(http_status),
                 )
             if result.get("reason") == "request_failed":
                 raise _TransientSigningFailure(
-                    "Douyin signed network request temporarily failed"
+                    "Douyin signed network request temporarily failed",
+                    category="network-error",
                 )
             if type(http_status) is int and http_status == 401:
                 raise _AuthenticationSigningFailure(
@@ -761,15 +971,29 @@ def _wait_for_signed_response(
                 )
             if type(http_status) is int and http_status == 403:
                 raise _TransientSigningFailure(
-                    "Douyin signed request was temporarily rejected"
+                    "Douyin signed request was temporarily rejected",
+                    category="http-403",
                 )
             raise _TransientSigningFailure(
-                "Douyin temporarily rejected the signed request"
+                "Douyin temporarily rejected the signed request",
+                category="signed-rejected",
             )
-        page.wait_for_timeout(_POLL_INTERVAL_MS)
+        interval = min(
+            _POLL_INTERVAL_MS,
+            max(1, int((deadline - time.monotonic()) * 1_000)),
+        )
+        if budget is not None:
+            interval = min(interval, budget.clamp_timeout_ms(interval))
+        page.wait_for_timeout(interval)
     with contextlib.suppress(Exception):
         page.evaluate(_ABORT_SIGNED_FETCH_SCRIPT)
-    raise _TransientSigningFailure("Douyin signed request timed out")
+    _raise_if_cancelled(should_cancel)
+    if budget is not None:
+        budget.remaining_seconds()
+    raise _TransientSigningFailure(
+        "Douyin signed request timed out",
+        category="network-timeout",
+    )
 
 
 def _validated_payload(
@@ -779,7 +1003,8 @@ def _validated_payload(
     http_status = response.get("httpStatus")
     if type(http_status) is int and http_status in _TRANSIENT_HTTP_STATUSES:
         raise _TransientSigningFailure(
-            f"Douyin {request_name} request was temporarily limited"
+            f"Douyin {request_name} request was temporarily limited",
+            category=_http_retry_category(http_status),
         )
     payload = response.get("payload")
     if type(http_status) is int and http_status == 401:
@@ -792,7 +1017,8 @@ def _validated_payload(
                 f"Douyin {request_name} API requires authentication"
             )
         raise _TransientSigningFailure(
-            f"Douyin {request_name} request was temporarily rejected"
+            f"Douyin {request_name} request was temporarily rejected",
+            category="http-403",
         )
     if type(http_status) is not int or not 200 <= http_status < 300:
         raise _SigningFailure(
@@ -807,7 +1033,8 @@ def _validated_payload(
                 f"Douyin {request_name} API requires authentication"
             )
         raise _TransientSigningFailure(
-            f"Douyin {request_name} API temporarily rejected the request"
+            f"Douyin {request_name} API temporarily rejected the request",
+            category="api-status-nonzero",
         )
     return payload
 
@@ -843,12 +1070,12 @@ def _validate_profile_response(
     response_identity = str(
         payload.get("sec_uid") or payload.get("sec_user_id") or ""
     ).strip()
-    if response_identity and response_identity != profile_id:
-        raise _SigningFailure("Douyin profile API returned a different profile")
-
     raw_awemes = payload.get("aweme_list")
     if not isinstance(raw_awemes, list):
-        raise _TransientSigningFailure("Douyin profile API returned no aweme list")
+        raise _TransientSigningFailure(
+            "Douyin profile API returned no aweme list",
+            category="api-missing-aweme-list",
+        )
     awemes: list[dict[str, Any]] = []
     for aweme in raw_awemes:
         if not isinstance(aweme, dict):
@@ -868,7 +1095,8 @@ def _validate_profile_response(
         has_images = isinstance(images, list) and bool(images)
         if not has_video and not has_images:
             raise _TransientSigningFailure(
-                "Douyin profile API returned incomplete aweme media"
+                "Douyin profile API returned incomplete aweme media",
+                category="api-incomplete-media",
             )
         awemes.append(aweme)
 
@@ -879,6 +1107,14 @@ def _validate_profile_response(
         has_more = bool(has_more_value)
     else:
         raise _SigningFailure("Douyin profile API returned invalid pagination state")
+
+    if not raw_awemes and not has_more and response_identity != profile_id:
+        raise _TransientSigningFailure(
+            "Douyin profile API returned an unbound empty terminal page",
+            category="api-unbound-empty-page",
+        )
+    if response_identity and response_identity != profile_id:
+        raise _SigningFailure("Douyin profile API returned a different profile")
 
     next_cursor_value = payload.get("max_cursor")
     next_cursor = (
@@ -904,6 +1140,8 @@ def _run_with_signing_page(
     navigation_timeout_ms: int,
     signer_timeout_ms: int,
     signer_settle_ms: int,
+    budget: _NoProgressBudget,
+    status_callback: StatusCallback | None,
     operation: Callable[[Any], Any],
 ) -> Any:
     browser: Any | None = None
@@ -911,6 +1149,8 @@ def _run_with_signing_page(
     page: Any | None = None
     try:
         _raise_if_cancelled(should_cancel)
+        budget.remaining_seconds()
+        _emit_status(status_callback, "Loading Douyin Chrome cookies")
         try:
             cookie_jar = _load_chrome_cookie_jar(cookie_profile)
         except (DownloadCancelledError, _SigningFailure):
@@ -919,16 +1159,22 @@ def _run_with_signing_page(
             raise _CookieAccessSigningFailure(
                 "Chrome cookies could not be read"
             ) from exc
+        budget.remaining_seconds()
         browser_cookies = _cookie_jar_to_playwright(cookie_jar)
         _raise_if_cancelled(should_cancel)
+        budget.remaining_seconds()
         from playwright.sync_api import sync_playwright
 
         with sync_playwright() as playwright:
             try:
+                budget.remaining_seconds()
+                _emit_status(status_callback, "Starting the Douyin signing browser")
                 browser = playwright.chromium.launch(
                     channel="chrome",
                     headless=True,
+                    timeout=budget.clamp_timeout_ms(navigation_timeout_ms),
                 )
+                budget.remaining_seconds()
                 context = browser.new_context(
                     locale="zh-CN",
                     viewport={"width": 1440, "height": 1100},
@@ -936,6 +1182,7 @@ def _run_with_signing_page(
                 )
                 context.add_cookies(browser_cookies)
                 _raise_if_cancelled(should_cancel)
+                budget.remaining_seconds()
                 user_agent = chrome_user_agent(browser.version)
                 glue_tags, cookie_jar_updated = _extract_glue_with_context_fallback(
                     context,
@@ -944,11 +1191,14 @@ def _run_with_signing_page(
                     user_agent,
                     navigation_timeout_ms,
                     should_cancel,
+                    budget=budget,
+                    status_callback=status_callback,
                 )
                 if cookie_jar_updated:
                     context.add_cookies(_cookie_jar_to_playwright(cookie_jar))
                 signing_document = _build_signing_document(glue_tags)
                 _raise_if_cancelled(should_cancel)
+                budget.remaining_seconds()
 
                 page = context.new_page()
 
@@ -960,14 +1210,27 @@ def _run_with_signing_page(
                     )
 
                 page.route(_SIGNING_PAGE_URL, serve_signing_page)
+                _emit_status(status_callback, "Starting the Douyin signing session")
                 page.goto(
                     _SIGNING_PAGE_URL,
                     wait_until="commit",
-                    timeout=navigation_timeout_ms,
+                    timeout=budget.clamp_timeout_ms(navigation_timeout_ms),
                 )
-                _wait_for_signer(page, signer_timeout_ms, should_cancel)
-                _wait_with_cancel(page, signer_settle_ms, should_cancel)
+                budget.remaining_seconds()
+                _wait_for_signer(
+                    page,
+                    signer_timeout_ms,
+                    should_cancel,
+                    budget=budget,
+                )
+                _wait_with_cancel(
+                    page,
+                    signer_settle_ms,
+                    should_cancel,
+                    budget=budget,
+                )
                 _raise_if_cancelled(should_cancel)
+                budget.remaining_seconds()
                 return operation(page)
             finally:
                 _close_resources(page, context, browser)
@@ -980,10 +1243,17 @@ def _raise_signing_error(
     verification_url: str,
     cause: Exception,
 ) -> None:
+    if isinstance(cause, _SigningNoProgressTimeout):
+        raise TemporaryAccessError(
+            "Douyin signed discovery stopped after 120 seconds without verified "
+            "progress. Retry after a short wait; Chrome verification is not "
+            f"required. Reason category: {cause.category}."
+        ) from cause
     if isinstance(cause, _TransientSigningFailure):
         raise TemporaryAccessError(
             "Douyin temporarily limited a signed request after automatic retries. "
-            "Wait a minute or two and retry; no lower-quality media was downloaded."
+            "Wait a minute or two and retry; no lower-quality media was downloaded. "
+            f"Reason category: {cause.category}."
         ) from cause
     if isinstance(cause, _CookieAccessSigningFailure):
         raise TemporaryAccessError(
@@ -1009,7 +1279,7 @@ def _raise_signing_error(
         raise TemporaryAccessError(
             "Douyin signed discovery temporarily failed before a verified response "
             "was available. Retry after a short wait; Chrome verification is not "
-            "required."
+            "required. Reason category: network-timeout."
         ) from cause
     raise DiscoveryError(
         "Douyin signed discovery failed before a verified response was available. "
@@ -1029,9 +1299,12 @@ def fetch_signed_aweme_detail(
     signer_timeout_ms: int = 20_000,
     signer_settle_ms: int = 8_000,
     request_timeout_ms: int = 45_000,
+    status_callback: StatusCallback | None = None,
+    progress_budget: _NoProgressBudget | None = None,
 ) -> dict[str, Any]:
     """Fetch one Douyin aweme detail through the site's current official SecSDK."""
 
+    budget = progress_budget or new_signed_discovery_budget()
     try:
         if not isinstance(aweme_id, str) or not aweme_id.isdigit():
             raise _SigningFailure("The Douyin aweme identifier is invalid")
@@ -1059,38 +1332,63 @@ def fetch_signed_aweme_detail(
         def fetch_detail(page: Any) -> dict[str, Any]:
             for attempt in range(_DETAIL_REQUEST_ATTEMPTS):
                 try:
+                    if not attempt:
+                        _emit_status(status_callback, "Fetching Douyin signed detail")
+                    effective_timeout_ms = budget.clamp_timeout_ms(
+                        request_timeout_ms
+                    )
                     _start_signed_fetch(
                         page,
                         _DETAIL_API_PATH,
                         {"aweme_id": aweme_id},
-                        request_timeout_ms,
+                        effective_timeout_ms,
                     )
                     response = _wait_for_signed_response(
                         page,
-                        request_timeout_ms,
+                        effective_timeout_ms,
                         should_cancel,
+                        budget=budget,
                     )
                     detail = _validate_detail_response(
                         response,
                         aweme_id,
                         expected_sec_uid,
                     )
-                except _TransientSigningFailure:
+                except _SigningNoProgressTimeout:
+                    raise
+                except _TransientSigningFailure as exc:
+                    budget.note_failure(exc)
                     if attempt + 1 >= _DETAIL_REQUEST_ATTEMPTS:
                         raise
+                    _emit_status(
+                        status_callback,
+                        "Retrying Douyin signed detail request "
+                        f"{attempt + 2}/{_DETAIL_REQUEST_ATTEMPTS} "
+                        f"(reason: {_transient_reason_category(exc)})",
+                    )
                     _wait_with_cancel(
                         page,
                         _DETAIL_RETRY_BASE_MS * (2**attempt),
                         should_cancel,
+                        budget=budget,
                     )
                     continue
                 _raise_if_cancelled(should_cancel)
                 return detail
             raise _SigningFailure("Douyin detail request attempts were exhausted")
 
-        with _serialized_signed_fetch(should_cancel):
+        with _serialized_signed_fetch(
+            should_cancel,
+            budget=budget,
+            status_callback=status_callback,
+        ):
             for session_attempt in range(_DETAIL_SIGNING_SESSION_ATTEMPTS):
                 try:
+                    _emit_status(
+                        status_callback,
+                        "Preparing Douyin signed detail session "
+                        f"{session_attempt + 1}/{_DETAIL_SIGNING_SESSION_ATTEMPTS}",
+                    )
                     return _run_with_signing_page(
                         verification_url,
                         cookie_profile=cookie_profile,
@@ -1098,14 +1396,25 @@ def fetch_signed_aweme_detail(
                         navigation_timeout_ms=navigation_timeout_ms,
                         signer_timeout_ms=signer_timeout_ms,
                         signer_settle_ms=signer_settle_ms,
+                        budget=budget,
+                        status_callback=status_callback,
                         operation=fetch_detail,
                     )
-                except _TransientSigningFailure:
+                except _SigningNoProgressTimeout:
+                    raise
+                except _TransientSigningFailure as exc:
+                    budget.note_failure(exc)
                     if session_attempt + 1 >= _DETAIL_SIGNING_SESSION_ATTEMPTS:
                         raise
+                    _emit_status(
+                        status_callback,
+                        "Retrying Douyin signed detail with a fresh signing session "
+                        f"(reason: {_transient_reason_category(exc)})",
+                    )
                     _wait_without_page_with_cancel(
                         _DETAIL_SIGNING_RETRY_BASE_MS * (2**session_attempt),
                         should_cancel,
+                        budget=budget,
                     )
         raise _SigningFailure("Douyin detail signing attempts were exhausted")
     except DownloadCancelledError:
@@ -1148,9 +1457,12 @@ def fetch_signed_profile_awemes(
     signer_timeout_ms: int = 20_000,
     signer_settle_ms: int = 8_000,
     request_timeout_ms: int = 45_000,
+    status_callback: StatusCallback | None = None,
+    progress_budget: _NoProgressBudget | None = None,
 ) -> list[dict[str, Any]]:
     """Fetch verified raw awemes from one Douyin profile with SecSDK."""
 
+    budget = progress_budget or new_signed_discovery_budget()
     try:
         if not isinstance(profile_url, str) or not _is_douyin_url(profile_url):
             raise _SigningFailure("The Douyin profile URL is invalid")
@@ -1170,44 +1482,76 @@ def fetch_signed_profile_awemes(
                 "The Douyin profile URL identifies a different author"
             )
 
+        collected: dict[str, dict[str, Any]] = {}
+        cursor = "0"
+        verified_page_cursors: set[str] = set()
+
         def fetch_pages(page: Any) -> list[dict[str, Any]]:
-            collected: dict[str, dict[str, Any]] = {}
-            cursor = "0"
-            used_cursors: set[str] = set()
-            for _ in range(max_pages):
+            nonlocal cursor
+            while len(verified_page_cursors) < max_pages:
+                page_number = len(verified_page_cursors) + 1
                 _raise_if_cancelled(should_cancel)
-                if cursor in used_cursors:
+                budget.remaining_seconds()
+                if cursor in verified_page_cursors:
                     raise _SigningFailure("Douyin profile pagination repeated a cursor")
-                used_cursors.add(cursor)
                 for attempt in range(_PROFILE_REQUEST_ATTEMPTS):
                     try:
+                        if not attempt:
+                            _emit_status(
+                                status_callback,
+                                "Fetching Douyin signed profile page "
+                                f"{page_number}/{max_pages}",
+                            )
                         params = _profile_request_params(profile_id, cursor)
                         if attempt % 2:
                             params["count"] = str(_PROFILE_FALLBACK_PAGE_SIZE)
+                        effective_timeout_ms = budget.clamp_timeout_ms(
+                            request_timeout_ms
+                        )
                         _start_signed_fetch(
                             page,
                             _PROFILE_API_PATH,
                             params,
-                            request_timeout_ms,
+                            effective_timeout_ms,
                         )
                         response = _wait_for_signed_response(
                             page,
-                            request_timeout_ms,
+                            effective_timeout_ms,
                             should_cancel,
+                            budget=budget,
                         )
                         awemes, has_more, next_cursor = _validate_profile_response(
                             response,
                             profile_id,
                         )
                         break
-                    except _TransientSigningFailure:
+                    except _SigningNoProgressTimeout:
+                        raise
+                    except _TransientSigningFailure as exc:
+                        budget.note_failure(exc)
                         if attempt + 1 >= _PROFILE_REQUEST_ATTEMPTS:
                             raise
+                        _emit_status(
+                            status_callback,
+                            "Retrying Douyin signed profile page "
+                            f"{page_number}/{max_pages} request "
+                            f"{attempt + 2}/{_PROFILE_REQUEST_ATTEMPTS} "
+                            f"(reason: {_transient_reason_category(exc)})",
+                        )
                         _wait_with_cancel(
                             page,
                             _PROFILE_RETRY_BASE_MS * (2**attempt),
                             should_cancel,
+                            budget=budget,
                         )
+                if has_more and (
+                    next_cursor == cursor
+                    or str(next_cursor) in verified_page_cursors
+                ):
+                    raise _SigningFailure(
+                        "Douyin profile pagination did not advance"
+                    )
+                collected_before_page = len(collected)
                 for aweme in awemes:
                     aweme_id = str(aweme["aweme_id"])
                     if aweme_id in collected:
@@ -1217,20 +1561,42 @@ def fetch_signed_profile_awemes(
                             "Douyin profile reached the aweme safety limit"
                         )
                     collected[aweme_id] = aweme
+                verified_page_cursors.add(cursor)
+                if len(collected) > collected_before_page:
+                    budget.refresh()
+                _emit_status(
+                    status_callback,
+                    "Verified Douyin signed profile page "
+                    f"{page_number} ({len(awemes)} items)",
+                )
                 if target_aweme_id and target_aweme_id in collected:
                     _raise_if_cancelled(should_cancel)
                     return [collected[target_aweme_id]]
                 if not has_more:
                     _raise_if_cancelled(should_cancel)
                     return list(collected.values())
-                if next_cursor == cursor:
-                    raise _SigningFailure("Douyin profile pagination did not advance")
                 cursor = str(next_cursor)
             raise _SigningFailure("Douyin profile reached the page safety limit")
 
-        with _serialized_signed_fetch(should_cancel):
+        with _serialized_signed_fetch(
+            should_cancel,
+            budget=budget,
+            status_callback=status_callback,
+        ):
             for session_attempt in range(_PROFILE_SIGNING_SESSION_ATTEMPTS):
                 try:
+                    _emit_status(
+                        status_callback,
+                        "Preparing Douyin signed profile session "
+                        f"{session_attempt + 1}/{_PROFILE_SIGNING_SESSION_ATTEMPTS}",
+                    )
+                    if session_attempt and verified_page_cursors:
+                        _emit_status(
+                            status_callback,
+                            "Resuming Douyin signed profile at page "
+                            f"{len(verified_page_cursors) + 1}/{max_pages} "
+                            f"({len(collected)} verified items)",
+                        )
                     return _run_with_signing_page(
                         profile_url,
                         cookie_profile=cookie_profile,
@@ -1238,14 +1604,25 @@ def fetch_signed_profile_awemes(
                         navigation_timeout_ms=navigation_timeout_ms,
                         signer_timeout_ms=signer_timeout_ms,
                         signer_settle_ms=signer_settle_ms,
+                        budget=budget,
+                        status_callback=status_callback,
                         operation=fetch_pages,
                     )
-                except _TransientSigningFailure:
+                except _SigningNoProgressTimeout:
+                    raise
+                except _TransientSigningFailure as exc:
+                    budget.note_failure(exc)
                     if session_attempt + 1 >= _PROFILE_SIGNING_SESSION_ATTEMPTS:
                         raise
+                    _emit_status(
+                        status_callback,
+                        "Retrying Douyin signed profile with a fresh signing session "
+                        f"(reason: {_transient_reason_category(exc)})",
+                    )
                     _wait_without_page_with_cancel(
                         _PROFILE_SIGNING_RETRY_BASE_MS * (2**session_attempt),
                         should_cancel,
+                        budget=budget,
                     )
         raise _SigningFailure("Douyin profile signing attempts were exhausted")
     except DownloadCancelledError:

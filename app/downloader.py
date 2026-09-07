@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import http.client
 import ipaddress
 import json
 import math
@@ -18,7 +19,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from http.cookiejar import CookieJar
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Iterator
 from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlsplit, urlunsplit
 
 from yt_dlp import YoutubeDL
@@ -29,13 +30,14 @@ from yt_dlp.networking._requests import RequestsRH, RequestsResponseAdapter
 from yt_dlp.networking.exceptions import (
     CertificateVerifyError,
     HTTPError,
+    IncompleteRead,
     ProxyError,
     RequestError,
     SSLError,
     TransportError,
 )
 from yt_dlp.postprocessor.common import PostProcessor
-from yt_dlp.utils import DownloadCancelled, DownloadError
+from yt_dlp.utils import DownloadCancelled, DownloadError, variadic
 
 from .douyin import discover_profile as discover_douyin_profile
 from .douyin import discover_item_metadata_from_profile
@@ -67,6 +69,9 @@ MAX_FILENAME_COMPONENT_BYTES = 255
 RESERVED_EXTENSION_BYTES = 16
 DOUYIN_PROBE_RATIOS = ("default", "4k", "2k", "1080p", "720p")
 DOUYIN_PROBE_BYTES = 256 * 1024
+DOUYIN_STREAM_CHUNK_BYTES = 64 * 1024
+DOUYIN_PROGRESS_INTERVAL_SECONDS = 0.5
+DOUYIN_LOCK_STATUS_INTERVAL_SECONDS = 5.0
 DOUYIN_DEFAULT_PROBE_HOST = "api-play-hl.amemv.com"
 DOUYIN_RATIO_PROBE_HOST = "api-play.amemv.com"
 DOUYIN_DEFAULT_ROUTE_LINES = ("0", "1")
@@ -74,6 +79,12 @@ DOUYIN_PROBE_HTTP_TIMEOUT_SECONDS = 10.0
 DOUYIN_PROBE_ATTEMPTS = 3
 DOUYIN_PROBE_RETRY_BASE_SECONDS = 1.0
 DOUYIN_TRANSFER_ATTEMPTS = 3
+DOUYIN_QUALITY_PROBE_IDLE_TIMEOUT_SECONDS = 120.0
+DOUYIN_TRANSFER_IDLE_TIMEOUT_SECONDS = 120.0
+DOUYIN_TRANSFER_HTTP_TIMEOUT_SECONDS = 30.0
+DOUYIN_MAX_TRANSFER_CANDIDATES = 8
+DOUYIN_YTDLP_SOCKET_TIMEOUT_SECONDS = 10
+DOUYIN_YTDLP_RETRIES = 2
 DOUYIN_FFPROBE_PIPE_TIMEOUT_SECONDS = 3.0
 DOUYIN_FFPROBE_FILE_TIMEOUT_SECONDS = 15.0
 DOUYIN_MAX_PROBE_FILE_BYTES = 8 * 1024 * 1024 * 1024
@@ -278,6 +289,10 @@ class _DouyinRedirectRejected(_DouyinProbeRejected):
 
 
 class _DouyinProbeIntegrityChanged(_DouyinProbeRejected):
+    pass
+
+
+class _DouyinNoProgressTimeout(TemporaryAccessError):
     pass
 
 
@@ -515,6 +530,45 @@ class DownloadOutcome:
     cookie_fallback_used: bool = False
 
 
+@dataclass(slots=True)
+class _DouyinProbeReuseContext:
+    directory: Path
+    files: dict[tuple[Any, ...], list[Path]] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class _DouyinNoProgressBudget:
+    idle_timeout_seconds: float
+    phase: str
+    deadline: float = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.refresh()
+
+    def refresh(self) -> None:
+        self.deadline = time.monotonic() + self.idle_timeout_seconds
+
+    def remaining(self) -> float:
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise _DouyinNoProgressTimeout(
+                f"Douyin {self.phase} made no media progress for "
+                f"{int(self.idle_timeout_seconds)} seconds. The task was paused; "
+                "completed files were preserved."
+            )
+        return remaining
+
+    def request_timeout(self, maximum: float) -> float:
+        return min(maximum, self.remaining())
+
+
+@dataclass(slots=True)
+class _DouyinQualityProbeRun:
+    budget: _DouyinNoProgressBudget
+    candidate_total: int = 0
+    candidate_index: int = 0
+
+
 EventCallback = Callable[[EngineEvent], None]
 CancelCallback = Callable[[], bool]
 
@@ -539,8 +593,63 @@ class _YdlLogger:
 
 
 class MediaDownloader:
-    def __init__(self, config: DownloaderConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: DownloaderConfig | None = None,
+        *,
+        discovery_callback: EventCallback | None = None,
+    ) -> None:
         self.config = config or DownloaderConfig()
+        self.discovery_callback = discovery_callback
+        self._douyin_probe_context = threading.local()
+
+    @contextlib.contextmanager
+    def _douyin_probe_reuse_scope(
+        self,
+        output_dir: Path,
+    ) -> Iterator[None]:
+        previous = getattr(self._douyin_probe_context, "reuse", None)
+        with tempfile.TemporaryDirectory(
+            prefix=".original-media-douyin-probe-",
+            dir=output_dir,
+        ) as temporary_directory:
+            context = _DouyinProbeReuseContext(
+                directory=Path(temporary_directory).resolve(strict=True)
+            )
+            self._douyin_probe_context.reuse = context
+            try:
+                yield
+            finally:
+                if previous is None:
+                    with contextlib.suppress(AttributeError):
+                        del self._douyin_probe_context.reuse
+                else:
+                    self._douyin_probe_context.reuse = previous
+
+    @contextlib.contextmanager
+    def _douyin_quality_probe_scope(self) -> Iterator[_DouyinQualityProbeRun]:
+        previous = getattr(self._douyin_probe_context, "quality_run", None)
+        if isinstance(previous, _DouyinQualityProbeRun):
+            yield previous
+            return
+        budget = _DouyinNoProgressBudget(
+            DOUYIN_QUALITY_PROBE_IDLE_TIMEOUT_SECONDS,
+            "quality verification",
+        )
+        run = _DouyinQualityProbeRun(budget=budget)
+        self._douyin_probe_context.quality_run = run
+        try:
+            yield run
+        finally:
+            if previous is None:
+                with contextlib.suppress(AttributeError):
+                    del self._douyin_probe_context.quality_run
+            else:
+                self._douyin_probe_context.quality_run = previous
+
+    def _report_discovery(self, message: str) -> None:
+        if self.discovery_callback:
+            self.discovery_callback(EngineEvent(event="probing", message=message))
 
     def _xiaohongshu_browser_cookies_enabled(self) -> bool:
         if self.config.cookie_browser is None:
@@ -662,6 +771,7 @@ class MediaDownloader:
                 use_browser_cookies=self.config.cookie_browser == "chrome",
                 allow_cookie_fallback=self.config.allow_cookie_fallback,
                 should_cancel=should_cancel,
+                status_callback=self._report_discovery,
             )
             profile_id = self._douyin_profile_id(url)
             if not profile_id:
@@ -802,7 +912,7 @@ class MediaDownloader:
 
         def operation(use_cookies: bool) -> tuple[dict[str, Any], str]:
             options = {
-                **self._base_options(use_cookies),
+                **self._douyin_ytdlp_options(use_cookies),
                 "skip_download": True,
                 "noplaylist": True,
                 "ignoreerrors": False,
@@ -818,6 +928,7 @@ class MediaDownloader:
                     profile_metadata=None,
                     fallback_title="Untitled Douyin video",
                     should_cancel=should_cancel,
+                    status_callback=self._report_discovery,
                 )
                 self._validate_douyin_info(info, expected_id, url)
                 video_uri = self._douyin_video_uri(info, expected_id, url)
@@ -881,6 +992,7 @@ class MediaDownloader:
                     expected_id,
                     cookie_profile=self.config.cookie_profile,
                     should_cancel=should_cancel,
+                    status_callback=self._report_discovery,
                 )
             except DownloadCancelledError:
                 raise
@@ -1007,26 +1119,36 @@ class MediaDownloader:
                 callback=callback,
                 should_cancel=should_cancel,
             )
-        if (
-            platform == Platform.DOUYIN
-            and (
-                (
-                    isinstance(item.metadata.get("douyin_profile_media"), dict)
-                    and item.metadata["douyin_profile_media"].get("media_kind")
-                    == "image"
+        if platform == Platform.DOUYIN:
+            with self._douyin_probe_reuse_scope(output_path):
+                if (
+                    (
+                        isinstance(
+                            item.metadata.get("douyin_profile_media"), dict
+                        )
+                        and item.metadata["douyin_profile_media"].get(
+                            "media_kind"
+                        )
+                        == "image"
+                    )
+                    or (
+                        item.media_type == MediaType.IMAGE
+                        and "profile_url" in item.metadata
+                    )
+                ):
+                    return self._download_douyin_profile_image(
+                        item,
+                        output_path,
+                        callback=callback,
+                        should_cancel=should_cancel,
+                    )
+                return self._download_with_ytdlp(
+                    item,
+                    output_path,
+                    platform=platform,
+                    callback=callback,
+                    should_cancel=should_cancel,
                 )
-                or (
-                    item.media_type == MediaType.IMAGE
-                    and "profile_url" in item.metadata
-                )
-            )
-        ):
-            return self._download_douyin_profile_image(
-                item,
-                output_path,
-                callback=callback,
-                should_cancel=should_cancel,
-            )
         return self._download_with_ytdlp(
             item,
             output_path,
@@ -1069,6 +1191,22 @@ class MediaDownloader:
             "js_runtimes": {"deno": {}},
             **self._cookie_options(use_cookies),
         }
+
+    def _douyin_ytdlp_options(self, use_cookies: bool = True) -> dict[str, Any]:
+        options = self._base_options(use_cookies)
+        options["socket_timeout"] = min(
+            max(1, int(self.config.socket_timeout_seconds)),
+            DOUYIN_YTDLP_SOCKET_TIMEOUT_SECONDS,
+        )
+        options["retries"] = min(
+            max(0, int(self.config.retries)),
+            DOUYIN_YTDLP_RETRIES,
+        )
+        options["extractor_retries"] = min(
+            int(options.get("extractor_retries") or 0),
+            DOUYIN_YTDLP_RETRIES,
+        )
+        return options
 
     def _run_with_cookie_fallback(
         self,
@@ -1575,7 +1713,7 @@ class MediaDownloader:
                     url=current_url,
                     data=request.data,
                     headers=current_headers,
-                    timeout=max(0.1, min(request_timeout, remaining_timeout)),
+                    timeout=max(0.001, min(request_timeout, remaining_timeout)),
                     proxies=handler._get_proxies(request),
                     allow_redirects=False,
                     stream=True,
@@ -1884,6 +2022,7 @@ class MediaDownloader:
         profile_metadata: dict[str, Any] | None,
         fallback_title: str,
         should_cancel: CancelCallback,
+        status_callback: Callable[[str], None] | None = None,
     ) -> dict[str, Any]:
         cached_result = self._douyin_raw_info_from_item_metadata(
             profile_metadata,
@@ -1900,6 +2039,8 @@ class MediaDownloader:
         )
         if cached_result:
             return cached_result
+        if status_callback:
+            status_callback("Reading Douyin item metadata with bounded retries")
         try:
             raw_result = ydl.extract_info(
                 source_url,
@@ -1940,6 +2081,7 @@ class MediaDownloader:
             expected_sec_uid=expected_profile_id,
             cookie_profile=self.config.cookie_profile,
             should_cancel=should_cancel,
+            status_callback=status_callback,
         )
         parsed = DouyinIE(ydl)._parse_aweme_video_app(detail)
         if not isinstance(parsed, dict):
@@ -2203,6 +2345,8 @@ class MediaDownloader:
                     callback=callback,
                     should_cancel=should_cancel,
                 )
+            except _DouyinNoProgressTimeout:
+                raise
             except (DownloadCancelled, MediaDownloadError):
                 raise
             except Exception as exc:
@@ -2250,6 +2394,28 @@ class MediaDownloader:
         callback: EventCallback | None = None,
         should_cancel: CancelCallback,
     ) -> bool:
+        with self._douyin_quality_probe_scope():
+            return self._add_douyin_probe_formats_scoped(
+                ydl,
+                info,
+                expected_id=expected_id,
+                verification_url=verification_url,
+                expected_profile_id=expected_profile_id,
+                callback=callback,
+                should_cancel=should_cancel,
+            )
+
+    def _add_douyin_probe_formats_scoped(
+        self,
+        ydl: YoutubeDL,
+        info: dict[str, Any],
+        *,
+        expected_id: str,
+        verification_url: str,
+        expected_profile_id: str | None = None,
+        callback: EventCallback | None = None,
+        should_cancel: CancelCallback,
+    ) -> bool:
         formats = [
             value
             for value in (info.get("formats") or [])
@@ -2280,6 +2446,14 @@ class MediaDownloader:
                 "link with Chrome Cookie enabled; no default-only fallback was "
                 "downloaded."
             )
+        quality_run = getattr(self._douyin_probe_context, "quality_run", None)
+        if isinstance(quality_run, _DouyinQualityProbeRun):
+            quality_run.candidate_index = 0
+            quality_run.candidate_total = sum(
+                len(candidate.get("urls") or [])
+                for candidate in direct_candidates
+                if isinstance(candidate, dict)
+            ) + len(self._douyin_default_probe_urls(video_uri))
         direct_count = len(direct_candidates)
         direct_failures: list[tuple[dict[str, Any], str, str, bool]] = []
         for index, candidate in enumerate(direct_candidates, start=1):
@@ -2311,6 +2485,8 @@ class MediaDownloader:
                         callback=callback,
                         should_cancel=should_cancel,
                     )
+                except _DouyinNoProgressTimeout:
+                    raise
                 except DownloadCancelled:
                     raise
                 except MediaDownloadError:
@@ -2393,6 +2569,8 @@ class MediaDownloader:
                 callback=callback,
                 should_cancel=should_cancel,
             )
+        except _DouyinNoProgressTimeout:
+            raise
         except DownloadCancelled:
             raise
         except MediaDownloadError:
@@ -2545,6 +2723,7 @@ class MediaDownloader:
                     "width": width,
                     "height": height,
                     "tbr": bit_rate / 1000 if bit_rate else None,
+                    "_douyin_probe_bit_rate": bit_rate or None,
                     "filesize": probe.get("filesize"),
                     "duration": probe.get("duration"),
                     "_douyin_probe_prefix_size": probe.get("probe_prefix_size"),
@@ -2580,27 +2759,91 @@ class MediaDownloader:
         callback: EventCallback | None,
         should_cancel: CancelCallback,
     ) -> dict[str, Any] | None:
+        quality_run = getattr(self._douyin_probe_context, "quality_run", None)
+        if isinstance(quality_run, _DouyinQualityProbeRun):
+            quality_run.candidate_index += 1
+            if callback:
+                callback(
+                    EngineEvent(
+                        event="probing",
+                        message=(
+                            "Checking Douyin media candidate "
+                            f"{quality_run.candidate_index}/"
+                            f"{max(quality_run.candidate_total, quality_run.candidate_index)} "
+                            f"({ratio})"
+                        ),
+                    )
+                )
         for attempt in range(1, DOUYIN_PROBE_ATTEMPTS + 1):
             try:
+                lock_timeout = DOUYIN_PROCESS_POLL_SECONDS
+                if isinstance(quality_run, _DouyinQualityProbeRun):
+                    lock_timeout = min(
+                        lock_timeout,
+                        quality_run.budget.remaining(),
+                    )
+                lock_wait_started_at = time.monotonic()
+                last_lock_status_at = (
+                    lock_wait_started_at - DOUYIN_LOCK_STATUS_INTERVAL_SECONDS
+                )
                 while not DOUYIN_MEDIA_PROBE_LOCK.acquire(
-                    timeout=DOUYIN_PROCESS_POLL_SECONDS
+                    timeout=lock_timeout
                 ):
                     if should_cancel():
                         raise DownloadCancelled("Task cancelled")
+                    if isinstance(quality_run, _DouyinQualityProbeRun):
+                        lock_timeout = min(
+                            DOUYIN_PROCESS_POLL_SECONDS,
+                            quality_run.budget.remaining(),
+                        )
+                    now = time.monotonic()
+                    if (
+                        callback
+                        and now - last_lock_status_at
+                        >= DOUYIN_LOCK_STATUS_INTERVAL_SECONDS
+                    ):
+                        callback(
+                            EngineEvent(
+                                event="probing",
+                                message=(
+                                    "Waiting for another Douyin quality check "
+                                    f"({int(now - lock_wait_started_at)}s)"
+                                ),
+                            )
+                        )
+                        last_lock_status_at = now
                 try:
-                    return self._probe_douyin_candidate(
-                        ydl,
-                        candidate_url,
-                        expected_duration=expected_duration,
-                        should_cancel=should_cancel,
-                    )
+                    self._douyin_probe_context.ratio = ratio
+                    self._douyin_probe_context.callback = callback
+                    try:
+                        probe = self._probe_douyin_candidate(
+                            ydl,
+                            candidate_url,
+                            expected_duration=expected_duration,
+                            should_cancel=should_cancel,
+                        )
+                        if (
+                            probe
+                            and isinstance(quality_run, _DouyinQualityProbeRun)
+                        ):
+                            quality_run.budget.refresh()
+                        return probe
+                    finally:
+                        self._douyin_probe_context.ratio = None
+                        self._douyin_probe_context.callback = None
                 finally:
                     DOUYIN_MEDIA_PROBE_LOCK.release()
-            except (DownloadCancelled, MediaDownloadError):
+            except (
+                DownloadCancelled,
+                MediaDownloadError,
+                _DouyinNoProgressTimeout,
+            ):
                 raise
             except Exception as exc:
                 retryable = self._is_retryable_douyin_probe_error(exc)
                 self._close_douyin_probe_error(exc)
+                if isinstance(quality_run, _DouyinQualityProbeRun):
+                    quality_run.budget.remaining()
                 if (
                     attempt >= DOUYIN_PROBE_ATTEMPTS
                     or not retryable
@@ -2617,10 +2860,17 @@ class MediaDownloader:
                             ),
                         )
                     )
-                self._wait_for_douyin_probe_retry(
-                    DOUYIN_PROBE_RETRY_BASE_SECONDS * (2 ** (attempt - 1)),
-                    should_cancel,
+                retry_delay = DOUYIN_PROBE_RETRY_BASE_SECONDS * (
+                    2 ** (attempt - 1)
                 )
+                if isinstance(quality_run, _DouyinQualityProbeRun):
+                    retry_delay = min(
+                        retry_delay,
+                        quality_run.budget.remaining(),
+                    )
+                self._wait_for_douyin_probe_retry(retry_delay, should_cancel)
+                if isinstance(quality_run, _DouyinQualityProbeRun):
+                    quality_run.budget.remaining()
         return None
 
     @staticmethod
@@ -2737,9 +2987,22 @@ class MediaDownloader:
         ydl: YoutubeDL,
         candidate_url: str,
         *,
+        ratio: str | None = None,
         expected_duration: float | None,
+        callback: EventCallback | None = None,
         should_cancel: CancelCallback,
     ) -> dict[str, Any] | None:
+        ratio = ratio or getattr(
+            self._douyin_probe_context,
+            "ratio",
+            None,
+        ) or "default"
+        callback = callback or getattr(
+            self._douyin_probe_context,
+            "callback",
+            None,
+        )
+        quality_run = getattr(self._douyin_probe_context, "quality_run", None)
         if should_cancel():
             raise DownloadCancelled("Task cancelled")
         if not self._is_trusted_douyin_asset_url(
@@ -2753,12 +3016,15 @@ class MediaDownloader:
             **DOUYIN_MEDIA_HEADERS,
             "Range": f"bytes=0-{DOUYIN_PROBE_BYTES - 1}",
         }
+        request_timeout = DOUYIN_PROBE_HTTP_TIMEOUT_SECONDS
+        if isinstance(quality_run, _DouyinQualityProbeRun):
+            request_timeout = quality_run.budget.request_timeout(request_timeout)
         response = self._open_douyin_media_response(
             ydl,
             Request(
                 candidate_url,
                 headers=headers,
-                extensions={"timeout": DOUYIN_PROBE_HTTP_TIMEOUT_SECONDS},
+                extensions={"timeout": request_timeout},
             ),
             redirect_rejection_reason=lambda value: (
                 self._douyin_media_redirect_rejection_reason(
@@ -2795,13 +3061,50 @@ class MediaDownloader:
             ):
                 raise _DouyinProbeRejected("media endpoint did not return video data")
             payload = bytearray()
+            last_range_report_at: float | None = None
             while len(payload) < DOUYIN_PROBE_BYTES:
                 if should_cancel():
                     raise DownloadCancelled("Task cancelled")
-                chunk = response.read(DOUYIN_PROBE_BYTES - len(payload))
+                chunk = self._read_douyin_stream_chunk(
+                    response,
+                    DOUYIN_PROBE_BYTES - len(payload),
+                )
                 if not chunk:
                     break
                 payload.extend(chunk)
+                if isinstance(quality_run, _DouyinQualityProbeRun):
+                    quality_run.budget.refresh()
+                if callback:
+                    now = time.monotonic()
+                    if (
+                        last_range_report_at is None
+                        or now - last_range_report_at
+                        >= DOUYIN_PROGRESS_INTERVAL_SECONDS
+                    ):
+                        candidate_index = (
+                            quality_run.candidate_index
+                            if isinstance(quality_run, _DouyinQualityProbeRun)
+                            else 1
+                        )
+                        candidate_total = (
+                            max(quality_run.candidate_total, candidate_index)
+                            if isinstance(quality_run, _DouyinQualityProbeRun)
+                            else 1
+                        )
+                        callback(
+                            EngineEvent(
+                                event="probing",
+                                message=(
+                                    "Reading Douyin quality candidate "
+                                    f"{candidate_index}/{candidate_total} ({ratio})"
+                                ),
+                                progress=TransferProgress(
+                                    downloaded_bytes=len(payload),
+                                    total_bytes=None,
+                                ),
+                            )
+                        )
+                        last_range_report_at = now
             if len(payload) < 12 or payload[4:8] != b"ftyp":
                 raise _DouyinProbeRejected("media endpoint did not return an MP4 file")
             content_range = str(response.headers.get("Content-Range") or "")
@@ -2829,17 +3132,33 @@ class MediaDownloader:
             bytes(payload),
             should_cancel=should_cancel,
         )
-        if not self._douyin_probe_metadata_complete(media, filesize=filesize):
-            with tempfile.TemporaryDirectory(
-                prefix="original-media-douyin-probe-"
-            ) as temporary_directory:
-                local_path = Path(temporary_directory) / "candidate.mp4"
+        local_path: Path | None = None
+        temporary_directory = None
+        reuse_registered = False
+        try:
+            if not self._douyin_probe_metadata_complete(media, filesize=filesize):
+                reuse = getattr(self._douyin_probe_context, "reuse", None)
+                if isinstance(reuse, _DouyinProbeReuseContext):
+                    temporary_fd, temporary_name = tempfile.mkstemp(
+                        prefix="candidate-",
+                        suffix=".mp4",
+                        dir=reuse.directory,
+                    )
+                    os.close(temporary_fd)
+                    local_path = Path(temporary_name)
+                else:
+                    temporary_directory = tempfile.TemporaryDirectory(
+                        prefix="original-media-douyin-probe-"
+                    )
+                    local_path = Path(temporary_directory.name) / "candidate.mp4"
                 self._download_douyin_probe_file(
                     ydl,
                     candidate_url,
                     local_path,
+                    ratio=ratio,
                     expected_prefix=bytes(payload),
                     expected_filesize=filesize,
+                    callback=callback,
                     should_cancel=should_cancel,
                 )
                 media = self._ffprobe_douyin_media(
@@ -2847,37 +3166,48 @@ class MediaDownloader:
                     local_path=local_path,
                     should_cancel=should_cancel,
                 )
-        if not media:
-            raise _DouyinProbeRejected("FFprobe could not parse the media stream")
-        width = int(media.get("width") or 0)
-        height = int(media.get("height") or 0)
-        if width <= 0 or height <= 0:
-            raise _DouyinProbeRejected("FFprobe returned no video dimensions")
-        duration = self._float_or_none(media.get("duration"))
-        if duration is None or duration <= 0:
-            raise _DouyinProbeRejected("FFprobe returned no media duration")
-        if expected_duration is not None:
-            tolerance = self._douyin_duration_tolerance(expected_duration)
-            if abs(duration - expected_duration) > tolerance:
+            if not media:
+                raise _DouyinProbeRejected("FFprobe could not parse the media stream")
+            width = int(media.get("width") or 0)
+            height = int(media.get("height") or 0)
+            if width <= 0 or height <= 0:
+                raise _DouyinProbeRejected("FFprobe returned no video dimensions")
+            duration = self._float_or_none(media.get("duration"))
+            if duration is None or duration <= 0:
+                raise _DouyinProbeRejected("FFprobe returned no media duration")
+            if expected_duration is not None:
+                tolerance = self._douyin_duration_tolerance(expected_duration)
+                if abs(duration - expected_duration) > tolerance:
+                    raise _DouyinProbeRejected(
+                        "media duration did not match the requested Douyin item"
+                    )
+            bit_rate = int(media.get("bit_rate") or 0)
+            if bit_rate <= 0 and filesize and duration and duration > 0:
+                bit_rate = int(filesize * 8 / duration)
+            if not filesize and bit_rate <= 0:
                 raise _DouyinProbeRejected(
-                    "media duration did not match the requested Douyin item"
+                    "FFprobe returned no bitrate or complete media size"
                 )
-        bit_rate = int(media.get("bit_rate") or 0)
-        if bit_rate <= 0 and filesize and duration and duration > 0:
-            bit_rate = int(filesize * 8 / duration)
-        if not filesize and bit_rate <= 0:
-            raise _DouyinProbeRejected(
-                "FFprobe returned no bitrate or complete media size"
-            )
-        return {
-            **media,
-            "url": final_url,
-            "filesize": filesize,
-            "bit_rate": bit_rate,
-            "probe_prefix_size": len(payload),
-            "probe_prefix_sha256": hashlib.sha256(payload).hexdigest(),
-            "source_url": candidate_url,
-        }
+            result = {
+                **media,
+                "url": final_url,
+                "filesize": filesize,
+                "bit_rate": bit_rate,
+                "probe_prefix_size": len(payload),
+                "probe_prefix_sha256": hashlib.sha256(payload).hexdigest(),
+                "source_url": candidate_url,
+            }
+            if local_path is not None:
+                reuse_registered = self._register_douyin_probe_file(
+                    local_path,
+                    result,
+                )
+            return result
+        finally:
+            if temporary_directory is not None:
+                temporary_directory.cleanup()
+            elif local_path is not None and not reuse_registered:
+                local_path.unlink(missing_ok=True)
 
     @staticmethod
     def _douyin_duration_tolerance(duration: float) -> float:
@@ -2889,8 +3219,10 @@ class MediaDownloader:
         candidate_url: str,
         path: Path,
         *,
+        ratio: str = "default",
         expected_prefix: bytes,
         expected_filesize: int | None,
+        callback: EventCallback | None = None,
         should_cancel: CancelCallback,
     ) -> None:
         if should_cancel():
@@ -2909,12 +3241,16 @@ class MediaDownloader:
             raise _DouyinProbeRejected(
                 "media file exceeded the safe probe size limit"
             )
+        quality_run = getattr(self._douyin_probe_context, "quality_run", None)
+        request_timeout = DOUYIN_PROBE_HTTP_TIMEOUT_SECONDS
+        if isinstance(quality_run, _DouyinQualityProbeRun):
+            request_timeout = quality_run.budget.request_timeout(request_timeout)
         response = self._open_douyin_media_response(
             ydl,
             Request(
                 candidate_url,
                 headers=dict(DOUYIN_MEDIA_HEADERS),
-                extensions={"timeout": DOUYIN_PROBE_HTTP_TIMEOUT_SECONDS},
+                extensions={"timeout": request_timeout},
             ),
             redirect_rejection_reason=lambda value: (
                 self._douyin_media_redirect_rejection_reason(
@@ -2927,6 +3263,49 @@ class MediaDownloader:
         )
         downloaded = 0
         prefix = bytearray()
+        started_at = time.monotonic()
+        last_report_at = 0.0
+
+        def report_progress(*, force: bool = False) -> None:
+            nonlocal last_report_at
+            if not callback:
+                return
+            now = time.monotonic()
+            if not force and now - last_report_at < DOUYIN_PROGRESS_INTERVAL_SECONDS:
+                return
+            elapsed = max(now - started_at, 0.001)
+            speed = downloaded / elapsed if downloaded else None
+            eta = (
+                max(0.0, (expected_filesize - downloaded) / speed)
+                if expected_filesize is not None
+                and speed is not None
+                and speed > 0
+                else None
+            )
+            percent = (
+                min(100.0, downloaded * 100.0 / expected_filesize)
+                if expected_filesize
+                else None
+            )
+            callback(
+                EngineEvent(
+                    event="probing",
+                    message=(
+                        "Reading the Douyin original file to verify quality "
+                        f"({ratio})"
+                    ),
+                    progress=TransferProgress(
+                        downloaded_bytes=downloaded,
+                        total_bytes=expected_filesize,
+                        percent=percent,
+                        speed_bytes_per_second=speed,
+                        eta_seconds=eta,
+                    ),
+                )
+            )
+            last_report_at = now
+
+        report_progress(force=True)
         try:
             final_url = str(response.url)
             redirect_reason = self._douyin_media_redirect_rejection_reason(
@@ -2973,10 +3352,15 @@ class MediaDownloader:
                 while True:
                     if should_cancel():
                         raise DownloadCancelled("Task cancelled")
-                    chunk = response.read(1024 * 1024)
+                    chunk = self._read_douyin_stream_chunk(
+                        response,
+                        DOUYIN_STREAM_CHUNK_BYTES,
+                    )
                     if not chunk:
                         break
                     downloaded += len(chunk)
+                    if isinstance(quality_run, _DouyinQualityProbeRun):
+                        quality_run.budget.refresh()
                     if downloaded > DOUYIN_MAX_PROBE_FILE_BYTES:
                         raise _DouyinProbeRejected(
                             "media file exceeded the safe probe size limit"
@@ -2989,6 +3373,9 @@ class MediaDownloader:
                         remaining = len(expected_prefix) - len(prefix)
                         prefix.extend(chunk[:remaining])
                     output.write(chunk)
+                    report_progress()
+                output.flush()
+                os.fsync(output.fileno())
         finally:
             with contextlib.suppress(Exception):
                 response.close()
@@ -3002,6 +3389,45 @@ class MediaDownloader:
             raise _DouyinProbeIntegrityChanged(
                 "media content changed between the range probe and local probe"
             )
+        report_progress(force=True)
+
+    @staticmethod
+    def _read_douyin_stream_chunk(response: Any, size: int) -> bytes:
+        if isinstance(response, RequestsResponseAdapter):
+            read_available = getattr(response.fp, "read1", None)
+            if callable(read_available):
+                try:
+                    data = read_available(size, decode_content=True)
+                    if response.fp.closed:
+                        response.close()
+                    return data
+                except urllib3.exceptions.SSLError as exc:
+                    raise SSLError(cause=exc) from exc
+                except urllib3.exceptions.ProtocolError as exc:
+                    incomplete_read = next(
+                        (
+                            error
+                            for error in (
+                                exc.__context__,
+                                exc.__cause__,
+                                *variadic(exc.args),
+                            )
+                            if isinstance(error, http.client.IncompleteRead)
+                        ),
+                        None,
+                    )
+                    if incomplete_read is not None:
+                        partial = incomplete_read.partial
+                        if not isinstance(partial, int):
+                            partial = len(partial)
+                        raise IncompleteRead(
+                            partial=partial,
+                            expected=incomplete_read.expected,
+                        ) from exc
+                    raise TransportError(cause=exc) from exc
+                except urllib3.exceptions.HTTPError as exc:
+                    raise TransportError(cause=exc) from exc
+        return response.read(size)
 
     def _ffprobe_douyin_media(
         self,
@@ -3268,7 +3694,10 @@ class MediaDownloader:
             verified,
             key=lambda value: (
                 int(value.get("width") or 0) * int(value.get("height") or 0),
-                int(float(value.get("tbr") or 0) * 1_000),
+                int(
+                    value.get("_douyin_probe_bit_rate")
+                    or round(float(value.get("tbr") or 0) * 1_000)
+                ),
                 int(value.get("filesize") or 0),
                 str(value.get("_douyin_requested_ratio") or "") == "default",
             ),
@@ -3381,7 +3810,11 @@ class MediaDownloader:
             self._prepare_ytdlp_parts_dir(parts_dir, output_dir)
             logger = _YdlLogger(callback)
             options = {
-                **self._base_options(use_cookies),
+                **(
+                    self._douyin_ytdlp_options(use_cookies)
+                    if expected_douyin_id
+                    else self._base_options(use_cookies)
+                ),
                 **self._download_format_options(platform),
                 "paths": {
                     "home": str(output_dir),
@@ -3420,6 +3853,11 @@ class MediaDownloader:
                         profile_metadata=item.metadata,
                         fallback_title=item.title,
                         should_cancel=should_cancel,
+                        status_callback=(
+                            lambda message: emit(
+                                EngineEvent(event="probing", message=message)
+                            )
+                        ),
                     )
                     self._validate_douyin_info(
                         raw_result,
@@ -3455,7 +3893,8 @@ class MediaDownloader:
                         )
                     selected_size = int(selected.get("filesize") or 0)
                     selected_bit_rate = int(
-                        float(selected.get("tbr") or 0) * 1_000
+                        selected.get("_douyin_probe_bit_rate")
+                        or round(float(selected.get("tbr") or 0) * 1_000)
                     )
                     redirect_source_url = str(
                         selected.get("_douyin_probe_source_url") or ""
@@ -3474,6 +3913,9 @@ class MediaDownloader:
                             if isinstance(value, str) and value
                         )
                     )
+                    selected_candidates = self._bounded_douyin_transfer_candidates(
+                        selected_candidates
+                    )
                     title = str(raw_result.get("title") or item.title or "").strip()
                     if (
                         not title
@@ -3489,8 +3931,8 @@ class MediaDownloader:
                         size=selected_size or None,
                         format_id=str(selected.get("format_id") or "verified"),
                         duration=(
-                            self._float_or_none(raw_result.get("duration"))
-                            or self._float_or_none(selected.get("duration"))
+                            self._float_or_none(selected.get("duration"))
+                            or self._float_or_none(raw_result.get("duration"))
                         ),
                         bit_rate=selected_bit_rate or None,
                         video_codec=str(selected.get("vcodec") or "").lower()
@@ -3775,40 +4217,64 @@ class MediaDownloader:
 
             for asset in live_photo_assets:
                 progress_index += 1
-                try:
-                    asset = self._select_highest_douyin_live_photo_asset(
-                        ydl,
-                        asset,
-                        callback=callback,
-                        should_cancel=should_cancel,
-                    )
-                    path, chosen = self._download_first_available_asset(
-                        ydl,
-                        [asset],
-                        output_dir,
-                        upload_date,
-                        title,
-                        media_id,
-                        profile_url,
-                        platform=Platform.DOUYIN,
-                        media_type=MediaType.VIDEO,
-                        callback=callback,
-                        should_cancel=should_cancel,
-                        asset_index=asset.index,
-                        progress_index=progress_index,
-                        progress_count=total_assets,
-                        verify_declared_dimensions=True,
-                        require_quality_fingerprint=True,
-                    )
-                except DownloadCancelledError:
-                    raise
-                except TemporaryAccessError:
-                    raise
-                except Exception as exc:
-                    raise MediaDownloadError(
-                        f"Live Photo {asset.index} failed: "
-                        f"{safe_external_error_message(exc)}"
-                    ) from exc
+                reused = self._existing_douyin_live_photo_asset(
+                    item,
+                    output_dir,
+                    media_id,
+                    asset,
+                    should_cancel=should_cancel,
+                )
+                if reused:
+                    path, chosen = reused
+                    if callback:
+                        callback(
+                            EngineEvent(
+                                event="downloading",
+                                progress=TransferProgress(
+                                    downloaded_bytes=int(chosen.size or 0),
+                                    total_bytes=chosen.size,
+                                    percent=progress_index * 100.0 / total_assets,
+                                    fragment_index=progress_index,
+                                    fragment_count=total_assets,
+                                    filename=str(path),
+                                ),
+                            )
+                        )
+                else:
+                    try:
+                        asset = self._select_highest_douyin_live_photo_asset(
+                            ydl,
+                            asset,
+                            callback=callback,
+                            should_cancel=should_cancel,
+                        )
+                        path, chosen = self._download_first_available_asset(
+                            ydl,
+                            [asset],
+                            output_dir,
+                            upload_date,
+                            title,
+                            media_id,
+                            profile_url,
+                            platform=Platform.DOUYIN,
+                            media_type=MediaType.VIDEO,
+                            callback=callback,
+                            should_cancel=should_cancel,
+                            asset_index=asset.index,
+                            progress_index=progress_index,
+                            progress_count=total_assets,
+                            verify_declared_dimensions=True,
+                            require_quality_fingerprint=True,
+                        )
+                    except DownloadCancelledError:
+                        raise
+                    except TemporaryAccessError:
+                        raise
+                    except Exception as exc:
+                        raise MediaDownloadError(
+                            f"Live Photo {asset.index} failed: "
+                            f"{safe_external_error_message(exc)}"
+                        ) from exc
                 output_paths.append(str(path))
                 completed_assets.append(chosen)
                 if callback:
@@ -3862,6 +4328,22 @@ class MediaDownloader:
         callback: EventCallback | None,
         should_cancel: CancelCallback,
     ) -> RemoteAsset:
+        with self._douyin_quality_probe_scope():
+            return self._select_highest_douyin_live_photo_asset_scoped(
+                ydl,
+                asset,
+                callback=callback,
+                should_cancel=should_cancel,
+            )
+
+    def _select_highest_douyin_live_photo_asset_scoped(
+        self,
+        ydl: YoutubeDL,
+        asset: RemoteAsset,
+        *,
+        callback: EventCallback | None,
+        should_cancel: CancelCallback,
+    ) -> RemoteAsset:
         video_uri = str(asset.video_uri or "").strip()
         if not re.fullmatch(r"[A-Za-z0-9_-]{10,200}", video_uri):
             raise MediaDownloadError(
@@ -3875,6 +4357,14 @@ class MediaDownloader:
                 "default-only fallback. Create a new task from the original profile."
             )
         renditions = asset.quality_candidates
+        quality_run = getattr(self._douyin_probe_context, "quality_run", None)
+        if isinstance(quality_run, _DouyinQualityProbeRun):
+            quality_run.candidate_index = 0
+            quality_run.candidate_total = sum(
+                len(rendition.get("urls") or [])
+                for rendition in renditions
+                if isinstance(rendition, dict)
+            ) + len(self._douyin_default_probe_urls(video_uri))
         direct_probes: list[dict[str, Any]] = []
         direct_failures: list[tuple[dict[str, Any], str, str, bool]] = []
         probe_count = len(renditions) + 1
@@ -3904,6 +4394,8 @@ class MediaDownloader:
                         callback=callback,
                         should_cancel=should_cancel,
                     )
+                except _DouyinNoProgressTimeout:
+                    raise
                 except DownloadCancelled as exc:
                     raise DownloadCancelledError("Task cancelled") from exc
                 except MediaDownloadError:
@@ -3996,6 +4488,8 @@ class MediaDownloader:
                 callback=callback,
                 should_cancel=should_cancel,
             )
+        except _DouyinNoProgressTimeout:
+            raise
         except DownloadCancelled as exc:
             raise DownloadCancelledError("Task cancelled") from exc
         except MediaDownloadError:
@@ -4130,7 +4624,7 @@ class MediaDownloader:
             with contextlib.suppress(ValueError, IndexError):
                 rendition_index = int(requested_ratio.rsplit("-", 1)[1]) - 1
                 best_urls.extend(renditions[rendition_index].get("urls") or [])
-        best_urls = list(dict.fromkeys(best_urls))
+        best_urls = self._bounded_douyin_transfer_candidates(best_urls)
         return RemoteAsset(
             candidates=best_urls,
             index=asset.index,
@@ -4178,6 +4672,71 @@ class MediaDownloader:
         )
 
     @classmethod
+    def _douyin_asset_media_identity_key(
+        cls,
+        asset: RemoteAsset,
+    ) -> tuple[Any, ...]:
+        return cls._douyin_probe_media_identity_key(
+            {
+                "width": asset.width,
+                "height": asset.height,
+                "vcodec": asset.video_codec,
+                "acodec": asset.audio_codec,
+                "bit_rate": asset.bit_rate,
+                "filesize": asset.size,
+                "duration": asset.duration,
+                "probe_prefix_size": asset.probe_prefix_size,
+                "probe_prefix_sha256": asset.probe_prefix_sha256,
+            }
+        )
+
+    def _register_douyin_probe_file(
+        self,
+        path: Path,
+        probe: dict[str, Any],
+    ) -> bool:
+        reuse = getattr(self._douyin_probe_context, "reuse", None)
+        if not isinstance(reuse, _DouyinProbeReuseContext):
+            return False
+        try:
+            resolved = path.resolve(strict=True)
+            if (
+                path.is_symlink()
+                or not resolved.is_file()
+                or resolved.parent != reuse.directory
+            ):
+                return False
+        except OSError:
+            return False
+        key = self._douyin_probe_media_identity_key(probe)
+        reuse.files.setdefault(key, []).append(resolved)
+        return True
+
+    def _take_douyin_probe_file(self, asset: RemoteAsset) -> Path | None:
+        reuse = getattr(self._douyin_probe_context, "reuse", None)
+        if not isinstance(reuse, _DouyinProbeReuseContext):
+            return None
+        key = self._douyin_asset_media_identity_key(asset)
+        candidates = reuse.files.get(key)
+        while candidates:
+            candidate = candidates.pop(0)
+            try:
+                resolved = candidate.resolve(strict=True)
+                if (
+                    candidate.is_symlink()
+                    or not resolved.is_file()
+                    or resolved.parent != reuse.directory
+                ):
+                    continue
+            except OSError:
+                continue
+            if not candidates:
+                reuse.files.pop(key, None)
+            return resolved
+        reuse.files.pop(key, None)
+        return None
+
+    @classmethod
     def _merge_douyin_probe_source_candidates(
         cls,
         target: dict[str, Any],
@@ -4203,6 +4762,34 @@ class MediaDownloader:
             )
         ]
         target["source_candidates"] = list(dict.fromkeys(candidates))
+
+    @staticmethod
+    def _bounded_douyin_transfer_candidates(candidates: Iterable[str]) -> list[str]:
+        result: list[str] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            if not isinstance(candidate, str) or not candidate:
+                continue
+            try:
+                parsed = urlsplit(candidate)
+                identity = urlunsplit(
+                    (
+                        parsed.scheme.lower(),
+                        parsed.netloc.lower(),
+                        parsed.path,
+                        parsed.query,
+                        "",
+                    )
+                )
+            except (TypeError, ValueError):
+                identity = candidate
+            if identity in seen:
+                continue
+            seen.add(identity)
+            result.append(candidate)
+            if len(result) >= DOUYIN_MAX_TRANSFER_CANDIDATES:
+                break
+        return result
 
     @classmethod
     def _unresolved_douyin_direct_failures(
@@ -4278,6 +4865,91 @@ class MediaDownloader:
                     height=height,
                     size=size,
                     format_id=asset.format_id,
+                ),
+            )
+        return None
+
+    def _existing_douyin_live_photo_asset(
+        self,
+        item: DownloadItem,
+        output_dir: Path,
+        media_id: str,
+        asset: RemoteAsset,
+        *,
+        should_cancel: CancelCallback,
+    ) -> tuple[Path, RemoteAsset] | None:
+        expected_suffix = re.compile(
+            rf"\[{re.escape(media_id)}\]-{asset.index:03d}\.mp4$"
+        )
+        quality_values = [
+            value
+            for value in (asset.quality_candidates or [])
+            if isinstance(value, dict)
+        ]
+        floor_values = [
+            {
+                "width": asset.width,
+                "height": asset.height,
+                "bit_rate": 0,
+            },
+            *quality_values,
+        ]
+        highest_floor = max(
+            floor_values,
+            key=self._douyin_probe_quality_key,
+        )
+        verification_asset = RemoteAsset(
+            candidates=list(asset.candidates),
+            index=asset.index,
+            width=int(highest_floor.get("width") or asset.width or 0) or None,
+            height=int(highest_floor.get("height") or asset.height or 0) or None,
+            format_id=(
+                "douyin-highest-live-photo-saved-"
+                f"{int(highest_floor.get('width') or asset.width or 0)}x"
+                f"{int(highest_floor.get('height') or asset.height or 0)}"
+            ),
+            video_uri=asset.video_uri,
+            duration=asset.duration,
+            quality_candidates=asset.quality_candidates,
+        )
+        for value in item.output_paths:
+            if should_cancel():
+                raise DownloadCancelledError("Task cancelled")
+            candidate = Path(value)
+            try:
+                if candidate.is_symlink() or not candidate.is_file():
+                    continue
+                resolved = candidate.resolve(strict=True)
+                if resolved.parent != output_dir or not expected_suffix.search(
+                    resolved.name
+                ):
+                    continue
+                chosen = self._verify_local_video_asset(
+                    resolved,
+                    verification_asset,
+                    should_cancel=should_cancel,
+                    require_quality_fingerprint=False,
+                )
+                size = resolved.stat().st_size
+            except DownloadCancelledError:
+                raise
+            except (OSError, MediaDownloadError):
+                continue
+            return (
+                resolved,
+                RemoteAsset(
+                    candidates=list(chosen.candidates),
+                    index=chosen.index,
+                    width=chosen.width,
+                    height=chosen.height,
+                    size=size,
+                    format_id=chosen.format_id,
+                    video_uri=chosen.video_uri,
+                    duration=chosen.duration,
+                    bit_rate=chosen.bit_rate,
+                    quality_candidates=chosen.quality_candidates,
+                    video_codec=chosen.video_codec,
+                    audio_codec=chosen.audio_codec,
                 ),
             )
         return None
@@ -4649,6 +5321,98 @@ class MediaDownloader:
             )
         return outcome
 
+    def _reuse_verified_douyin_probe_file(
+        self,
+        probe_path: Path,
+        asset: RemoteAsset,
+        output_dir: Path,
+        upload_date: str | None,
+        title: str,
+        media_id: str,
+        *,
+        callback: EventCallback | None,
+        should_cancel: CancelCallback,
+        asset_index: int | None,
+        progress_index: int | None,
+        progress_count: int | None,
+    ) -> tuple[Path, RemoteAsset]:
+        if should_cancel():
+            raise DownloadCancelledError("Task cancelled")
+        try:
+            file_size = probe_path.stat().st_size
+        except OSError as exc:
+            raise MediaDownloadError(
+                "The verified Douyin probe file could not be read"
+            ) from exc
+        path = self._xhs_output_path(
+            output_dir,
+            upload_date,
+            title,
+            media_id,
+            "mp4",
+            asset_index,
+        )
+
+        def progress_percent(completed: bool) -> float:
+            fraction = 1.0 if completed else 0.0
+            if (
+                progress_index is not None
+                and progress_count is not None
+                and 0 < progress_index <= progress_count
+            ):
+                return min(
+                    100.0,
+                    ((progress_index - 1) + fraction) * 100.0 / progress_count,
+                )
+            return fraction * 100.0
+
+        if callback:
+            callback(
+                EngineEvent(
+                    event="downloading",
+                    progress=TransferProgress(
+                        downloaded_bytes=0,
+                        total_bytes=file_size,
+                        percent=progress_percent(False),
+                        fragment_index=progress_index,
+                        fragment_count=progress_count,
+                        filename=str(path),
+                    ),
+                )
+            )
+        started_at = time.monotonic()
+        try:
+            chosen = self._verify_local_video_asset(
+                probe_path,
+                asset,
+                should_cancel=should_cancel,
+                require_quality_fingerprint=True,
+            )
+            if should_cancel():
+                raise DownloadCancelledError("Task cancelled")
+            os.replace(probe_path, path)
+        except BaseException:
+            probe_path.unlink(missing_ok=True)
+            raise
+        if callback:
+            elapsed = max(time.monotonic() - started_at, 0.001)
+            callback(
+                EngineEvent(
+                    event="downloading",
+                    progress=TransferProgress(
+                        downloaded_bytes=file_size,
+                        total_bytes=file_size,
+                        percent=progress_percent(True),
+                        speed_bytes_per_second=file_size / elapsed,
+                        eta_seconds=0.0,
+                        fragment_index=progress_index,
+                        fragment_count=progress_count,
+                        filename=str(path),
+                    ),
+                )
+            )
+        return path.resolve(), chosen
+
     def _download_first_available_asset(
         self,
         ydl: YoutubeDL,
@@ -4669,12 +5433,14 @@ class MediaDownloader:
         verify_declared_dimensions: bool = False,
         require_quality_fingerprint: bool = False,
         _douyin_transfer_attempt: int = 1,
+        _douyin_transfer_budget: _DouyinNoProgressBudget | None = None,
     ) -> tuple[Path, RemoteAsset]:
         errors: list[str] = []
         douyin_transient_errors: list[str] = []
         douyin_redirect_errors: list[TemporaryAccessError] = []
         is_xiaohongshu_source = platform == Platform.XIAOHONGSHU
         is_douyin_source = platform == Platform.DOUYIN
+        transfer_budget = _douyin_transfer_budget
         for asset in assets:
             allow_verified_douyin_redirect = bool(
                 is_douyin_source
@@ -4696,11 +5462,64 @@ class MediaDownloader:
                     MediaType.VIDEO,
                 )
             )
-            for candidate_index, candidate in enumerate(asset.candidates, start=1):
+            if allow_verified_douyin_redirect:
+                probe_path = self._take_douyin_probe_file(asset)
+                if probe_path is not None:
+                    try:
+                        return self._reuse_verified_douyin_probe_file(
+                            probe_path,
+                            asset,
+                            output_dir,
+                            upload_date,
+                            title,
+                            media_id,
+                            callback=callback,
+                            should_cancel=should_cancel,
+                            asset_index=asset_index,
+                            progress_index=progress_index,
+                            progress_count=progress_count,
+                        )
+                    except DownloadCancelledError:
+                        raise
+                    except Exception as exc:
+                        errors.append(
+                            "Verified probe file: "
+                            f"{safe_external_error_message(exc)}"
+                        )
+            candidates = (
+                self._bounded_douyin_transfer_candidates(
+                    [
+                        *(
+                            [asset.redirect_source_url]
+                            if asset.redirect_source_url
+                            else []
+                        ),
+                        *asset.candidates,
+                    ]
+                )
+                if is_douyin_source
+                else asset.candidates
+            )
+            for candidate_index, candidate in enumerate(candidates, start=1):
                 if should_cancel():
                     raise DownloadCancelledError("Task cancelled")
                 response = None
                 try:
+                    if is_douyin_source:
+                        if transfer_budget is None:
+                            transfer_budget = _DouyinNoProgressBudget(
+                                DOUYIN_TRANSFER_IDLE_TIMEOUT_SECONDS,
+                                "media transfer",
+                            )
+                        request_timeout = transfer_budget.request_timeout(
+                            max(
+                                0.1,
+                                min(
+                                    float(self.config.socket_timeout_seconds),
+                                    DOUYIN_TRANSFER_HTTP_TIMEOUT_SECONDS,
+                                ),
+                            )
+                        )
                     if is_xiaohongshu_source and not (
                         is_trusted_xiaohongshu_asset_url(candidate)
                     ):
@@ -4735,6 +5554,11 @@ class MediaDownloader:
                     media_request = Request(
                         candidate,
                         headers=request_headers,
+                        extensions=(
+                            {"timeout": request_timeout}
+                            if is_douyin_source
+                            else {}
+                        ),
                     )
                     if is_douyin_source:
                         try:
@@ -4825,11 +5649,35 @@ class MediaDownloader:
                             "Media server returned a text or metadata response "
                             "instead of a media file"
                         )
-                    first_chunk = response.read(1024 * 1024)
+                    transfer_started_at = time.monotonic()
+                    last_transfer_report_at = 0.0
+                    if callback and is_douyin_source:
+                        callback(
+                            EngineEvent(
+                                event="downloading",
+                                progress=TransferProgress(
+                                    filename="Starting Douyin original media transfer",
+                                ),
+                            )
+                        )
+                    stream_chunk_size = (
+                        DOUYIN_STREAM_CHUNK_BYTES
+                        if is_douyin_source
+                        else 1024 * 1024
+                    )
+                    first_chunk = (
+                        self._read_douyin_stream_chunk(response, stream_chunk_size)
+                        if is_douyin_source
+                        else response.read(stream_chunk_size)
+                    )
                     if not first_chunk:
+                        if transfer_budget is not None:
+                            transfer_budget.remaining()
                         raise MediaDownloadError(
                             "Media server returned an empty response"
                         )
+                    if transfer_budget is not None:
+                        transfer_budget.refresh()
                     chosen = asset
                     if verify_declared_dimensions and media_type == MediaType.IMAGE:
                         actual_dimensions = self._image_dimensions(first_chunk)
@@ -4898,46 +5746,70 @@ class MediaDownloader:
                         dir=path.parent,
                     )
                     temporary = Path(temporary_name)
+
+                    def emit_transfer_progress(*, force: bool = False) -> None:
+                        nonlocal last_transfer_report_at
+                        if not callback:
+                            return
+                        now = time.monotonic()
+                        if (
+                            is_douyin_source
+                            and not force
+                            and now - last_transfer_report_at
+                            < DOUYIN_PROGRESS_INTERVAL_SECONDS
+                        ):
+                            return
+                        elapsed = max(now - transfer_started_at, 0.001)
+                        speed = downloaded / elapsed if downloaded else None
+                        eta = (
+                            max(0.0, (total - downloaded) / speed)
+                            if total is not None
+                            and speed is not None
+                            and speed > 0
+                            else None
+                        )
+                        callback(
+                            EngineEvent(
+                                event="downloading",
+                                progress=TransferProgress(
+                                    downloaded_bytes=downloaded,
+                                    total_bytes=total,
+                                    percent=progress_percent(),
+                                    speed_bytes_per_second=speed,
+                                    eta_seconds=eta,
+                                    fragment_index=progress_index,
+                                    fragment_count=progress_count,
+                                    filename=str(path),
+                                ),
+                            )
+                        )
+                        last_transfer_report_at = now
+
                     try:
                         with os.fdopen(temporary_fd, "wb") as handle:
                             temporary_fd = -1
                             handle.write(first_chunk)
-                            if callback:
-                                callback(
-                                    EngineEvent(
-                                        event="downloading",
-                                        progress=TransferProgress(
-                                            downloaded_bytes=downloaded,
-                                            total_bytes=total,
-                                            percent=progress_percent(),
-                                            fragment_index=progress_index,
-                                            fragment_count=progress_count,
-                                            filename=str(path),
-                                        ),
-                                    )
-                                )
+                            emit_transfer_progress(force=True)
                             while True:
                                 if should_cancel():
                                     raise DownloadCancelledError("Task cancelled")
-                                chunk = response.read(1024 * 1024)
+                                chunk = (
+                                    self._read_douyin_stream_chunk(
+                                        response,
+                                        stream_chunk_size,
+                                    )
+                                    if is_douyin_source
+                                    else response.read(stream_chunk_size)
+                                )
                                 if not chunk:
+                                    if transfer_budget is not None:
+                                        transfer_budget.remaining()
                                     break
                                 handle.write(chunk)
                                 downloaded += len(chunk)
-                                if callback:
-                                    callback(
-                                        EngineEvent(
-                                            event="downloading",
-                                            progress=TransferProgress(
-                                                downloaded_bytes=downloaded,
-                                                total_bytes=total,
-                                                percent=progress_percent(),
-                                                fragment_index=progress_index,
-                                                fragment_count=progress_count,
-                                                filename=str(path),
-                                            ),
-                                        )
-                                    )
+                                if transfer_budget is not None:
+                                    transfer_budget.refresh()
+                                emit_transfer_progress()
                             if total is not None and downloaded != total:
                                 raise MediaDownloadError(
                                     f"Incomplete media response: expected {total} bytes, "
@@ -4969,25 +5841,9 @@ class MediaDownloader:
                                 os.close(temporary_fd)
                         temporary.unlink(missing_ok=True)
                         raise
-                    if callback:
-                        callback(
-                            EngineEvent(
-                                event="downloading",
-                                progress=TransferProgress(
-                                    downloaded_bytes=downloaded,
-                                    total_bytes=total or downloaded,
-                                    percent=(
-                                        progress_index * 100.0 / progress_count
-                                        if progress_index is not None
-                                        and progress_count
-                                        else 100.0
-                                    ),
-                                    fragment_index=progress_index,
-                                    fragment_count=progress_count,
-                                    filename=str(path),
-                                ),
-                            )
-                        )
+                    if total is None:
+                        total = downloaded
+                    emit_transfer_progress(force=True)
                     return path.resolve(), chosen
                 except DownloadCancelledError:
                     raise
@@ -5005,6 +5861,8 @@ class MediaDownloader:
                     raise
                 except Exception as exc:
                     self._close_douyin_probe_error(exc)
+                    if is_douyin_source and transfer_budget is not None:
+                        transfer_budget.remaining()
                     if is_douyin_source and self._is_retryable_douyin_transfer_error(
                         exc
                     ):
@@ -5035,11 +5893,17 @@ class MediaDownloader:
                         )
                     )
                 try:
-                    self._wait_for_douyin_probe_retry(
-                        DOUYIN_PROBE_RETRY_BASE_SECONDS
-                        * (2 ** (_douyin_transfer_attempt - 1)),
-                        should_cancel,
+                    retry_delay = DOUYIN_PROBE_RETRY_BASE_SECONDS * (
+                        2 ** (_douyin_transfer_attempt - 1)
                     )
+                    if transfer_budget is not None:
+                        retry_delay = min(
+                            retry_delay,
+                            transfer_budget.remaining(),
+                        )
+                    self._wait_for_douyin_probe_retry(retry_delay, should_cancel)
+                    if transfer_budget is not None:
+                        transfer_budget.remaining()
                 except DownloadCancelled as exc:
                     raise DownloadCancelledError("Task cancelled") from exc
                 return self._download_first_available_asset(
@@ -5060,6 +5924,7 @@ class MediaDownloader:
                     verify_declared_dimensions=verify_declared_dimensions,
                     require_quality_fingerprint=require_quality_fingerprint,
                     _douyin_transfer_attempt=_douyin_transfer_attempt + 1,
+                    _douyin_transfer_budget=transfer_budget,
                 )
             if douyin_redirect_errors:
                 raise douyin_redirect_errors[-1]

@@ -31,6 +31,7 @@ from .douyin import (
     is_complete_profile_media_metadata,
     quality_floor_dimensions,
 )
+from .douyin_signing import new_signed_discovery_budget
 from .errors import (
     AuthenticationRequiredError,
     DiscoveryError,
@@ -50,6 +51,7 @@ from .models import (
     MediaType,
     Platform,
     SourceKind,
+    TransferProgress,
     utc_now,
 )
 from .platforms import identify_url
@@ -616,6 +618,12 @@ class DownloadManager:
                 job.discovery_complete = False
                 job.finished_at = now
                 changed = True
+            if (
+                job.activity_message is not None
+                or job.activity_started_at is not None
+            ):
+                self._clear_activity_locked(job)
+                changed = True
             changed |= self._sanitize_persisted_errors(job)
             if changed:
                 job.refresh_counts()
@@ -746,6 +754,7 @@ class DownloadManager:
             }:
                 return job.model_copy(deep=True)
             job.cancel_requested = True
+            self._clear_activity_locked(job)
             job.updated_at = utc_now()
             event = self._cancel_events.setdefault(job_id, threading.Event())
             event.set()
@@ -941,6 +950,7 @@ class DownloadManager:
         self._cancel_events[job.id] = cancel_event
         job.cancel_requested = False
         job.status = JobStatus.QUEUED
+        self._clear_activity_locked(job)
         job.error = None
         job.auth_message = None
         job.verification_url = None
@@ -986,11 +996,17 @@ class DownloadManager:
                 job.status = (
                     JobStatus.DISCOVERING if rediscover else JobStatus.DOWNLOADING
                 )
+                if rediscover:
+                    job.activity_message = "Starting media discovery"
+                    job.activity_started_at = utc_now()
+                else:
+                    self._clear_activity_locked(job)
                 self._commit_locked(job)
             self._notify(self.get_job(job_id), "started")
 
             engine = self._engine_for_job(self.get_job(job_id))
             if rediscover:
+                self._attach_discovery_callback(engine, job_id, cancel_event)
                 job_snapshot = self.get_job(job_id)
                 result = engine.discover(
                     job_snapshot.source_url,
@@ -1070,6 +1086,7 @@ class DownloadManager:
                     job.discovery_complete = result.discovery_complete
                     job.warning = result.warning
                     job.status = JobStatus.DOWNLOADING
+                    self._clear_activity_locked(job)
                     job.refresh_counts()
                     if requested_item_ids is None:
                         target_items = [
@@ -1335,6 +1352,7 @@ class DownloadManager:
                     self._mark_cancelled_locked(job)
                 else:
                     job.status = JobStatus.FAILED
+                    self._clear_activity_locked(job)
                     job.error = safe_message
                     job.auth_message = None
                     job.verification_url = None
@@ -1362,6 +1380,7 @@ class DownloadManager:
                 else:
                     safe_message = safe_external_error_message(exc)
                     job.status = JobStatus.NEEDS_AUTH
+                    self._clear_activity_locked(job)
                     job.error = safe_message
                     job.auth_message = safe_message
                     job.verification_url = self._verification_url(
@@ -1385,6 +1404,7 @@ class DownloadManager:
             with self._lock:
                 job = self._require_job(job_id)
                 job.status = JobStatus.FAILED
+                self._clear_activity_locked(job)
                 job.error = safe_message
                 job.auth_message = None
                 job.verification_url = None
@@ -1452,6 +1472,15 @@ class DownloadManager:
                     "Douyin automatic item refresh could not verify the previous "
                     "quality floor"
                 )
+
+            def report_refresh_status(message: str) -> None:
+                self._on_engine_event(
+                    job_id,
+                    item_id,
+                    EngineEvent(event="probing", message=message),
+                )
+
+            refresh_progress_budget = new_signed_discovery_budget()
             try:
                 refreshed_metadata = discover_item_metadata_from_profile(
                     profile_id,
@@ -1459,6 +1488,8 @@ class DownloadManager:
                     cookie_profile=engine.config.cookie_profile,
                     prefer_exact_detail=True,
                     should_cancel=cancel_event.is_set,
+                    status_callback=report_refresh_status,
+                    progress_budget=refresh_progress_budget,
                 )
                 if (
                     refreshed_metadata
@@ -1477,6 +1508,8 @@ class DownloadManager:
                         current_media_id,
                         cookie_profile=engine.config.cookie_profile,
                         should_cancel=cancel_event.is_set,
+                        status_callback=report_refresh_status,
+                        progress_budget=refresh_progress_budget,
                     )
             except (
                 AuthenticationRequiredError,
@@ -1829,7 +1862,9 @@ class DownloadManager:
         with self._lock:
             job = self._require_job(job_id)
             item = self._find_item(job, item_id)
-            if event.progress:
+            if event.event == "probing":
+                item.progress = event.progress or TransferProgress()
+            elif event.progress:
                 item.progress = event.progress
             if event.title:
                 item.title = event.title
@@ -1896,10 +1931,62 @@ class DownloadManager:
             except Exception:
                 continue
 
+    def _attach_discovery_callback(
+        self,
+        engine: Any,
+        job_id: str,
+        cancel_event: threading.Event,
+    ) -> None:
+        try:
+            if not hasattr(engine, "discovery_callback"):
+                return
+            engine.discovery_callback = lambda event: self._on_discovery_event(
+                job_id,
+                event,
+                cancel_event,
+            )
+        except (AttributeError, TypeError):
+            return
+
+    def _on_discovery_event(
+        self,
+        job_id: str,
+        event: EngineEvent,
+        cancel_event: threading.Event,
+    ) -> None:
+        if event.event != "probing" or not event.message:
+            return
+        message = safe_external_error_message(event.message)
+        if not message:
+            return
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if (
+                job is None
+                or self._cancel_events.get(job_id) is not cancel_event
+                or cancel_event.is_set()
+                or job.cancel_requested
+                or job.status != JobStatus.DISCOVERING
+            ):
+                return
+            if job.activity_message != message or job.activity_started_at is None:
+                job.activity_started_at = utc_now()
+            job.activity_message = message
+            job.refresh_counts()
+            job.updated_at = utc_now()
+            job.revision += 1
+            now = time.monotonic()
+            if now - self._last_progress_save.get(job_id, 0.0) >= 1.0:
+                self.store.save(job)
+                self._last_progress_save[job_id] = now
+            snapshot = job.model_copy(deep=True)
+        self._notify(snapshot, "activity")
+
     def _finish_job(self, job_id: str) -> None:
         with self._lock:
             job = self._require_job(job_id)
             job.active_item_id = None
+            self._clear_activity_locked(job)
             job.cancel_requested = False
             job.refresh_counts()
             if (
@@ -1932,6 +2019,7 @@ class DownloadManager:
     def _mark_cancelled_locked(job: DownloadJob) -> None:
         now = utc_now()
         job.status = JobStatus.CANCELLED
+        DownloadManager._clear_activity_locked(job)
         job.error = "Cancelled by user"
         job.auth_message = None
         job.verification_url = None
@@ -1950,6 +2038,11 @@ class DownloadManager:
                 item.auth_message = None
                 item.updated_at = now
         job.refresh_counts()
+
+    @staticmethod
+    def _clear_activity_locked(job: DownloadJob) -> None:
+        job.activity_message = None
+        job.activity_started_at = None
 
     def _engine_for_job(self, job: DownloadJob) -> MediaDownloader:
         config = replace(

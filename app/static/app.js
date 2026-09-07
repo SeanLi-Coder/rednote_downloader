@@ -174,6 +174,44 @@
     return [];
   }
 
+  function getActiveItem(job) {
+    const items = getItems(job);
+    const activeId = job?.active_item_id;
+    const isActivePhase = (item) => ["preparing", "downloading", "retrying"].includes(canonicalStatus(item));
+    if (activeId !== undefined && activeId !== null) {
+      const matched = items.find((item) => {
+        const itemId = firstDefined(item?.id, item?.item_id, item?.media_id);
+        return String(itemId) === String(activeId);
+      });
+      if (matched && isActivePhase(matched)) return matched;
+    }
+    return items.find(isActivePhase);
+  }
+
+  function isDouyinProbeProgress(item) {
+    const message = asText(item?.progress?.filename).trim();
+    return (
+      message.startsWith("Checking Douyin ")
+      || message.startsWith("Reading Douyin quality candidate ")
+      || message.startsWith("Reading the Douyin original file to verify quality")
+      || message.startsWith("Waiting for another Douyin quality check")
+      || message.startsWith("Retrying Douyin quality ")
+      || message.startsWith("Preparing Douyin signed ")
+      || message.startsWith("Retrying Douyin signed ")
+      || message.startsWith("Fetching Douyin signed ")
+      || message === "Fetching Douyin signing HTML"
+      || message === "Loading Douyin Chrome cookies"
+      || message === "Starting the Douyin signing browser"
+      || message === "Starting the Douyin signing session"
+      || message === "Waiting for the Douyin signed request slot"
+      || message.startsWith("Starting bounded Douyin browser profile fallback")
+      || message === "Launching Douyin browser fallback"
+      || message === "Opening the Douyin profile in the bounded browser fallback"
+      || message.startsWith("Scanning Douyin browser fallback ")
+      || message.startsWith("Douyin browser fallback added ")
+    );
+  }
+
   function getCounts(job) {
     const items = getItems(job);
     const stats = job?.stats || job?.statistics || {};
@@ -298,7 +336,12 @@
     if (isJob) {
       const counts = getCounts(entity);
       if (counts.total && counts.total > 0) {
-        return Math.min(100, ((counts.success + counts.failed) / counts.total) * 100);
+        const processed = Math.min(counts.total, counts.success + counts.failed);
+        const activeItem = getActiveItem(entity);
+        const activeContribution = activeItem && !isDouyinProbeProgress(activeItem)
+          ? getProgress(activeItem) / 100
+          : 0;
+        return Math.min(100, ((processed + activeContribution) / counts.total) * 100);
       }
     }
     return 0;
@@ -315,7 +358,7 @@
   }
 
   function formatSpeed(job) {
-    const activeItem = getItems(job).find((item) => isRunning(item));
+    const activeItem = getActiveItem(job);
     const value = firstDefined(
       job?.speed,
       job?.download_speed,
@@ -344,7 +387,7 @@
   }
 
   function formatEta(job) {
-    const activeItem = getItems(job).find((item) => isRunning(item));
+    const activeItem = getActiveItem(job);
     return formatDuration(firstDefined(
       job?.eta,
       job?.eta_seconds,
@@ -670,6 +713,12 @@
 
   function localizeRuntimeMessage(value, job = null) {
     let text = asText(value);
+    if (text.includes("Douyin quality verification made no media progress for 120 seconds")) {
+      return "抖音最高画质校验已在连续 120 秒没有收到新的媒体字节或有效探测结果后自动停止。任务没有假死，也没有改下低清版本；此前已完成的文件会保留，请稍等后点击继续任务。";
+    }
+    if (text.includes("Douyin media transfer made no media progress for 120 seconds")) {
+      return "抖音原文件传输已在连续 120 秒没有收到任何新字节后自动停止。任务没有假死；此前已完成的文件会保留，请稍等后点击继续任务。";
+    }
     if (text.includes("Refreshing this Douyin item from the original task link")) {
       return "检测到抖音媒体路由异常，正在从原任务链接只刷新当前作品并自动重试……";
     }
@@ -720,6 +769,9 @@
     ) {
       return "抖音主页本次临时没有返回完整、可验证的作品信息。程序没有生成数字占位项，也没有下载低清文件；请稍等一两分钟后直接重试，这种临时响应不需要打开 Chrome 验证。";
     }
+    if (text.includes("Douyin profile discovery stopped after 120 seconds without new verified profile media")) {
+      return "抖音主页解析已在连续 120 秒没有发现新的、可验证作品后自动停止。任务没有假死，也没有把空响应或其他作者的内容当成完成结果；请稍等一两分钟后从原主页继续，不需要打开 Chrome 验证。";
+    }
     if (text.includes("Douyin stopped returning new videos before the profile reported completion") || text.includes("Douyin reached the discovery safety limit before confirming the end of the profile")) {
       return "抖音主页在确认列表结束前停止返回新作品。当前结果可能不完整，请稍后点击继续发现；已有成功记录不会重复下载。";
     }
@@ -732,8 +784,15 @@
     if (text.includes("Douyin requires current Chrome cookies or an explicit verification")) {
       return `抖音明确要求最新 Chrome Cookie、登录或验证码。请在 Chrome 打开${verificationTarget(job)}完成验证后再重试。`;
     }
+    if (text.includes("Douyin signed discovery stopped after 120 seconds without verified progress")) {
+      const reason = text.match(/Reason category:\s*([a-z0-9-]+)/i)?.[1];
+      const detail = douyinSignedReasonLabel(reason);
+      return `抖音解析已在 120 秒无有效进展后自动停止${detail ? `（${detail}）` : ""}。任务没有假死，也没有下载低清或串号文件；请稍等一两分钟后从原链接重试，不需要打开 Chrome 验证。`;
+    }
     if (text.includes("Douyin temporarily limited the verified author-feed request") || text.includes("Douyin temporarily limited a signed request")) {
-      return "抖音作者接口正在短时限流，程序已自动退避重试，仍未恢复。请等待一两分钟后重试；程序没有改下低清版本，也不需要先打开作者主页验证。";
+      const reason = text.match(/Reason category:\s*([a-z0-9-]+)/i)?.[1];
+      const detail = douyinSignedReasonLabel(reason);
+      return `抖音作者接口正在短时限流或临时拒绝请求${detail ? `（${detail}）` : ""}，程序自动退避重试后仍未恢复。请等待一两分钟后重试；程序没有改下低清版本，也不需要先打开作者主页验证。`;
     }
     if (text.includes("Douyin automatic item refresh was skipped because Chrome Cookie is disabled")) {
       return "检测到抖音媒体路由异常，但这个任务已关闭 Chrome Cookie，程序遵守该设置，没有读取 Chrome Cookie，也没有复用旧媒体地址。请开启 Chrome Cookie 后继续任务，以便只刷新当前作品。";
@@ -1130,15 +1189,30 @@
     }
     if (status === "needs_auth") return "等待验证，完成后即可继续";
     if (status === "cancelled") return "任务已取消，已下载文件会保留";
+    const discoveryActivity = discoveryActivityDescription(job);
+    if (discoveryActivity) return discoveryActivity;
     const current = firstDefined(job?.current_item, job?.current_title, job?.message, job?.detail);
     if (typeof current === "string" && current.trim()) return current;
-    const activeItem = getItems(job).find((item) => {
-      const itemId = firstDefined(item?.id, item?.item_id, item?.media_id);
-      return job?.active_item_id ? String(itemId) === String(job.active_item_id) : isRunning(item);
-    });
+    const activeItem = getActiveItem(job);
     if (activeItem) {
       const phaseMessage = activeItem?.progress?.filename;
       if (typeof phaseMessage === "string") {
+        const qualityWaitMatch = phaseMessage.match(
+          /^Waiting for another Douyin quality check \((\d+)s\)$/
+        );
+        if (qualityWaitMatch) {
+          return `正在等待前一个抖音画质校验完成（已等待 ${qualityWaitMatch[1]} 秒）`;
+        }
+        const originalReadMatch = phaseMessage.match(
+          /^Reading the Douyin original file to verify quality \(([^)]+)\)$/
+        );
+        if (originalReadMatch) {
+          const ratio = originalReadMatch[1] === "default" ? "原始档" : originalReadMatch[1];
+          return `正在读取抖音原文件以完成画质校验（${ratio}）`;
+        }
+        if (phaseMessage.startsWith("Starting Douyin original media transfer")) {
+          return "正在开始传输抖音原文件";
+        }
         const retryMatch = phaseMessage.match(
           /^Retrying Douyin quality (\S+) after a temporary network error \((\d+\/\d+)\)$/
         );
@@ -1151,6 +1225,24 @@
         );
         if (transferRetryMatch) {
           return `抖音原文件传输遇到临时网络错误，正在重试（${transferRetryMatch[1]}）`;
+        }
+        const mediaCandidateMatch = phaseMessage.match(
+          /^Checking Douyin media candidate (\d+)\/(\d+) \(([^)]+)\)$/
+        );
+        if (mediaCandidateMatch) {
+          const ratio = mediaCandidateMatch[3] === "default"
+            ? "原始档"
+            : mediaCandidateMatch[3];
+          return `正在检测抖音媒体候选 ${mediaCandidateMatch[1]}/${mediaCandidateMatch[2]}（${ratio}）`;
+        }
+        const qualityCandidateReadMatch = phaseMessage.match(
+          /^Reading Douyin quality candidate (\d+)\/(\d+) \(([^)]+)\)$/
+        );
+        if (qualityCandidateReadMatch) {
+          const ratio = qualityCandidateReadMatch[3] === "default"
+            ? "原始档"
+            : qualityCandidateReadMatch[3];
+          return `正在读取抖音画质候选 ${qualityCandidateReadMatch[1]}/${qualityCandidateReadMatch[2]}（${ratio}）`;
         }
         const phasePrefixes = [
           ["Checking Douyin Live Photo quality", "正在检测抖音 Live Photo 最高画质"],
@@ -1165,6 +1257,9 @@
             .replace(": default", ": 原始档")
             .replaceAll("x", "×");
         }
+        if (isDouyinProbeProgress(activeItem)) {
+          return localizeDiscoveryActivity(phaseMessage, job);
+        }
       }
       const index = Math.max(0, getItems(job).indexOf(activeItem));
       return `正在处理：${itemTitle(activeItem, index)}`;
@@ -1174,6 +1269,151 @@
     }
     if (status === "completed") return "所有作品处理完成";
     return "正在解析主页内容…";
+  }
+
+  function localizeDiscoveryActivity(value, job) {
+    const message = asText(value).trim();
+    const platform = platformMeta(job).label;
+    const target = isProfileJob(job) ? `${platform}主页` : `${platform}作品`;
+    if (!message || message === "Starting media discovery") {
+      return `正在准备解析${target}`;
+    }
+
+    const browserStart = message.match(
+      /^Starting bounded Douyin browser profile fallback \(reason: ([a-z0-9-]+); (\d+)s remaining\)$/i
+    );
+    if (browserStart) {
+      const reasonLabels = {
+        "direct-browser-mode": "直接浏览器模式",
+        "authentication-confirmation": "正在确认是否确实需要验证",
+        "signed-integrity": "签名响应未通过完整性校验"
+      };
+      const reason = reasonLabels[browserStart[1]] || "签名接口暂不可用";
+      return `正在切换到有时限的抖音主页浏览器解析（${reason}，剩余 ${browserStart[2]} 秒）`;
+    }
+    if (message === "Launching Douyin browser fallback") {
+      return "正在启动抖音主页浏览器解析";
+    }
+    if (message === "Opening the Douyin profile in the bounded browser fallback") {
+      return "正在浏览器中打开原抖音主页";
+    }
+    const browserScan = message.match(
+      /^Scanning Douyin browser fallback round (\d+)\/(\d+) \((\d+) verified item\(s\); (\d+)s remaining\)$/
+    );
+    if (browserScan) {
+      return `正在滚动读取抖音主页（第 ${browserScan[1]}/${browserScan[2]} 轮，已验证 ${browserScan[3]} 个作品，剩余 ${browserScan[4]} 秒）`;
+    }
+    const browserAdded = message.match(
+      /^Douyin browser fallback added (\d+) verified item\(s\) \((\d+) total; (\d+)s remaining\)$/
+    );
+    if (browserAdded) {
+      return `浏览器解析新增 ${browserAdded[1]} 个抖音作品（共 ${browserAdded[2]} 个，剩余 ${browserAdded[3]} 秒）`;
+    }
+
+    const profileRetry = message.match(
+      /^Retrying Douyin signed profile page (\d+)\/(\d+) request (\d+)\/(\d+)(?: \(reason: ([a-z0-9-]+)\))?$/i
+    );
+    if (profileRetry) {
+      const reason = douyinSignedReasonLabel(profileRetry[5]);
+      return `抖音主页第 ${profileRetry[1]} 页请求暂时失败${reason ? `（${reason}）` : ""}，正在重试（${profileRetry[3]}/${profileRetry[4]}）`;
+    }
+    const profilePage = message.match(
+      /^Fetching Douyin signed profile page (\d+)\/(\d+)$/
+    );
+    if (profilePage) return `正在读取抖音主页第 ${profilePage[1]} 页作品`;
+    const verifiedPage = message.match(
+      /^Verified Douyin signed profile page (\d+) \((\d+) items\)$/
+    );
+    if (verifiedPage) {
+      return `已验证抖音主页第 ${verifiedPage[1]} 页（${verifiedPage[2]} 个作品）`;
+    }
+    const profileSession = message.match(
+      /^Preparing Douyin signed profile session (\d+)\/(\d+)$/
+    );
+    if (profileSession) {
+      return `正在准备抖音主页签名会话（${profileSession[1]}/${profileSession[2]}）`;
+    }
+    const profileResume = message.match(
+      /^Resuming Douyin signed profile at page (\d+)\/(\d+) \((\d+) verified items\)$/
+    );
+    if (profileResume) {
+      return `正在从抖音主页第 ${profileResume[1]} 页续跑（已验证 ${profileResume[3]} 个作品）`;
+    }
+    const detailRetry = message.match(
+      /^Retrying Douyin signed detail request (\d+)\/(\d+)(?: \(reason: ([a-z0-9-]+)\))?$/i
+    );
+    if (detailRetry) {
+      const reason = douyinSignedReasonLabel(detailRetry[3]);
+      return `抖音作品详情请求暂时失败${reason ? `（${reason}）` : ""}，正在重试（${detailRetry[1]}/${detailRetry[2]}）`;
+    }
+    const detailSession = message.match(
+      /^Preparing Douyin signed detail session (\d+)\/(\d+)$/
+    );
+    if (detailSession) {
+      return `正在准备抖音作品签名会话（${detailSession[1]}/${detailSession[2]}）`;
+    }
+    if (message === "Fetching Douyin signed detail") return "正在读取抖音作品详情";
+    if (message === "Fetching Douyin signing HTML") return "正在读取抖音签名页面";
+    if (message === "Waiting for the Douyin signed request slot") return "正在等待抖音签名请求通道";
+    if (message === "Loading Douyin Chrome cookies") return "正在读取 Chrome 中的抖音登录状态";
+    if (message === "Starting the Douyin signing browser") return "正在启动抖音签名浏览器";
+    if (message === "Starting the Douyin signing session") return "正在建立抖音签名会话";
+    const freshProfileSession = message.match(
+      /^Retrying Douyin signed profile with a fresh signing session(?: \(reason: ([a-z0-9-]+)\))?$/i
+    );
+    if (freshProfileSession) {
+      const reason = douyinSignedReasonLabel(freshProfileSession[1]);
+      return `抖音主页签名会话暂时失败${reason ? `（${reason}）` : ""}，正在重新建立`;
+    }
+    const freshDetailSession = message.match(
+      /^Retrying Douyin signed detail with a fresh signing session(?: \(reason: ([a-z0-9-]+)\))?$/i
+    );
+    if (freshDetailSession) {
+      const reason = douyinSignedReasonLabel(freshDetailSession[1]);
+      return `抖音作品签名会话暂时失败${reason ? `（${reason}）` : ""}，正在重新建立`;
+    }
+
+    const retryCount = message.match(/\((\d+\s*\/\s*\d+)\)/)?.[1]?.replaceAll(" ", "");
+    if (/retry|rate.?limit|temporary/i.test(message)) {
+      const suffix = retryCount ? `（${retryCount}）` : "";
+      return `${target}接口暂时繁忙，正在自动重试${suffix}`;
+    }
+
+    const page = message.match(/(?:page|batch)\s*(\d+)/i)?.[1];
+    if (page) return `正在读取${target}第 ${page} 页内容`;
+    if (/scroll/i.test(message)) return `正在滚动加载${target}`;
+    if (/browser|playwright|chrome/i.test(message)) return `正在通过浏览器读取${target}`;
+    if (/signed|signature|author.?feed|api/i.test(message)) return `正在读取${target}列表`;
+    if (/collect|parse|discover|profile|item|media/i.test(message)) return `正在解析${target}`;
+    return `正在解析${target}`;
+  }
+
+  function douyinSignedReasonLabel(value) {
+    const labels = {
+      "http-403": "HTTP 403 临时拒绝",
+      "http-429": "HTTP 429 限流",
+      "http-5xx": "抖音服务器 5xx 异常",
+      "api-status-nonzero": "接口业务状态异常",
+      "api-incomplete": "接口返回不完整",
+      "api-missing-aweme-list": "接口没有返回作品列表",
+      "api-unbound-empty-page": "空终页没有绑定当前作者",
+      "api-incomplete-media": "接口返回的作品媒体信息不完整",
+      "network-timeout": "网络超时",
+      "network-error": "网络连接异常",
+      "signer-timeout": "签名组件超时",
+      "signed-rejected": "签名请求被临时拒绝",
+      "no-progress-timeout": "没有拿到可验证的新结果"
+    };
+    return labels[asText(value).trim().toLowerCase()] || "";
+  }
+
+  function discoveryActivityDescription(job) {
+    if (rawStatus(job) !== "discovering" || !job?.activity_message) return "";
+    const phase = localizeDiscoveryActivity(job.activity_message, job);
+    const startedAt = toDate(job.activity_started_at);
+    if (!startedAt) return phase;
+    const elapsedSeconds = Math.max(0, (Date.now() - startedAt.getTime()) / 1000);
+    return `${phase}（已等待 ${formatDuration(elapsedSeconds)}）`;
   }
 
   function renderItems(job) {
@@ -1642,6 +1882,19 @@
     }
   }
 
+  function refreshActivityClock() {
+    const job = state.selectedJobId ? state.jobs.get(state.selectedJobId) : null;
+    if (
+      !job
+      || rawStatus(job) !== "discovering"
+      || !job.activity_started_at
+      || !elements.progressLabel
+    ) {
+      return;
+    }
+    elements.progressLabel.textContent = progressDescription(job, getCounts(job));
+  }
+
   function bindEvents() {
     elements.downloadForm.addEventListener("submit", createJob);
     elements.settingsForm.addEventListener("submit", saveConfig);
@@ -1677,6 +1930,7 @@
     if (!(await verifyBackendBuild())) return;
     connectEvents();
     await Promise.all([loadConfig(), fetchJobs(true)]);
+    window.setInterval(refreshActivityClock, 1000);
     window.setInterval(poll, 4000);
   }
 

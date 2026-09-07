@@ -170,6 +170,33 @@ def test_douyin_redirect_messages_execute_with_safe_legacy_and_reason_parsing(
             "without verified media-type metadata. Existing files were preserved.",
             "重新识别它是图片还是视频",
         ),
+        (
+            "Douyin signed discovery stopped after 120 seconds without verified "
+            "progress. Retry after a short wait; Chrome verification is not "
+            "required. Reason category: no-progress-timeout.",
+            "120 秒无有效进展后自动停止",
+        ),
+        (
+            "Douyin temporarily limited a signed request after automatic retries. "
+            "Wait a minute or two and retry. Reason category: http-429.",
+            "HTTP 429 限流",
+        ),
+        (
+            "Douyin temporarily limited a signed request after automatic retries. "
+            "Wait a minute or two and retry. Reason category: "
+            "api-unbound-empty-page.",
+            "空终页没有绑定当前作者",
+        ),
+        (
+            "Douyin quality verification made no media progress for 120 seconds. "
+            "The task was paused; completed files were preserved.",
+            "连续 120 秒没有收到新的媒体字节或有效探测结果后自动停止",
+        ),
+        (
+            "Douyin media transfer made no media progress for 120 seconds. "
+            "The task was paused; completed files were preserved.",
+            "连续 120 秒没有收到任何新字节后自动停止",
+        ),
     ]
     harness = (
         "globalThis.window = {};\n"
@@ -389,3 +416,215 @@ def test_nonretryable_failed_item_keeps_visible_error_without_retrying(
     result = json.loads(completed.stdout)
     assert "余下可见作品会继续下载" in result["error"]
     assert result["retryable"] is False
+
+
+def test_discovery_activity_and_active_item_progress_are_visible(
+    tmp_path: Path,
+) -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is unavailable")
+    source = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(
+        encoding="utf-8"
+    )
+    tail = "  initialize();\n})();\n"
+    assert tail in source
+    source = source.replace(
+        tail,
+        "  window.__getCounts = getCounts;\n"
+        "  window.__getProgress = getProgress;\n"
+        "  window.__localizeDiscoveryActivity = localizeDiscoveryActivity;\n"
+        "  window.__localizeRuntimeMessage = localizeRuntimeMessage;\n"
+        "  window.__progressDescription = progressDescription;\n})();\n",
+    )
+    discovery_job = {
+        "id": "discovering-profile",
+        "status": "discovering",
+        "platform": "douyin",
+        "source_kind": "profile",
+        "activity_message": (
+            "Retrying Douyin signed profile page 3/300 request 2/3 "
+            "(reason: http-429)"
+        ),
+        "activity_started_at": "2026-09-07T02:00:00Z",
+        "items": [],
+    }
+    transfer_job = {
+        "id": "active-transfer",
+        "status": "downloading",
+        "platform": "douyin",
+        "total_items": 4,
+        "completed_items": 1,
+        "failed_items": 0,
+        "active_item_id": "current",
+        "items": [
+            {"id": "done", "status": "completed"},
+            {
+                "id": "current",
+                "status": "downloading",
+                "progress": {"percent": 40},
+            },
+            {"id": "queued-1", "status": "queued"},
+            {"id": "queued-2", "status": "queued"},
+        ],
+    }
+    original_read_job = {
+        **transfer_job,
+        "items": [
+            {
+                "id": "current",
+                "status": "downloading",
+                "progress": {
+                    "filename": (
+                        "Reading the Douyin original file to verify quality (2k)"
+                    ),
+                    "percent": 100,
+                },
+            }
+        ],
+    }
+    transfer_start_job = {
+        **transfer_job,
+        "items": [
+            {
+                "id": "current",
+                "status": "downloading",
+                "progress": {
+                    "filename": "Starting Douyin original media transfer"
+                },
+            }
+        ],
+    }
+    quality_wait_job = {
+        **transfer_job,
+        "items": [
+            {
+                "id": "current",
+                "status": "downloading",
+                "progress": {
+                    "filename": "Waiting for another Douyin quality check (12s)"
+                },
+            }
+        ],
+    }
+    media_candidate_job = {
+        **transfer_job,
+        "items": [
+            {
+                "id": "current",
+                "status": "downloading",
+                "progress": {
+                    "filename": "Checking Douyin media candidate 4/24 (2k)",
+                    "percent": 100,
+                },
+            }
+        ],
+    }
+    quality_candidate_read_job = {
+        **transfer_job,
+        "items": [
+            {
+                "id": "current",
+                "status": "downloading",
+                "progress": {
+                    "filename": (
+                        "Reading Douyin quality candidate 4/24 (author-feed-1)"
+                    ),
+                    "percent": 100,
+                },
+            }
+        ],
+    }
+    harness = (
+        "globalThis.window = {};\n"
+        "globalThis.document = {querySelector: () => null};\n"
+        f"const __discoveryJob = {json.dumps(discovery_job)};\n"
+        f"const __transferJob = {json.dumps(transfer_job)};\n"
+        f"const __originalReadJob = {json.dumps(original_read_job)};\n"
+        f"const __transferStartJob = {json.dumps(transfer_start_job)};\n"
+        f"const __qualityWaitJob = {json.dumps(quality_wait_job)};\n"
+        f"const __mediaCandidateJob = {json.dumps(media_candidate_job)};\n"
+        f"const __qualityCandidateReadJob = "
+        f"{json.dumps(quality_candidate_read_job)};\n"
+    )
+    trailer = (
+        "\nDate.now = () => Date.parse('2026-09-07T02:01:05Z');\n"
+        "const __discoveryCounts = window.__getCounts(__discoveryJob);\n"
+        "const __transferCounts = window.__getCounts(__transferJob);\n"
+        "process.stdout.write(JSON.stringify({"
+        "activity: window.__progressDescription(__discoveryJob, __discoveryCounts), "
+        "freshSession: window.__localizeDiscoveryActivity("
+        "'Retrying Douyin signed profile with a fresh signing session "
+        "(reason: api-status-nonzero)', __discoveryJob), "
+        "resume: window.__localizeDiscoveryActivity("
+        "'Resuming Douyin signed profile at page 2/300 (44 verified items)', "
+        "__discoveryJob), "
+        "browserStart: window.__localizeDiscoveryActivity("
+        "'Starting bounded Douyin browser profile fallback "
+        "(reason: signed-integrity; 87s remaining)', __discoveryJob), "
+        "browserScan: window.__localizeDiscoveryActivity("
+        "'Scanning Douyin browser fallback round 4/300 "
+        "(12 verified item(s); 63s remaining)', __discoveryJob), "
+        "browserAdded: window.__localizeDiscoveryActivity("
+        "'Douyin browser fallback added 3 verified item(s) "
+        "(15 total; 120s remaining)', __discoveryJob), "
+        "browserTimeout: window.__localizeRuntimeMessage("
+        "'Douyin profile discovery stopped after 120 seconds without new "
+        "verified profile media. Retry.', __discoveryJob), "
+        "progress: window.__getProgress(__transferJob, true), "
+        "originalRead: window.__progressDescription(__originalReadJob, __transferCounts), "
+        "probeOverall: window.__getProgress(__originalReadJob, true), "
+        "transferStart: window.__progressDescription(__transferStartJob, __transferCounts), "
+        "qualityWait: window.__progressDescription(__qualityWaitJob, __transferCounts), "
+        "mediaCandidate: window.__progressDescription(__mediaCandidateJob, __transferCounts), "
+        "qualityCandidateRead: window.__progressDescription("
+        "__qualityCandidateReadJob, __transferCounts), "
+        "mediaCandidateOverall: window.__getProgress(__mediaCandidateJob, true), "
+        "qualityCandidateReadOverall: window.__getProgress("
+        "__qualityCandidateReadJob, true)"
+        "}));\n"
+    )
+
+    completed = _run_node_script(
+        node,
+        harness + source + trailer,
+        tmp_path,
+        "discovery-activity-progress.js",
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == {
+        "activity": (
+            "抖音主页第 3 页请求暂时失败（HTTP 429 限流），正在重试"
+            "（2/3）（已等待 1 分 5 秒）"
+        ),
+        "freshSession": (
+            "抖音主页签名会话暂时失败（接口业务状态异常），正在重新建立"
+        ),
+        "resume": "正在从抖音主页第 2 页续跑（已验证 44 个作品）",
+        "browserStart": (
+            "正在切换到有时限的抖音主页浏览器解析"
+            "（签名响应未通过完整性校验，剩余 87 秒）"
+        ),
+        "browserScan": (
+            "正在滚动读取抖音主页（第 4/300 轮，已验证 12 个作品，"
+            "剩余 63 秒）"
+        ),
+        "browserAdded": "浏览器解析新增 3 个抖音作品（共 15 个，剩余 120 秒）",
+        "browserTimeout": (
+            "抖音主页解析已在连续 120 秒没有发现新的、可验证作品后自动停止。"
+            "任务没有假死，也没有把空响应或其他作者的内容当成完成结果；"
+            "请稍等一两分钟后从原主页继续，不需要打开 Chrome 验证。"
+        ),
+        "progress": 35,
+        "originalRead": "正在读取抖音原文件以完成画质校验（2k）",
+        "probeOverall": 25,
+        "transferStart": "正在开始传输抖音原文件",
+        "qualityWait": "正在等待前一个抖音画质校验完成（已等待 12 秒）",
+        "mediaCandidate": "正在检测抖音媒体候选 4/24（2k）",
+        "qualityCandidateRead": (
+            "正在读取抖音画质候选 4/24（author-feed-1）"
+        ),
+        "mediaCandidateOverall": 25,
+        "qualityCandidateReadOverall": 25,
+    }

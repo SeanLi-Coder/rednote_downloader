@@ -12,7 +12,11 @@ from urllib.parse import parse_qs, unquote, urlsplit
 from yt_dlp.cookies import extract_cookies_from_browser
 
 from .browser import chrome_user_agent
-from .douyin_signing import fetch_signed_aweme_detail, fetch_signed_profile_awemes
+from .douyin_signing import (
+    fetch_signed_aweme_detail,
+    fetch_signed_profile_awemes,
+    new_signed_discovery_budget,
+)
 from .errors import (
     AuthenticationRequiredError,
     DiscoveryError,
@@ -742,12 +746,15 @@ def discover_item_metadata_from_profile(
     cookie_profile: str | None = None,
     prefer_exact_detail: bool = False,
     should_cancel: Callable[[], bool] | None = None,
+    status_callback: Callable[[str], None] | None = None,
+    progress_budget: Any | None = None,
 ) -> dict[str, Any] | None:
     if not re.fullmatch(r"[A-Za-z0-9_-]{10,200}", profile_id):
         return None
     if not media_id.isdigit():
         return None
     profile_url = f"https://www.douyin.com/user/{profile_id}"
+    progress_budget = progress_budget or new_signed_discovery_budget()
     detail_error: Exception | None = None
     if prefer_exact_detail:
         try:
@@ -757,6 +764,8 @@ def discover_item_metadata_from_profile(
                 expected_sec_uid=profile_id,
                 cookie_profile=cookie_profile,
                 should_cancel=should_cancel,
+                status_callback=status_callback,
+                progress_budget=progress_budget,
             )
         except (AuthenticationRequiredError, DownloadCancelledError):
             raise
@@ -779,6 +788,8 @@ def discover_item_metadata_from_profile(
         target_aweme_id=media_id,
         cookie_profile=cookie_profile,
         should_cancel=should_cancel,
+        status_callback=status_callback,
+        progress_budget=progress_budget,
     )
     for aweme in awemes:
         if str(aweme.get("aweme_id") or "").strip() != media_id:
@@ -830,6 +841,58 @@ def _extract_cookies(profile: str | None) -> CookieJar:
     )
 
 
+def _raise_if_profile_discovery_cancelled(
+    should_cancel: Callable[[], bool] | None,
+) -> None:
+    if should_cancel and should_cancel():
+        raise DownloadCancelledError("Task cancelled")
+
+
+def _profile_discovery_budget_remaining(
+    progress_budget: Any,
+    should_cancel: Callable[[], bool] | None,
+) -> float:
+    _raise_if_profile_discovery_cancelled(should_cancel)
+    try:
+        remaining = float(progress_budget.remaining_seconds())
+    except Exception as exc:
+        _raise_if_profile_discovery_cancelled(should_cancel)
+        raise TemporaryAccessError(
+            "Douyin profile discovery stopped after 120 seconds without new "
+            "verified profile media. Retry after a short wait; Chrome verification "
+            "is not required."
+        ) from exc
+    _raise_if_profile_discovery_cancelled(should_cancel)
+    return remaining
+
+
+def _profile_discovery_timeout_ms(
+    progress_budget: Any,
+    requested_ms: int,
+    should_cancel: Callable[[], bool] | None,
+) -> int:
+    remaining = _profile_discovery_budget_remaining(
+        progress_budget,
+        should_cancel,
+    )
+    remaining_ms = int(remaining * 1_000)
+    if remaining_ms < 1:
+        raise TemporaryAccessError(
+            "Douyin profile discovery stopped after 120 seconds without new "
+            "verified profile media. Retry after a short wait; Chrome verification "
+            "is not required."
+        )
+    return min(max(int(requested_ms), 1), remaining_ms)
+
+
+def _profile_discovery_status(
+    status_callback: Callable[[str], None] | None,
+    message: str,
+) -> None:
+    if status_callback:
+        status_callback(message)
+
+
 def _pick_author(page: Any) -> str | None:
     for selector in (
         "h1",
@@ -859,10 +922,13 @@ def discover_profile(
     max_scrolls: int = 300,
     stable_rounds: int = 15,
     navigation_timeout_ms: int = 45_000,
+    status_callback: Callable[[str], None] | None = None,
 ) -> DouyinProfile:
     profile_id = _profile_id(url)
     if not profile_id:
         raise DiscoveryError("The Douyin profile URL has no profile identifier")
+    progress_budget = new_signed_discovery_budget()
+    signed_fallback_reason = "direct-browser-mode"
     if use_browser_cookies:
         try:
             signed_awemes = fetch_signed_profile_awemes(
@@ -870,9 +936,13 @@ def discover_profile(
                 profile_id,
                 cookie_profile=cookie_profile,
                 should_cancel=should_cancel,
+                status_callback=status_callback,
+                progress_budget=progress_budget,
             )
-        except (AuthenticationRequiredError, DiscoveryError):
-            pass
+        except AuthenticationRequiredError:
+            signed_fallback_reason = "authentication-confirmation"
+        except DiscoveryError:
+            signed_fallback_reason = "signed-integrity"
         else:
             signed_data = {"aweme_list": signed_awemes, "has_more": False}
             entries, authors, _ = _parse_profile_awemes(signed_data, profile_id)
@@ -906,6 +976,12 @@ def discover_profile(
                 discovery_complete=True,
                 media_metadata=metadata,
             )
+    remaining = _profile_discovery_budget_remaining(progress_budget, should_cancel)
+    _profile_discovery_status(
+        status_callback,
+        "Starting bounded Douyin browser profile fallback "
+        f"(reason: {signed_fallback_reason}; {max(1, int(remaining))}s remaining)",
+    )
     try:
         from playwright.sync_api import Error as PlaywrightError
         from playwright.sync_api import sync_playwright
@@ -917,6 +993,7 @@ def discover_profile(
     browser_cookies: list[dict[str, Any]] = []
     cookie_fallback_used = False
     if use_browser_cookies:
+        _profile_discovery_budget_remaining(progress_budget, should_cancel)
         try:
             browser_cookies = _cookie_jar_to_playwright(
                 _extract_cookies(cookie_profile)
@@ -930,36 +1007,114 @@ def discover_profile(
                     "task. Opening a verification page is not required.",
                 ) from exc
             cookie_fallback_used = True
+        _profile_discovery_budget_remaining(progress_budget, should_cancel)
 
     try:
         with sync_playwright() as playwright:
-            browser = playwright.chromium.launch(channel="chrome", headless=True)
+            _profile_discovery_status(
+                status_callback,
+                "Launching Douyin browser fallback",
+            )
+            browser = playwright.chromium.launch(
+                channel="chrome",
+                headless=True,
+                timeout=_profile_discovery_timeout_ms(
+                    progress_budget,
+                    navigation_timeout_ms,
+                    should_cancel,
+                ),
+            )
             try:
+                _profile_discovery_budget_remaining(
+                    progress_budget,
+                    should_cancel,
+                )
                 browser_version = browser.version
                 context = browser.new_context(
                     locale="zh-CN",
                     viewport={"width": 1440, "height": 1100},
                     user_agent=chrome_user_agent(browser_version),
                 )
+                _profile_discovery_budget_remaining(
+                    progress_budget,
+                    should_cancel,
+                )
                 if browser_cookies:
                     context.add_cookies(browser_cookies)
+                    _profile_discovery_budget_remaining(
+                        progress_budget,
+                        should_cancel,
+                    )
                 discovered: dict[str, str] = {}
                 media_metadata: dict[str, dict[str, Any]] = {}
                 incomplete_media_ids: set[str] = set()
                 api_authors: list[str] = []
                 api_has_more: bool | None = None
+                callback_budget_error: Exception | None = None
 
-                def capture_post_response(response: Any) -> None:
-                    nonlocal api_has_more
+                def check_browser_budget() -> float:
+                    _raise_if_profile_discovery_cancelled(should_cancel)
+                    if callback_budget_error is not None:
+                        raise callback_budget_error
+                    return _profile_discovery_budget_remaining(
+                        progress_budget,
+                        should_cancel,
+                    )
+
+                def capture_finished_post_request(request: Any) -> None:
+                    nonlocal api_has_more, callback_budget_error
+                    try:
+                        check_browser_budget()
+                    except (DownloadCancelledError, TemporaryAccessError) as exc:
+                        callback_budget_error = exc
+                        return
+                    try:
+                        response = request.response()
+                    except Exception:
+                        return
+                    if response is None:
+                        return
                     if not _is_target_post_response(response.url, profile_id):
+                        return
+                    try:
+                        check_browser_budget()
+                    except (DownloadCancelledError, TemporaryAccessError) as exc:
+                        callback_budget_error = exc
                         return
                     try:
                         data = response.json()
                     except Exception:
                         return
+                    raw_values = data.get("aweme_list")
+                    if raw_values is None:
+                        raw_values = data.get("awemeList")
+                    if not isinstance(raw_values, list):
+                        return
+                    response_identity = str(
+                        data.get("sec_uid") or data.get("sec_user_id") or ""
+                    ).strip()
+                    if response_identity and response_identity != profile_id:
+                        return
                     entries, authors, has_more = _parse_profile_awemes(data, profile_id)
-                    values = data.get("aweme_list") or data.get("awemeList") or []
+                    values = raw_values
+                    if values:
+                        for aweme in values:
+                            if not isinstance(aweme, dict):
+                                return
+                            author = aweme.get("author")
+                            if not isinstance(author, dict):
+                                return
+                            owner_id = str(
+                                author.get("sec_uid") or author.get("secUid") or ""
+                            ).strip()
+                            if owner_id != profile_id:
+                                return
+                        if not entries:
+                            return
+                    elif has_more is not False or response_identity != profile_id:
+                        return
                     entries_by_id = dict(entries)
+                    verified_metadata: dict[str, dict[str, Any]] = {}
                     for aweme in values:
                         if not isinstance(aweme, dict):
                             continue
@@ -974,19 +1129,90 @@ def discover_profile(
                         ):
                             incomplete_media_ids.add(aweme_id)
                             continue
-                        media_metadata.setdefault(*metadata)
+                        verified_metadata.setdefault(*metadata)
                         incomplete_media_ids.discard(aweme_id)
+                    try:
+                        check_browser_budget()
+                    except (DownloadCancelledError, TemporaryAccessError) as exc:
+                        callback_budget_error = exc
+                        return
+                    media_metadata.update(
+                        {
+                            aweme_id: metadata
+                            for aweme_id, metadata in verified_metadata.items()
+                            if aweme_id not in media_metadata
+                        }
+                    )
                     api_authors.extend(authors)
+                    before = len(discovered)
                     for aweme_id, video_url in entries:
                         if aweme_id in media_metadata:
                             discovered.setdefault(aweme_id, video_url)
                     if has_more is not None:
                         api_has_more = has_more
+                    added = len(discovered) - before
+                    if added:
+                        try:
+                            progress_budget.refresh()
+                            remaining = check_browser_budget()
+                        except (
+                            DownloadCancelledError,
+                            TemporaryAccessError,
+                        ) as exc:
+                            callback_budget_error = exc
+                            return
+                        except Exception as exc:
+                            callback_budget_error = TemporaryAccessError(
+                                "Douyin browser fallback could not update its bounded "
+                                "progress state. Retry after a short wait; Chrome "
+                                "verification is not required."
+                            )
+                            callback_budget_error.__cause__ = exc
+                            return
+                        _profile_discovery_status(
+                            status_callback,
+                            "Douyin browser fallback added "
+                            f"{added} verified item(s) ({len(discovered)} total; "
+                            f"{max(1, int(remaining))}s remaining)",
+                        )
 
                 page = context.new_page()
-                page.on("response", capture_post_response)
-                page.goto(url, wait_until="commit", timeout=navigation_timeout_ms)
-                page.wait_for_timeout(4_000)
+                check_browser_budget()
+                page.on("requestfinished", capture_finished_post_request)
+                _profile_discovery_status(
+                    status_callback,
+                    "Opening the Douyin profile in the bounded browser fallback",
+                )
+                page.goto(
+                    url,
+                    wait_until="commit",
+                    timeout=_profile_discovery_timeout_ms(
+                        progress_budget,
+                        navigation_timeout_ms,
+                        should_cancel,
+                    ),
+                )
+                _raise_if_profile_discovery_cancelled(should_cancel)
+                if _is_explicit_douyin_auth_url(page.url):
+                    raise AuthenticationRequiredError(
+                        "Douyin redirected to an explicit login or verification page. "
+                        "Complete it in Chrome and retry.",
+                        verification_url=url,
+                    )
+                if not _is_trusted_douyin_page_url(page.url):
+                    raise DiscoveryError(
+                        "Douyin profile discovery redirected outside the trusted "
+                        "Douyin origin"
+                    )
+                check_browser_budget()
+                page.wait_for_timeout(
+                    _profile_discovery_timeout_ms(
+                        progress_budget,
+                        4_000,
+                        should_cancel,
+                    )
+                )
+                _raise_if_profile_discovery_cancelled(should_cancel)
 
                 if _is_explicit_douyin_auth_url(page.url):
                     raise AuthenticationRequiredError(
@@ -999,16 +1225,26 @@ def discover_profile(
                         "Douyin profile discovery redirected outside the trusted "
                         "Douyin origin"
                     )
+                check_browser_budget()
                 if page.locator("body").count() == 0 and not discovered:
                     raise TemporaryAccessError(
                         "Douyin profile discovery temporarily returned a blank browser "
                         "response. Retry after a short wait; Chrome verification was "
                         "not requested."
                     )
+                body_timeout_ms = _profile_discovery_timeout_ms(
+                    progress_budget,
+                    5_000,
+                    should_cancel,
+                )
                 try:
-                    body_text = page.locator("body").inner_text(timeout=5_000)
+                    body_text = page.locator("body").inner_text(
+                        timeout=body_timeout_ms
+                    )
                 except Exception:
+                    check_browser_budget()
                     body_text = page.content()
+                _raise_if_profile_discovery_cancelled(should_cancel)
                 if _looks_like_transient_limit(body_text):
                     raise TemporaryAccessError(
                         "Douyin profile discovery was temporarily rate-limited. Retry "
@@ -1020,23 +1256,44 @@ def discover_profile(
                         "finish the CAPTCHA or login, then retry the task.",
                         verification_url=url,
                     )
+                check_browser_budget()
 
                 author = (
                     (api_authors[0] if api_authors else None)
                     or _pick_author(page)
                     or "Douyin Author"
                 )
+                check_browser_budget()
                 unchanged_rounds = 0
                 discovery_complete = False
                 discovery_warning: str | None = None
-                for _ in range(max_scrolls):
-                    if should_cancel and should_cancel():
-                        raise DownloadCancelledError("Task cancelled")
+                for scroll_offset in range(max_scrolls):
+                    remaining = check_browser_budget()
+                    _profile_discovery_status(
+                        status_callback,
+                        "Scanning Douyin browser fallback "
+                        f"round {scroll_offset + 1}/{max_scrolls} "
+                        f"({len(discovered)} verified item(s); "
+                        f"{max(1, int(remaining))}s remaining)",
+                    )
                     if api_has_more is False:
                         discovery_complete = True
                         break
                     before = len(discovered)
                     page.mouse.wheel(0, 5_000)
+                    _raise_if_profile_discovery_cancelled(should_cancel)
+                    if _is_explicit_douyin_auth_url(page.url):
+                        raise AuthenticationRequiredError(
+                            "Douyin interrupted discovery with a verification "
+                            "challenge. Complete it in Chrome and retry.",
+                            verification_url=url,
+                        )
+                    if not _is_trusted_douyin_page_url(page.url):
+                        raise DiscoveryError(
+                            "Douyin profile discovery redirected outside the trusted "
+                            "Douyin origin"
+                        )
+                    check_browser_budget()
                     with contextlib.suppress(Exception):
                         page.evaluate(
                             """
@@ -1050,7 +1307,27 @@ def discover_profile(
                             }
                             """
                         )
-                    page.wait_for_timeout(1_200)
+                    _raise_if_profile_discovery_cancelled(should_cancel)
+                    if _is_explicit_douyin_auth_url(page.url):
+                        raise AuthenticationRequiredError(
+                            "Douyin interrupted discovery with a verification "
+                            "challenge. Complete it in Chrome and retry.",
+                            verification_url=url,
+                        )
+                    if not _is_trusted_douyin_page_url(page.url):
+                        raise DiscoveryError(
+                            "Douyin profile discovery redirected outside the trusted "
+                            "Douyin origin"
+                        )
+                    check_browser_budget()
+                    page.wait_for_timeout(
+                        _profile_discovery_timeout_ms(
+                            progress_budget,
+                            1_200,
+                            should_cancel,
+                        )
+                    )
+                    _raise_if_profile_discovery_cancelled(should_cancel)
                     if _is_explicit_douyin_auth_url(page.url):
                         raise AuthenticationRequiredError(
                             "Douyin redirected to an explicit login or verification "
@@ -1062,10 +1339,19 @@ def discover_profile(
                             "Douyin profile discovery redirected outside the trusted "
                             "Douyin origin"
                         )
+                    updated_body_timeout_ms = _profile_discovery_timeout_ms(
+                        progress_budget,
+                        2_000,
+                        should_cancel,
+                    )
                     try:
-                        updated_body = page.locator("body").inner_text(timeout=2_000)
+                        updated_body = page.locator("body").inner_text(
+                            timeout=updated_body_timeout_ms
+                        )
                     except Exception:
+                        check_browser_budget()
                         updated_body = page.content()
+                    _raise_if_profile_discovery_cancelled(should_cancel)
                     if _looks_like_transient_limit(updated_body):
                         raise TemporaryAccessError(
                             "Douyin profile discovery was temporarily rate-limited. "
@@ -1078,6 +1364,7 @@ def discover_profile(
                             "Complete it in Chrome and retry.",
                             verification_url=url,
                         )
+                    check_browser_budget()
                     unchanged_rounds = (
                         unchanged_rounds + 1 if len(discovered) == before else 0
                     )
@@ -1097,6 +1384,7 @@ def discover_profile(
                         "end of the profile. Retry to continue discovering videos."
                     )
 
+                check_browser_budget()
                 if incomplete_media_ids:
                     raise TemporaryAccessError(
                         "Douyin browser discovery returned media without complete "

@@ -19,6 +19,7 @@ from app.douyin import (
 from app.errors import (
     AuthenticationRequiredError,
     DiscoveryError,
+    DownloadCancelledError,
     TemporaryAccessError,
 )
 
@@ -65,6 +66,32 @@ def _install_fake_douyin_browser(monkeypatch, page) -> None:
     )
 
 
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class FakeProgressBudget:
+    def __init__(self, clock: FakeClock, timeout_seconds: float = 120) -> None:
+        self.clock = clock
+        self.timeout_seconds = timeout_seconds
+        self.deadline = clock.now + timeout_seconds
+        self.refresh_calls = 0
+
+    def remaining_seconds(self) -> float:
+        remaining = self.deadline - self.clock.now
+        if remaining <= 0:
+            raise RuntimeError("PRIVATE_FAKE_BUDGET_TIMEOUT")
+        return remaining
+
+    def refresh(self) -> None:
+        self.refresh_calls += 1
+        self.deadline = self.clock.now + self.timeout_seconds
+
+
 def test_douyin_rate_limit_text_is_not_treated_as_captcha() -> None:
     assert _looks_like_transient_limit("当前访问频繁，请稍后再试")
     assert not _looks_like_auth_page("当前访问频繁，请稍后再试")
@@ -108,6 +135,7 @@ def test_item_metadata_profile_lookup_uses_exact_detail_when_preferred(
     media_id = "1111111111111111111"
     video_uri = "v0200fg10000fixturevideoid"
     calls = []
+    statuses: list[str] = []
 
     def fetch_detail(requested_media_id, **kwargs):
         calls.append((requested_media_id, kwargs))
@@ -138,6 +166,7 @@ def test_item_metadata_profile_lookup_uses_exact_detail_when_preferred(
         profile_id,
         media_id,
         prefer_exact_detail=True,
+        status_callback=statuses.append,
     )
 
     assert result and result["media_id"] == media_id
@@ -147,6 +176,8 @@ def test_item_metadata_profile_lookup_uses_exact_detail_when_preferred(
     assert calls[0][1]["verification_url"] == (
         f"https://www.douyin.com/user/{profile_id}"
     )
+    assert calls[0][1]["status_callback"] == statuses.append
+    assert calls[0][1]["progress_budget"] is not None
 
 
 def test_item_metadata_profile_lookup_uses_targeted_feed_by_default(
@@ -156,6 +187,7 @@ def test_item_metadata_profile_lookup_uses_targeted_feed_by_default(
     media_id = "1111111111111111111"
     video_uri = "v0200fg10000fixturevideoid"
     feed_calls = []
+    statuses: list[str] = []
 
     monkeypatch.setattr(
         "app.douyin.fetch_signed_aweme_detail",
@@ -185,11 +217,17 @@ def test_item_metadata_profile_lookup_uses_targeted_feed_by_default(
 
     monkeypatch.setattr("app.douyin.fetch_signed_profile_awemes", fetch_feed)
 
-    result = discover_item_metadata_from_profile(profile_id, media_id)
+    result = discover_item_metadata_from_profile(
+        profile_id,
+        media_id,
+        status_callback=statuses.append,
+    )
 
     assert result and result["media_id"] == media_id
     assert len(feed_calls) == 1
     assert feed_calls[0][2]["target_aweme_id"] == media_id
+    assert feed_calls[0][2]["status_callback"] == statuses.append
+    assert feed_calls[0][2]["progress_budget"] is not None
 
 
 def test_item_metadata_preferred_detail_falls_back_to_targeted_feed(
@@ -200,12 +238,13 @@ def test_item_metadata_preferred_detail_falls_back_to_targeted_feed(
     video_uri = "v0200fg10000fixturevideoid"
     feed_calls = []
 
-    monkeypatch.setattr(
-        "app.douyin.fetch_signed_aweme_detail",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            TemporaryAccessError("detail endpoint was temporarily limited")
-        ),
-    )
+    detail_budgets = []
+
+    def fetch_detail(*args, **kwargs):
+        detail_budgets.append(kwargs["progress_budget"])
+        raise TemporaryAccessError("detail endpoint was temporarily limited")
+
+    monkeypatch.setattr("app.douyin.fetch_signed_aweme_detail", fetch_detail)
 
     def fetch_feed(profile_url, requested_profile_id, **kwargs):
         feed_calls.append((profile_url, requested_profile_id, kwargs))
@@ -239,6 +278,7 @@ def test_item_metadata_preferred_detail_falls_back_to_targeted_feed(
     assert result["minimum_height"] == 2560
     assert len(feed_calls) == 1
     assert feed_calls[0][2]["target_aweme_id"] == media_id
+    assert feed_calls[0][2]["progress_budget"] is detail_budgets[0]
 
 
 def test_douyin_signed_profile_discovery_returns_verified_complete_metadata(
@@ -249,9 +289,11 @@ def test_douyin_signed_profile_discovery_returns_verified_complete_metadata(
     aweme_id = "1111111111111111111"
     video_uri = "v0200fg10000fixturevideoid"
     video_url = "https://v26-web.douyinvod.com/signed-profile-1440.mp4"
-    monkeypatch.setattr(
-        "app.douyin.fetch_signed_profile_awemes",
-        lambda *args, **kwargs: [
+    signed_calls = []
+
+    def fetch_signed(*args, **kwargs):
+        signed_calls.append((args, kwargs))
+        return [
             {
                 "aweme_id": aweme_id,
                 "desc": "Signed profile video",
@@ -272,14 +314,25 @@ def test_douyin_signed_profile_discovery_returns_verified_complete_metadata(
                     },
                 },
             }
-        ],
-    )
+        ]
 
-    result = discover_profile(profile_url, use_browser_cookies=True)
+    monkeypatch.setattr(
+        "app.douyin.fetch_signed_profile_awemes",
+        fetch_signed,
+    )
+    statuses: list[str] = []
+
+    result = discover_profile(
+        profile_url,
+        use_browser_cookies=True,
+        status_callback=statuses.append,
+    )
 
     assert result.author == "Signed Author"
     assert result.video_urls == [f"https://www.douyin.com/video/{aweme_id}"]
     assert result.discovery_complete is True
+    assert len(signed_calls) == 1
+    assert signed_calls[0][1]["status_callback"] == statuses.append
     assert result.media_metadata[aweme_id] == {
         "media_id": aweme_id,
         "owner_id": profile_id,
@@ -335,6 +388,316 @@ def test_douyin_browser_timeout_does_not_request_chrome_verification(
 
     with pytest.raises(TemporaryAccessError, match="Chrome verification is not required"):
         discover_profile(profile_url, use_browser_cookies=True)
+
+
+def test_douyin_browser_fallback_shares_budget_and_stops_without_progress(
+    monkeypatch,
+) -> None:
+    profile_id = "MS4wLjABAAAAexpected"
+    profile_url = f"https://www.douyin.com/user/{profile_id}"
+    clock = FakeClock()
+    budget = FakeProgressBudget(clock)
+    statuses: list[str] = []
+    signed_budgets = []
+
+    class FakeBody:
+        @property
+        def first(self):
+            return self
+
+        def count(self) -> int:
+            return 1
+
+        def inner_text(self, timeout: int) -> str:
+            return "Normal profile page"
+
+    class FakePage:
+        url = profile_url
+
+        def __init__(self) -> None:
+            self.mouse = self
+            self.events: list[str] = []
+            self.waits: list[int] = []
+            self.goto_timeout = 0
+            self.scrolls = 0
+            self.header_response_received = False
+            self.response_json_calls = 0
+
+        def on(self, event: str, callback) -> None:
+            self.events.append(event)
+
+        def goto(self, url: str, wait_until: str, timeout: int) -> None:
+            self.url = url
+            self.goto_timeout = timeout
+            self.header_response_received = True
+
+        def wait_for_timeout(self, timeout: int) -> None:
+            self.waits.append(timeout)
+            clock.advance(timeout / 1_000)
+
+        def locator(self, selector: str) -> FakeBody:
+            return FakeBody()
+
+        def content(self) -> str:
+            return "<html><body>Normal profile page</body></html>"
+
+        def title(self) -> str:
+            return "Normal profile - Douyin"
+
+        def wheel(self, x: int, y: int) -> None:
+            self.scrolls += 1
+
+        def evaluate(self, script: str) -> None:
+            return None
+
+    page = FakePage()
+    _install_fake_douyin_browser(monkeypatch, page)
+
+    def signed_failure(*args, **kwargs):
+        signed_budgets.append(kwargs["progress_budget"])
+        clock.advance(100)
+        raise DiscoveryError("Signed integrity failure")
+
+    monkeypatch.setattr("app.douyin.new_signed_discovery_budget", lambda: budget)
+    monkeypatch.setattr(
+        "app.douyin.fetch_signed_profile_awemes",
+        signed_failure,
+    )
+
+    with pytest.raises(
+        TemporaryAccessError,
+        match="120 seconds without new verified profile media",
+    ) as captured:
+        discover_profile(
+            profile_url,
+            use_browser_cookies=True,
+            max_scrolls=300,
+            stable_rounds=1_000,
+            status_callback=statuses.append,
+        )
+
+    assert signed_budgets == [budget]
+    assert clock.now == pytest.approx(120, abs=0.01)
+    assert page.goto_timeout <= 20_000
+    assert page.scrolls < 300
+    assert page.events == ["requestfinished"]
+    assert page.header_response_received is True
+    assert page.response_json_calls == 0
+    assert page.waits and all(0 < value <= 4_000 for value in page.waits)
+    assert any("Starting bounded Douyin browser profile fallback" in s for s in statuses)
+    assert any("Scanning Douyin browser fallback round" in s for s in statuses)
+    assert all(profile_id not in status for status in statuses)
+    assert "PRIVATE_FAKE_BUDGET_TIMEOUT" not in str(captured.value)
+
+
+def test_douyin_browser_budget_refreshes_only_for_new_verified_items(
+    monkeypatch,
+) -> None:
+    profile_id = "MS4wLjABAAAAexpected"
+    profile_url = f"https://www.douyin.com/user/{profile_id}"
+    media_ids = [
+        "1111111111111111111",
+        "2222222222222222222",
+        "3333333333333333333",
+    ]
+    clock = FakeClock()
+    budget = FakeProgressBudget(clock)
+    statuses: list[str] = []
+
+    def response_data(
+        media_id: str,
+        has_more: bool,
+        owner_id: str = profile_id,
+    ) -> dict:
+        return {
+            "has_more": int(has_more),
+            "aweme_list": [
+                {
+                    "aweme_id": media_id,
+                    "desc": f"Video {media_id}",
+                    "author": {
+                        "sec_uid": owner_id,
+                        "nickname": "Verified Author",
+                    },
+                    "video": {
+                        "play_addr": {
+                            "uri": f"video-{media_id}",
+                            "width": 1080,
+                            "height": 1920,
+                            "url_list": [
+                                f"https://v26-web.douyinvod.com/{media_id}.mp4"
+                            ],
+                        }
+                    },
+                }
+            ],
+        }
+
+    class FakeResponse:
+        def __init__(self, data: dict) -> None:
+            self.url = (
+                "https://www.douyin.com/aweme/v1/web/aweme/post/"
+                f"?sec_user_id={profile_id}"
+            )
+            self.data = data
+
+        def json(self) -> dict:
+            return self.data
+
+    class FakeRequest:
+        def __init__(self, data: dict) -> None:
+            self.value = FakeResponse(data)
+
+        def response(self) -> FakeResponse:
+            return self.value
+
+    class FakeBody:
+        @property
+        def first(self):
+            return self
+
+        def count(self) -> int:
+            return 1
+
+        def inner_text(self, timeout: int) -> str:
+            return "Normal profile page"
+
+    class FakePage:
+        url = profile_url
+
+        def __init__(self) -> None:
+            self.mouse = self
+            self.callback = None
+            self.wheel_index = 0
+
+        def on(self, event: str, callback) -> None:
+            assert event == "requestfinished"
+            self.callback = callback
+
+        def emit(
+            self,
+            media_id: str,
+            has_more: bool,
+            owner_id: str = profile_id,
+        ) -> None:
+            assert self.callback is not None
+            self.callback(
+                FakeRequest(response_data(media_id, has_more, owner_id))
+            )
+
+        def goto(self, url: str, wait_until: str, timeout: int) -> None:
+            self.url = url
+            self.emit(media_ids[0], True)
+
+        def wait_for_timeout(self, timeout: int) -> None:
+            clock.advance(timeout / 1_000)
+
+        def locator(self, selector: str) -> FakeBody:
+            return FakeBody()
+
+        def content(self) -> str:
+            return "<html><body>Normal profile page</body></html>"
+
+        def wheel(self, x: int, y: int) -> None:
+            delays = [50, 50, 100]
+            emitted_ids = [media_ids[0], media_ids[1], media_ids[2]]
+            has_more_values = [False, True, False]
+            owner_ids = ["MS4wLjABAAAAother", profile_id, profile_id]
+            clock.advance(delays[self.wheel_index])
+            if self.wheel_index == 0:
+                assert self.callback is not None
+                self.callback(FakeRequest({"has_more": 0, "aweme_list": []}))
+            self.emit(
+                emitted_ids[self.wheel_index],
+                has_more_values[self.wheel_index],
+                owner_ids[self.wheel_index],
+            )
+            self.wheel_index += 1
+
+        def evaluate(self, script: str) -> None:
+            return None
+
+    page = FakePage()
+    _install_fake_douyin_browser(monkeypatch, page)
+    monkeypatch.setattr("app.douyin.new_signed_discovery_budget", lambda: budget)
+
+    result = discover_profile(
+        profile_url,
+        max_scrolls=4,
+        stable_rounds=4,
+        status_callback=statuses.append,
+    )
+
+    assert clock.now > 200
+    assert budget.refresh_calls == 3
+    assert page.wheel_index == 3
+    assert result.video_urls == [
+        f"https://www.douyin.com/video/{media_id}" for media_id in media_ids
+    ]
+    added_statuses = [status for status in statuses if "added" in status]
+    assert len(added_statuses) == 3
+    assert "1 total" in added_statuses[0]
+    assert "2 total" in added_statuses[1]
+    assert "3 total" in added_statuses[2]
+
+
+@pytest.mark.parametrize(
+    ("redirect_url", "cancel_after_deadline", "expected_error"),
+    [
+        ("https://www.douyin.com/login", False, AuthenticationRequiredError),
+        (None, True, DownloadCancelledError),
+    ],
+)
+def test_douyin_browser_auth_and_cancel_take_priority_over_budget_expiry(
+    monkeypatch,
+    redirect_url: str | None,
+    cancel_after_deadline: bool,
+    expected_error: type[Exception],
+) -> None:
+    profile_id = "MS4wLjABAAAAexpected"
+    profile_url = f"https://www.douyin.com/user/{profile_id}"
+    clock = FakeClock()
+    budget = FakeProgressBudget(clock)
+
+    class FakePage:
+        url = profile_url
+
+        def on(self, event: str, callback) -> None:
+            assert event == "requestfinished"
+
+        def goto(self, url: str, wait_until: str, timeout: int) -> None:
+            clock.advance(2)
+            self.url = redirect_url or url
+
+    page = FakePage()
+    _install_fake_douyin_browser(monkeypatch, page)
+
+    def signed_failure(*args, **kwargs):
+        clock.advance(119)
+        if redirect_url:
+            raise AuthenticationRequiredError(
+                "Explicit signed authentication",
+                verification_url=profile_url,
+            )
+        raise DiscoveryError("Signed integrity failure")
+
+    monkeypatch.setattr("app.douyin.new_signed_discovery_budget", lambda: budget)
+    monkeypatch.setattr(
+        "app.douyin.fetch_signed_profile_awemes",
+        signed_failure,
+    )
+
+    with pytest.raises(expected_error) as captured:
+        discover_profile(
+            profile_url,
+            should_cancel=(
+                (lambda: clock.now >= 120) if cancel_after_deadline else None
+            ),
+        )
+
+    assert "PRIVATE_FAKE_BUDGET_TIMEOUT" not in str(captured.value)
+    if isinstance(captured.value, AuthenticationRequiredError):
+        assert captured.value.verification_url == profile_url
 
 
 def test_douyin_browser_mixed_login_and_rate_limit_is_temporary(
@@ -503,6 +866,10 @@ def test_douyin_scroll_non_auth_content_does_not_request_verification(
                 "has_more": True,
             }
 
+    class FakeRequest:
+        def response(self) -> FakeResponse:
+            return FakeResponse()
+
     class FakeBody:
         def __init__(self) -> None:
             self.calls = 0
@@ -527,13 +894,13 @@ def test_douyin_scroll_non_auth_content_does_not_request_verification(
             self.mouse = self
 
         def on(self, event: str, callback) -> None:
-            if event == "response":
+            if event == "requestfinished":
                 self.response_callback = callback
 
         def goto(self, url: str, wait_until: str, timeout: int) -> None:
             self.url = url
             assert self.response_callback is not None
-            self.response_callback(FakeResponse())
+            self.response_callback(FakeRequest())
 
         def wait_for_timeout(self, timeout: int) -> None:
             return None
@@ -1374,6 +1741,13 @@ def test_douyin_discovery_waits_for_scrolled_api_page_before_stability_stop(
         def json(self):
             return self._data
 
+    class FakeRequest:
+        def __init__(self, data: dict):
+            self._response = FakeResponse(data)
+
+        def response(self) -> FakeResponse:
+            return self._response
+
     class FakeLocator:
         def __init__(self, selector: str):
             self.selector = selector
@@ -1404,17 +1778,19 @@ def test_douyin_discovery_waits_for_scrolled_api_page_before_stability_stop(
             self.mouse = FakeMouse(self)
 
         def on(self, event: str, callback) -> None:
-            if event == "response":
+            if event == "requestfinished":
                 self.callback = callback
 
         def goto(self, url: str, wait_until: str, timeout: int):
             self.url = url
-            self.callback(FakeResponse(response_data("1111111111111111111", True)))
+            self.callback(FakeRequest(response_data("1111111111111111111", True)))
 
         def wait_for_timeout(self, timeout: int) -> None:
             if self.scrolled and not self.sent_second_page:
                 self.sent_second_page = True
-                self.callback(FakeResponse(response_data("2222222222222222222", False)))
+                self.callback(
+                    FakeRequest(response_data("2222222222222222222", False))
+                )
 
         def locator(self, selector: str) -> FakeLocator:
             return FakeLocator(selector)

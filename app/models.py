@@ -125,6 +125,8 @@ class DownloadJob(BaseModel):
     completed_items: int = 0
     failed_items: int = 0
     active_item_id: str | None = None
+    activity_message: str | None = None
+    activity_started_at: datetime | None = None
     error: str | None = None
     warning: str | None = None
     auth_message: str | None = None

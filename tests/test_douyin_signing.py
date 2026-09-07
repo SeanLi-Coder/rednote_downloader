@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from email.message import Message
 from io import BytesIO
 from types import SimpleNamespace
 from urllib.error import HTTPError as UrllibHTTPError
 
 import pytest
 
+import app.douyin_signing as douyin_signing
 from app.douyin_signing import (
     _AuthenticationSigningFailure,
     _SigningFailure,
@@ -49,6 +51,189 @@ GLUE_HTML = """
   <script data-sdk-glue-default="init">window.initializeGlue();</script>
 </head></html>
 """
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+    def advance_ms(self, milliseconds: int) -> None:
+        self.advance(milliseconds / 1_000)
+
+    def sleep(self, seconds: float) -> None:
+        self.advance(seconds)
+
+
+def test_no_progress_budget_clamps_and_refreshes_from_monotonic_clock(
+    monkeypatch,
+) -> None:
+    clock = FakeClock()
+    monkeypatch.setattr(
+        douyin_signing,
+        "time",
+        SimpleNamespace(monotonic=clock.monotonic, sleep=clock.sleep),
+    )
+    budget = douyin_signing._NoProgressBudget(120)
+
+    clock.advance(119)
+    assert budget.remaining_seconds() == pytest.approx(1)
+    assert 999 <= budget.clamp_timeout_ms(45_000) <= 1_000
+
+    budget.refresh()
+    clock.advance(119)
+    assert budget.remaining_seconds() == pytest.approx(1)
+    budget.note_failure(
+        _TransientSigningFailure(
+            "missing profile page",
+            category="api-missing-aweme-list",
+        )
+    )
+    clock.advance(1)
+    with pytest.raises(
+        douyin_signing._SigningNoProgressTimeout,
+        match="120-second safety window",
+    ) as captured:
+        budget.remaining_seconds()
+
+    assert captured.value.category == "api-missing-aweme-list"
+
+
+def test_signed_profile_honors_an_expired_shared_progress_budget(
+    monkeypatch,
+) -> None:
+    clock = FakeClock()
+    monkeypatch.setattr(
+        douyin_signing,
+        "time",
+        SimpleNamespace(monotonic=clock.monotonic, sleep=clock.sleep),
+    )
+    budget = douyin_signing._NoProgressBudget(120)
+    clock.advance(120)
+    monkeypatch.setattr(
+        douyin_signing,
+        "_run_with_signing_page",
+        lambda *args, **kwargs: pytest.fail(
+            "An expired shared budget must stop before opening another session"
+        ),
+    )
+
+    with pytest.raises(
+        TemporaryAccessError,
+        match="120 seconds without verified progress",
+    ):
+        fetch_signed_profile_awemes(
+            PROFILE_URL,
+            SEC_UID,
+            progress_budget=budget,
+        )
+
+
+def test_serialized_slot_wait_reports_once_and_expires_shared_budget(
+    monkeypatch,
+) -> None:
+    clock = FakeClock()
+    statuses: list[str] = []
+
+    class BusyLock:
+        def __init__(self) -> None:
+            self.timeouts: list[float] = []
+            self.release_calls = 0
+
+        def acquire(self, *, timeout: float) -> bool:
+            self.timeouts.append(timeout)
+            clock.advance(timeout)
+            return False
+
+        def release(self) -> None:
+            self.release_calls += 1
+
+    lock = BusyLock()
+    monkeypatch.setattr(
+        douyin_signing,
+        "time",
+        SimpleNamespace(monotonic=clock.monotonic, sleep=clock.sleep),
+    )
+    monkeypatch.setattr(douyin_signing, "_SIGNED_FETCH_LOCK", lock)
+    entered = False
+
+    with pytest.raises(douyin_signing._SigningNoProgressTimeout):
+        with douyin_signing._serialized_signed_fetch(
+            lambda: False,
+            budget=douyin_signing._NoProgressBudget(120),
+            status_callback=statuses.append,
+        ):
+            entered = True
+
+    assert entered is False
+    assert statuses == ["Waiting for the Douyin signed request slot"]
+    assert lock.release_calls == 0
+    assert lock.timeouts
+    assert all(0 < timeout <= 0.2 for timeout in lock.timeouts)
+    assert sum(lock.timeouts) == pytest.approx(120)
+
+
+def test_chunked_urllib_drip_cannot_extend_shared_deadline(monkeypatch) -> None:
+    clock = FakeClock()
+
+    class DripResponse:
+        status = 200
+
+        def __init__(self) -> None:
+            self.headers = Message()
+            self.read_sizes: list[int] = []
+            self.closed = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback) -> None:
+            self.closed = True
+
+        def geturl(self) -> str:
+            return VIDEO_URL
+
+        def read(self, size: int) -> bytes:
+            self.read_sizes.append(size)
+            clock.advance(30)
+            return b"x"
+
+    response = DripResponse()
+
+    class DripOpener:
+        def open(self, request, timeout: float):
+            assert timeout == pytest.approx(45)
+            return response
+
+    monkeypatch.setattr(
+        douyin_signing,
+        "time",
+        SimpleNamespace(monotonic=clock.monotonic, sleep=clock.sleep),
+    )
+    monkeypatch.setattr(
+        douyin_signing,
+        "build_opener",
+        lambda *args, **kwargs: DripOpener(),
+    )
+
+    with pytest.raises(douyin_signing._SigningNoProgressTimeout):
+        _fetch_source_html_with_urllib(
+            VIDEO_URL,
+            object(),
+            "Test User Agent",
+            45_000,
+            budget=douyin_signing._NoProgressBudget(120),
+            should_cancel=lambda: False,
+        )
+
+    assert len(response.read_sizes) == 4
+    assert all(0 < size <= 64 * 1_024 for size in response.read_sizes)
+    assert response.closed is True
 
 
 def _detail_response(
@@ -386,8 +571,32 @@ def test_validate_profile_response_retries_incomplete_owned_media() -> None:
         }
     ]
 
-    with pytest.raises(_TransientSigningFailure, match="incomplete aweme media"):
+    with pytest.raises(
+        _TransientSigningFailure,
+        match="incomplete aweme media",
+    ) as captured:
         _validate_profile_response(response, SEC_UID)
+
+    assert captured.value.category == "api-incomplete-media"
+
+
+@pytest.mark.parametrize("response_identity", [None, "", "MS4wLjABAAAAother"])
+def test_validate_profile_response_retries_unbound_empty_terminal_page(
+    response_identity: str | None,
+) -> None:
+    response = _profile_response([], has_more=0)
+    if response_identity is None:
+        response["payload"].pop("sec_uid")
+    else:
+        response["payload"]["sec_uid"] = response_identity
+
+    with pytest.raises(
+        _TransientSigningFailure,
+        match="unbound empty terminal page",
+    ) as captured:
+        _validate_profile_response(response, SEC_UID)
+
+    assert captured.value.category == "api-unbound-empty-page"
 
 
 @pytest.mark.parametrize(
@@ -573,7 +782,7 @@ def _install_fake_playwright(
     )
     monkeypatch.setattr(
         "app.douyin_signing._fetch_source_html_with_urllib",
-        lambda url, cookie_jar, user_agent, timeout_ms: GLUE_HTML,
+        lambda url, cookie_jar, user_agent, timeout_ms, **kwargs: GLUE_HTML,
     )
     monkeypatch.setattr(
         "playwright.sync_api.sync_playwright",
@@ -614,13 +823,70 @@ def test_fetch_signed_aweme_detail_uses_same_origin_and_closes_resources(
     assert manager.resources_closed_on_exit is True
 
 
+def test_pending_detail_retries_share_one_no_progress_budget(monkeypatch) -> None:
+    pending_response = {"state": "pending"}
+    page, context, browser, manager = _install_fake_playwright(
+        monkeypatch,
+        [pending_response, pending_response, pending_response],
+    )
+    clock = FakeClock()
+    statuses: list[str] = []
+    abort_calls = 0
+    original_evaluate = page.evaluate
+
+    def evaluate(script: str, argument=None):
+        nonlocal abort_calls
+        if "controller.abort" in script:
+            abort_calls += 1
+        return original_evaluate(script, argument)
+
+    page.evaluate = evaluate
+    page.wait_for_timeout = clock.advance_ms
+    monkeypatch.setattr(
+        douyin_signing,
+        "time",
+        SimpleNamespace(monotonic=clock.monotonic, sleep=clock.sleep),
+    )
+
+    with pytest.raises(
+        TemporaryAccessError,
+        match="120 seconds without verified progress",
+    ) as captured:
+        fetch_signed_aweme_detail(
+            AWEME_ID,
+            verification_url=VIDEO_URL,
+            expected_sec_uid=SEC_UID,
+            signer_settle_ms=0,
+            request_timeout_ms=45_000,
+            status_callback=statuses.append,
+        )
+
+    assert isinstance(
+        captured.value.__cause__, douyin_signing._SigningNoProgressTimeout
+    )
+    assert "Reason category: network-timeout" in str(captured.value)
+    assert len(page.signed_requests) == 3
+    assert [value["timeoutMs"] for value in page.signed_requests[:2]] == [
+        45_000,
+        45_000,
+    ]
+    assert 26_000 <= page.signed_requests[2]["timeoutMs"] <= 27_000
+    assert context.new_page_calls == 1
+    assert abort_calls >= 3
+    assert not any("session 2/" in value for value in statuses)
+    assert any("reason: network-timeout" in value for value in statuses)
+    assert clock.now == pytest.approx(120, abs=0.01)
+    assert page.closed and context.closed and browser.closed
+    assert manager.resources_closed_on_exit is True
+
+
 def test_fetch_prefers_urllib_with_the_original_cookie_jar(
     monkeypatch,
 ) -> None:
     page, context, browser, manager = _install_fake_playwright(monkeypatch)
     fallback_calls = []
 
-    def fetch_with_urllib(url, cookie_jar, user_agent, timeout_ms):
+    def fetch_with_urllib(url, cookie_jar, user_agent, timeout_ms, **kwargs):
         fallback_calls.append((url, cookie_jar, user_agent, timeout_ms))
         return GLUE_HTML
 
@@ -648,8 +914,13 @@ def test_fetch_prefers_urllib_with_the_original_cookie_jar(
 
 def test_fetch_falls_back_to_browser_context_when_urllib_fails(monkeypatch) -> None:
     page, context, browser, manager = _install_fake_playwright(monkeypatch)
+    urllib_called = False
 
-    def fail_urllib(url, cookie_jar, user_agent, timeout_ms):
+    def fail_urllib(url, cookie_jar, user_agent, timeout_ms, **kwargs):
+        nonlocal urllib_called
+        urllib_called = True
+        assert kwargs["budget"] is not None
+        assert kwargs["should_cancel"] is None
         raise OSError("Temporary network failure")
 
     monkeypatch.setattr(
@@ -665,9 +936,46 @@ def test_fetch_falls_back_to_browser_context_when_urllib_fails(monkeypatch) -> N
     )
 
     assert detail["aweme_id"] == AWEME_ID
+    assert urllib_called is True
     assert context.request.requested_url == VIDEO_URL
     assert page.closed and context.closed and browser.closed
     assert manager.resources_closed_on_exit is True
+
+
+@pytest.mark.parametrize(
+    ("transient_response", "reason"),
+    [
+        (_detail_response(http_status=429), "http-429"),
+        (_detail_response(http_status=403), "http-403"),
+        (_detail_response(http_status=503), "http-5xx"),
+        (_detail_response(status_code=9), "api-status-nonzero"),
+    ],
+)
+def test_detail_retry_status_reports_only_safe_reason_category(
+    monkeypatch,
+    transient_response: dict,
+    reason: str,
+) -> None:
+    _install_fake_playwright(
+        monkeypatch,
+        [transient_response, _detail_response()],
+    )
+    statuses: list[str] = []
+
+    detail = fetch_signed_aweme_detail(
+        AWEME_ID,
+        verification_url=VIDEO_URL,
+        expected_sec_uid=SEC_UID,
+        signer_settle_ms=0,
+        status_callback=statuses.append,
+    )
+
+    assert detail["aweme_id"] == AWEME_ID
+    retry_statuses = [value for value in statuses if "Retrying" in value]
+    assert retry_statuses == [
+        f"Retrying Douyin signed detail request 2/3 (reason: {reason})"
+    ]
+    assert all("http" not in value.lower() or reason in value for value in retry_statuses)
 
 
 def test_browser_html_429_is_transient_and_response_is_disposed(monkeypatch) -> None:
@@ -1105,6 +1413,317 @@ def test_fetch_signed_profile_awemes_paginates_on_one_signer_page(
     assert manager.resources_closed_on_exit is True
 
 
+def test_distinct_verified_profile_pages_refresh_no_progress_budget(
+    monkeypatch,
+) -> None:
+    clock = FakeClock()
+    statuses: list[str] = []
+    responses = [
+        _profile_response(
+            ["7000000000000000001"],
+            has_more=1,
+            max_cursor="123",
+        ),
+        _profile_response(
+            ["7000000000000000002"],
+            has_more=0,
+            max_cursor="456",
+        ),
+    ]
+
+    class TimedPage:
+        def __init__(self) -> None:
+            self.signed_requests: list[dict] = []
+            self.started_at = 0.0
+
+        def evaluate(self, script: str, argument=None):
+            if argument is not None:
+                self.signed_requests.append(argument)
+                self.started_at = clock.monotonic()
+                return None
+            if "controller.abort" in script:
+                return None
+            if clock.monotonic() - self.started_at < 119:
+                return {"state": "pending"}
+            return responses[len(self.signed_requests) - 1]
+
+        def wait_for_timeout(self, timeout: int) -> None:
+            clock.advance_ms(timeout)
+
+    page = TimedPage()
+
+    def run(*args, **kwargs):
+        return kwargs["operation"](page)
+
+    monkeypatch.setattr(
+        douyin_signing,
+        "time",
+        SimpleNamespace(monotonic=clock.monotonic, sleep=clock.sleep),
+    )
+    monkeypatch.setattr(douyin_signing, "_run_with_signing_page", run)
+
+    awemes = fetch_signed_profile_awemes(
+        PROFILE_URL,
+        SEC_UID,
+        max_pages=2,
+        signer_settle_ms=0,
+        request_timeout_ms=119_500,
+        status_callback=statuses.append,
+    )
+
+    assert [aweme["aweme_id"] for aweme in awemes] == [
+        "7000000000000000001",
+        "7000000000000000002",
+    ]
+    assert clock.now == pytest.approx(238, abs=0.25)
+    assert clock.now > 120
+    assert [
+        value for value in statuses if value.startswith("Verified Douyin")
+    ] == [
+        "Verified Douyin signed profile page 1 (1 items)",
+        "Verified Douyin signed profile page 2 (1 items)",
+    ]
+    assert [
+        request["params"]["max_cursor"] for request in page.signed_requests
+    ] == ["0", "123"]
+
+
+def test_duplicate_only_profile_page_does_not_refresh_no_progress_budget(
+    monkeypatch,
+) -> None:
+    clock = FakeClock()
+    first_page = _profile_response(
+        ["7000000000000000001"],
+        has_more=1,
+        max_cursor="123",
+    )
+    duplicate_page = _profile_response(
+        ["7000000000000000001"],
+        has_more=1,
+        max_cursor="456",
+    )
+
+    class TimedPage:
+        def __init__(self) -> None:
+            self.signed_requests: list[dict] = []
+            self.started_at = 0.0
+
+        def evaluate(self, script: str, argument=None):
+            if argument is not None:
+                self.signed_requests.append(argument)
+                self.started_at = clock.monotonic()
+                return None
+            if "controller.abort" in script:
+                return None
+            page_index = len(self.signed_requests) - 1
+            if page_index == 0:
+                return first_page
+            if page_index == 1:
+                if clock.monotonic() - self.started_at < 60:
+                    return {"state": "pending"}
+                return duplicate_page
+            return {"state": "pending"}
+
+        def wait_for_timeout(self, timeout: int) -> None:
+            clock.advance_ms(timeout)
+
+    page = TimedPage()
+    monkeypatch.setattr(
+        douyin_signing,
+        "time",
+        SimpleNamespace(monotonic=clock.monotonic, sleep=clock.sleep),
+    )
+    monkeypatch.setattr(
+        douyin_signing,
+        "_run_with_signing_page",
+        lambda *args, **kwargs: kwargs["operation"](page),
+    )
+
+    with pytest.raises(
+        TemporaryAccessError,
+        match="120 seconds without verified progress",
+    ):
+        fetch_signed_profile_awemes(
+            PROFILE_URL,
+            SEC_UID,
+            max_pages=3,
+            signer_settle_ms=0,
+            request_timeout_ms=119_500,
+        )
+
+    assert clock.now == pytest.approx(120, abs=0.01)
+    assert [
+        request["params"]["max_cursor"] for request in page.signed_requests
+    ] == ["0", "123", "456"]
+
+
+def test_fresh_signing_session_resumes_from_failed_profile_cursor(
+    monkeypatch,
+) -> None:
+    clock = FakeClock()
+    run_calls = 0
+    refresh_times: list[float] = []
+    requested_by_session: dict[int, list[str]] = {1: [], 2: []}
+    statuses: list[str] = []
+    original_refresh = douyin_signing._NoProgressBudget.refresh
+
+    def record_refresh(self) -> None:
+        refresh_times.append(clock.monotonic())
+        original_refresh(self)
+
+    first_page = _profile_response(
+        ["7000000000000000001"],
+        has_more=1,
+        max_cursor="123",
+    )
+    second_page = _profile_response(
+        ["7000000000000000002"],
+        has_more=0,
+        max_cursor="456",
+    )
+
+    class ReplayPage:
+        def __init__(self, session_number: int) -> None:
+            self.session_number = session_number
+            self.current_cursor = ""
+            self.started_at = 0.0
+
+        def evaluate(self, script: str, argument=None):
+            if argument is not None:
+                self.current_cursor = argument["params"]["max_cursor"]
+                requested_by_session[self.session_number].append(self.current_cursor)
+                self.started_at = clock.monotonic()
+                return None
+            if "controller.abort" in script:
+                return None
+            if self.session_number == 1:
+                if self.current_cursor == "0":
+                    return first_page
+                return {"state": "failed", "reason": "request_failed"}
+            if self.current_cursor != "123":
+                raise AssertionError("A fresh session replayed an already verified page")
+            return second_page
+
+        def wait_for_timeout(self, timeout: int) -> None:
+            clock.advance_ms(timeout)
+
+    def run(*args, **kwargs):
+        nonlocal run_calls
+        run_calls += 1
+        return kwargs["operation"](ReplayPage(run_calls))
+
+    monkeypatch.setattr(
+        douyin_signing,
+        "time",
+        SimpleNamespace(monotonic=clock.monotonic, sleep=clock.sleep),
+    )
+    monkeypatch.setattr(
+        douyin_signing._NoProgressBudget,
+        "refresh",
+        record_refresh,
+    )
+    monkeypatch.setattr(douyin_signing, "_run_with_signing_page", run)
+
+    awemes = fetch_signed_profile_awemes(
+        PROFILE_URL,
+        SEC_UID,
+        max_pages=2,
+        signer_settle_ms=0,
+        request_timeout_ms=119_500,
+        status_callback=statuses.append,
+    )
+
+    assert [aweme["aweme_id"] for aweme in awemes] == [
+        "7000000000000000001",
+        "7000000000000000002",
+    ]
+    assert run_calls == 2
+    assert requested_by_session == {
+        1: ["0", "123", "123", "123"],
+        2: ["123"],
+    }
+    assert refresh_times == [pytest.approx(0), pytest.approx(8)]
+    assert clock.now == pytest.approx(8)
+    assert "Resuming Douyin signed profile at page 2/2 (1 verified items)" in statuses
+
+
+def test_profile_session_rebuild_does_not_refresh_resume_budget(monkeypatch) -> None:
+    clock = FakeClock()
+    run_calls = 0
+    refresh_times: list[float] = []
+    second_session_cursors: list[str] = []
+    original_refresh = douyin_signing._NoProgressBudget.refresh
+    first_page = _profile_response(
+        ["7000000000000000001"],
+        has_more=1,
+        max_cursor="123",
+    )
+
+    def record_refresh(self) -> None:
+        refresh_times.append(clock.monotonic())
+        original_refresh(self)
+
+    class ResumeTimeoutPage:
+        def __init__(self, session_number: int) -> None:
+            self.session_number = session_number
+            self.current_cursor = ""
+
+        def evaluate(self, script: str, argument=None):
+            if argument is not None:
+                self.current_cursor = argument["params"]["max_cursor"]
+                if self.session_number == 2:
+                    second_session_cursors.append(self.current_cursor)
+                return None
+            if "controller.abort" in script:
+                return None
+            if self.session_number == 1 and self.current_cursor == "0":
+                return first_page
+            if self.session_number == 1:
+                return {"state": "failed", "reason": "request_failed"}
+            return {"state": "pending"}
+
+        def wait_for_timeout(self, timeout: int) -> None:
+            clock.advance_ms(timeout)
+
+    def run(*args, **kwargs):
+        nonlocal run_calls
+        run_calls += 1
+        return kwargs["operation"](ResumeTimeoutPage(run_calls))
+
+    monkeypatch.setattr(
+        douyin_signing,
+        "time",
+        SimpleNamespace(monotonic=clock.monotonic, sleep=clock.sleep),
+    )
+    monkeypatch.setattr(
+        douyin_signing._NoProgressBudget,
+        "refresh",
+        record_refresh,
+    )
+    monkeypatch.setattr(douyin_signing, "_run_with_signing_page", run)
+
+    with pytest.raises(
+        TemporaryAccessError,
+        match="120 seconds without verified progress",
+    ) as captured:
+        fetch_signed_profile_awemes(
+            PROFILE_URL,
+            SEC_UID,
+            max_pages=2,
+            signer_settle_ms=0,
+            request_timeout_ms=119_500,
+        )
+
+    assert isinstance(
+        captured.value.__cause__, douyin_signing._SigningNoProgressTimeout
+    )
+    assert "Reason category: network-error" in str(captured.value)
+    assert run_calls == 2
+    assert second_session_cursors and set(second_session_cursors) == {"123"}
+    assert refresh_times == [pytest.approx(0)]
+    assert clock.now == pytest.approx(120, abs=0.01)
+
+
 def test_profile_target_stops_before_a_later_transient_page(monkeypatch) -> None:
     target_aweme_id = "7000000000000000002"
     empty_response = {
@@ -1138,6 +1757,88 @@ def test_profile_target_stops_before_a_later_transient_page(monkeypatch) -> None
     assert manager.resources_closed_on_exit is True
 
 
+def test_profile_fetch_does_not_return_partial_result_after_unbound_empty_page(
+    monkeypatch,
+) -> None:
+    first_page = _profile_response(
+        ["7000000000000000001"],
+        has_more=1,
+        max_cursor="123",
+    )
+    unbound_empty_page = _profile_response([], has_more=0)
+    unbound_empty_page["payload"].pop("sec_uid")
+    requested_cursors: list[str] = []
+    statuses: list[str] = []
+
+    class RecordingBudget:
+        def __init__(self) -> None:
+            self.refresh_calls = 0
+
+        def remaining_seconds(self) -> float:
+            return 120.0
+
+        def clamp_timeout_ms(self, requested_ms: int) -> int:
+            return requested_ms
+
+        def note_failure(self, exc: BaseException) -> None:
+            del exc
+
+        def refresh(self) -> None:
+            self.refresh_calls += 1
+
+    class Page:
+        def __init__(self) -> None:
+            self.cursor = ""
+
+        def evaluate(self, script: str, argument=None):
+            if argument is not None:
+                self.cursor = argument["params"]["max_cursor"]
+                requested_cursors.append(self.cursor)
+                return None
+            if "controller.abort" in script:
+                return None
+            return first_page if self.cursor == "0" else unbound_empty_page
+
+    budget = RecordingBudget()
+    run_calls = 0
+
+    def run(*args, **kwargs):
+        nonlocal run_calls
+        del args
+        run_calls += 1
+        return kwargs["operation"](Page())
+
+    monkeypatch.setattr(douyin_signing, "_run_with_signing_page", run)
+    monkeypatch.setattr(
+        douyin_signing,
+        "_wait_with_cancel",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        douyin_signing,
+        "_wait_without_page_with_cancel",
+        lambda *args, **kwargs: None,
+    )
+
+    with pytest.raises(
+        TemporaryAccessError,
+        match="Reason category: api-unbound-empty-page",
+    ):
+        fetch_signed_profile_awemes(
+            PROFILE_URL,
+            SEC_UID,
+            signer_settle_ms=0,
+            status_callback=statuses.append,
+            progress_budget=budget,
+        )
+
+    assert run_calls == 3
+    assert requested_cursors[0] == "0"
+    assert requested_cursors[1:] == ["123"] * 9
+    assert budget.refresh_calls == 1
+    assert any("reason: api-unbound-empty-page" in value for value in statuses)
+
+
 def test_profile_fetch_retries_transient_empty_signed_response(monkeypatch) -> None:
     empty_response = {
         "state": "done",
@@ -1154,11 +1855,13 @@ def test_profile_fetch_retries_transient_empty_signed_response(monkeypatch) -> N
             ),
         ],
     )
+    statuses: list[str] = []
 
     awemes = fetch_signed_profile_awemes(
         PROFILE_URL,
         SEC_UID,
         signer_settle_ms=0,
+        status_callback=statuses.append,
     )
 
     assert [aweme["aweme_id"] for aweme in awemes] == ["7000000000000000001"]
@@ -1170,6 +1873,7 @@ def test_profile_fetch_retries_transient_empty_signed_response(monkeypatch) -> N
         "50",
         "18",
     ]
+    assert any("reason: api-missing-aweme-list" in value for value in statuses)
     assert page.closed and context.closed and browser.closed
     assert manager.resources_closed_on_exit is True
 
@@ -1187,7 +1891,7 @@ def test_profile_fetch_retries_with_a_fresh_signing_session(monkeypatch) -> None
     monkeypatch.setattr("app.douyin_signing._run_with_signing_page", run)
     monkeypatch.setattr(
         "app.douyin_signing._wait_without_page_with_cancel",
-        lambda duration_ms, should_cancel: delays.append(duration_ms),
+        lambda duration_ms, should_cancel, **kwargs: delays.append(duration_ms),
     )
 
     awemes = fetch_signed_profile_awemes(
@@ -1210,15 +1914,18 @@ def test_profile_transient_exhaustion_is_not_mislabeled_as_captcha(
     monkeypatch.setattr(
         "app.douyin_signing._run_with_signing_page",
         lambda *args, **kwargs: (_ for _ in ()).throw(
-            _TransientSigningFailure("temporary empty profile response")
+            _TransientSigningFailure(
+                "temporary profile limit",
+                category="http-429",
+            )
         ),
     )
     monkeypatch.setattr(
         "app.douyin_signing._wait_without_page_with_cancel",
-        lambda duration_ms, should_cancel: delays.append(duration_ms),
+        lambda duration_ms, should_cancel, **kwargs: delays.append(duration_ms),
     )
 
-    with pytest.raises(TemporaryAccessError, match="temporarily limited"):
+    with pytest.raises(TemporaryAccessError, match="temporarily limited") as captured:
         fetch_signed_profile_awemes(
             PROFILE_URL,
             SEC_UID,
@@ -1227,6 +1934,7 @@ def test_profile_transient_exhaustion_is_not_mislabeled_as_captcha(
         )
 
     assert delays == [5_000, 10_000]
+    assert "Reason category: http-429" in str(captured.value)
 
 
 def test_profile_page_limit_does_not_request_auth_and_closes_resources(

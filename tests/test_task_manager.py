@@ -15,6 +15,7 @@ from app.errors import (
     AuthenticationRequiredError,
     DiscoveryError,
     DouyinMediaRefreshRequiredError,
+    DownloadCancelledError,
     MediaDownloadError,
     TemporaryAccessError,
 )
@@ -5329,10 +5330,14 @@ def test_douyin_profile_redirect_auto_refreshes_once_and_resumes_queue(
         cookie_profile,
         prefer_exact_detail,
         should_cancel,
+        status_callback,
+        progress_budget,
     ):
         refresh_calls.append((profile_id, media_id, cookie_profile))
         assert prefer_exact_detail is True
         assert should_cancel() is False
+        assert callable(status_callback)
+        assert progress_budget is not None
         metadata = complete_douyin_profile_metadata(
             profile_url,
             media_id,
@@ -5494,6 +5499,7 @@ def test_douyin_profile_refresh_rejects_lower_detail_and_uses_feed_floor(
             )
 
     refresh_modes: list[bool] = []
+    refresh_budgets = []
 
     def refresh_profile_item(
         profile_id,
@@ -5502,8 +5508,12 @@ def test_douyin_profile_refresh_rejects_lower_detail_and_uses_feed_floor(
         cookie_profile,
         prefer_exact_detail=False,
         should_cancel,
+        status_callback,
+        progress_budget,
     ):
         refresh_modes.append(prefer_exact_detail)
+        refresh_budgets.append(progress_budget)
+        assert callable(status_callback)
         metadata = complete_douyin_profile_metadata(
             profile_url,
             target_media_id,
@@ -5545,6 +5555,7 @@ def test_douyin_profile_refresh_rejects_lower_detail_and_uses_feed_floor(
 
         assert completed.status == JobStatus.COMPLETED
         assert refresh_modes == [True, False]
+        assert refresh_budgets[0] is refresh_budgets[1]
         assert engine.download_calls == [initial_url, feed_url]
         cached = completed.items[0].metadata["douyin_profile_media"]
         assert cached["direct_candidates"][0]["width"] == 1440
@@ -5694,9 +5705,13 @@ def test_douyin_profile_redirect_refresh_attempt_is_capped_at_one(
         cookie_profile,
         prefer_exact_detail,
         should_cancel,
+        status_callback,
+        progress_budget,
     ):
         refresh_calls.append(media_id)
         assert prefer_exact_detail is True
+        assert callable(status_callback)
+        assert progress_budget is not None
         metadata = complete_douyin_profile_metadata(
             profile_url,
             media_id,
@@ -5982,8 +5997,12 @@ def test_douyin_profile_redirect_refresh_rejects_cross_wired_author(
         cookie_profile,
         prefer_exact_detail,
         should_cancel,
+        status_callback,
+        progress_budget,
     ):
         assert prefer_exact_detail is True
+        assert callable(status_callback)
+        assert progress_budget is not None
         refresh_calls.append(target_media_id)
         metadata = complete_douyin_profile_metadata(
             profile_url,
@@ -7259,3 +7278,224 @@ def test_cancel_does_not_overwrite_completed_job_state(tmp_path) -> None:
         assert unchanged.cancel_requested is False
     finally:
         manager.shutdown()
+
+
+def test_discovery_activity_is_published_and_cleared_after_completion(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    activity_published = threading.Event()
+    release_discovery = threading.Event()
+    published_events: list[tuple[str, int, str | None]] = []
+
+    class ReportingEngine:
+        def __init__(self) -> None:
+            self.discovery_callback = None
+
+        def discover(self, url, platform, kind, *, should_cancel):
+            assert self.discovery_callback is not None
+            self.discovery_callback(
+                EngineEvent(
+                    event="probing",
+                    message="Fetching Douyin signed profile page 3/300",
+                )
+            )
+            activity_published.set()
+            release_discovery.wait(timeout=5)
+            return DiscoveryResult(
+                author="Activity Author",
+                items=[
+                    DownloadItem(
+                        id="activity-item",
+                        media_id="LXb3EKWsInQ",
+                        source_url=(
+                            "https://www.youtube.com/watch?v=LXb3EKWsInQ"
+                        ),
+                        title="Activity item",
+                        media_type=MediaType.VIDEO,
+                    )
+                ],
+            )
+
+        def download_item(
+            self,
+            item,
+            platform,
+            output_dir,
+            *,
+            callback,
+            should_cancel,
+        ):
+            return DownloadOutcome(
+                output_paths=[str(Path(output_dir) / "activity-item.mp4")],
+                title=item.title,
+                upload_date="2025-11-14",
+                author="Activity Author",
+                media_type=MediaType.VIDEO,
+            )
+
+    manager = DownloadManager(
+        state_dir=tmp_path / "state",
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    engine = ReportingEngine()
+    monkeypatch.setattr(manager, "_engine_for_job", lambda job: engine)
+
+    def listener(event, job) -> None:
+        if event.event == "activity":
+            published_events.append(
+                (event.event, event.revision, job.activity_message)
+            )
+
+    manager.add_listener(listener)
+    try:
+        created = manager.create_job(
+            "https://www.youtube.com/watch?v=LXb3EKWsInQ",
+            auto_start=True,
+        )
+        assert activity_published.wait(timeout=2)
+
+        active = manager.get_job(created.id)
+        assert active.status == JobStatus.DISCOVERING
+        assert active.activity_message == "Fetching Douyin signed profile page 3/300"
+        assert active.activity_started_at is not None
+        assert active.warning is None
+        assert published_events == [
+            (
+                "activity",
+                active.revision,
+                "Fetching Douyin signed profile page 3/300",
+            )
+        ]
+        persisted = JsonJobStore(tmp_path / "state").get(created.id)
+        assert persisted.activity_message == active.activity_message
+        assert persisted.activity_started_at == active.activity_started_at
+
+        release_discovery.set()
+        completed = wait_for_job(manager, created.id)
+        assert completed.status == JobStatus.COMPLETED
+        assert completed.activity_message is None
+        assert completed.activity_started_at is None
+    finally:
+        release_discovery.set()
+        manager.shutdown()
+
+
+def test_phase_only_probe_clears_stale_transfer_metrics(tmp_path) -> None:
+    manager = DownloadManager(
+        state_dir=tmp_path / "state",
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    try:
+        created = manager.create_job(
+            "https://www.youtube.com/watch?v=LXb3EKWsInQ",
+            auto_start=False,
+        )
+        with manager._lock:
+            job = manager._require_job(created.id)
+            job.status = JobStatus.DOWNLOADING
+            job.items = [
+                DownloadItem(
+                    id="probe-item",
+                    media_id="LXb3EKWsInQ",
+                    source_url="https://www.youtube.com/watch?v=LXb3EKWsInQ",
+                    status=ItemStatus.DOWNLOADING,
+                    progress=TransferProgress(
+                        downloaded_bytes=10_000,
+                        total_bytes=10_000,
+                        percent=100,
+                        speed_bytes_per_second=1_000,
+                        eta_seconds=0,
+                    ),
+                )
+            ]
+            job.active_item_id = "probe-item"
+            manager._commit_locked(job)
+
+        manager._on_engine_event(
+            created.id,
+            "probe-item",
+            EngineEvent(
+                event="probing",
+                message="Checking Douyin quality 2/5: 4k",
+            ),
+        )
+
+        item = manager.get_job(created.id).items[0]
+        assert item.progress.filename == "Checking Douyin quality 2/5: 4k"
+        assert item.progress.downloaded_bytes == 0
+        assert item.progress.total_bytes is None
+        assert item.progress.percent is None
+        assert item.progress.speed_bytes_per_second is None
+        assert item.progress.eta_seconds is None
+    finally:
+        manager.shutdown()
+
+
+def test_discovery_activity_is_cleared_after_cancellation(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    activity_published = threading.Event()
+
+    class CancellableReportingEngine:
+        def __init__(self) -> None:
+            self.discovery_callback = None
+
+        def discover(self, url, platform, kind, *, should_cancel):
+            assert self.discovery_callback is not None
+            self.discovery_callback(
+                EngineEvent(
+                    event="probing",
+                    message="Loading Douyin profile in browser",
+                )
+            )
+            activity_published.set()
+            while not should_cancel():
+                threading.Event().wait(0.01)
+            raise DownloadCancelledError("Task cancelled")
+
+    manager = DownloadManager(
+        state_dir=tmp_path / "state",
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    monkeypatch.setattr(
+        manager,
+        "_engine_for_job",
+        lambda job: CancellableReportingEngine(),
+    )
+    try:
+        created = manager.create_job(
+            "https://www.youtube.com/watch?v=LXb3EKWsInQ",
+            auto_start=True,
+        )
+        assert activity_published.wait(timeout=2)
+        assert manager.get_job(created.id).activity_message is not None
+
+        cancelling = manager.cancel_job(created.id)
+        assert cancelling.activity_message is None
+        assert cancelling.activity_started_at is None
+        cancelled = wait_for_job(manager, created.id)
+        assert cancelled.status == JobStatus.CANCELLED
+        assert cancelled.activity_message is None
+        assert cancelled.activity_started_at is None
+    finally:
+        manager.shutdown()
+
+
+def test_download_job_activity_fields_are_optional_for_legacy_state(tmp_path) -> None:
+    legacy = DownloadJob.model_validate(
+        {
+            "id": "legacy-without-activity",
+            "source_url": "https://www.youtube.com/watch?v=LXb3EKWsInQ",
+            "platform": "youtube",
+            "source_kind": "item",
+            "output_root": str(tmp_path),
+        }
+    )
+
+    assert legacy.activity_message is None
+    assert legacy.activity_started_at is None
