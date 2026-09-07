@@ -672,6 +672,7 @@ svg {
   color: #c8af83;
   font-size: 11px;
   overflow-wrap: anywhere;
+  white-space: pre-line;
   word-break: break-word;
 }
 
@@ -974,7 +975,7 @@ svg {
   line-height: 1.5;
   overflow-wrap: anywhere;
   text-overflow: clip;
-  white-space: normal;
+  white-space: pre-line;
   word-break: break-word;
 }
 
@@ -1350,6 +1351,9 @@ svg {
   border-radius: 12px;
   box-shadow: 0 16px 40px rgba(0, 0, 0, 0.36);
   font-size: 11px;
+  overflow-wrap: anywhere;
+  white-space: pre-line;
+  word-break: break-word;
   animation: toast-in 220ms ease both;
 }
 

@@ -7,9 +7,28 @@ from pathlib import Path
 
 import pytest
 
+from app.errors import SiteIssueCode
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 NODE_EXECUTION_TIMEOUT_SECONDS = 30
+ISSUE_SOLUTION_MARKERS = {
+    "rate_limited": "等待 1–2 分钟",
+    "verification_required": "打开 Chrome 验证",
+    "login_required": "Chrome Profile 登录",
+    "request_rejected": "检查代理或 VPN",
+    "site_processing": "网站生成原文件",
+    "content_unavailable": "本工具无法下载",
+    "region_restricted": "本工具不会绕过地区限制",
+    "site_response_changed": "从原链接重新解析",
+    "media_link_expired": "刷新当前作品的媒体地址",
+    "site_unavailable": "等待服务恢复",
+    "network_error": "检查网络、DNS",
+    "cookie_unavailable": "完全退出 Chrome",
+    "security_blocked": "不要手动放行未知地址",
+    "local_configuration": "brew install ffmpeg",
+    "unknown": "版本号和 build ID",
+}
 
 
 def _run_node_script(
@@ -437,6 +456,10 @@ def test_structured_issue_helpers_drive_titles_messages_and_auth_state(
         "  window.__localizedIssueMessage = localizedIssueMessage;\n"
         "  window.__localizedPrimaryJobIssueMessage = "
         "localizedPrimaryJobIssueMessage;\n"
+        "  window.__issueResolutionText = issueResolutionText;\n"
+        "  window.__issueToastMessage = issueToastMessage;\n"
+        "  window.__warningToastMessage = warningToastMessage;\n"
+        "  window.__warningPresentation = warningPresentation;\n"
         "  window.__authRequired = authRequired;\n"
         "  window.__statusLabel = statusLabel;\n})();\n",
     )
@@ -472,7 +495,6 @@ def test_structured_issue_helpers_drive_titles_messages_and_auth_state(
         },
         "cookieDisabled": {
             "status": "failed",
-            "issue_code": "cookie_unavailable",
             "issue_message": (
                 "Douyin automatic item refresh was skipped because Chrome Cookie "
                 "is disabled for this task"
@@ -484,11 +506,35 @@ def test_structured_issue_helpers_drive_titles_messages_and_auth_state(
             "issue_message": "网络环境存在风险，请稍后再试",
             "items": [],
         },
+        "completedWarning": {
+            "status": "completed",
+            "warning": (
+                "Chrome cookies could not be read, so anonymous access was used"
+            ),
+            "items": [{"status": "completed"}],
+        },
+        "completedCookieFallback": {
+            "status": "completed",
+            "cookie_fallback_used": True,
+            "items": [{"status": "completed"}],
+        },
+        "incompleteDiscovery": {
+            "status": "completed",
+            "discovery_complete": False,
+            "items": [{"status": "completed"}],
+        },
     }
     harness = (
         "globalThis.window = {};\n"
         "globalThis.document = {querySelector: () => null};\n"
         f"const __jobs = {json.dumps(jobs)};\n"
+        f"const __issueCodes = {json.dumps([code.value for code in SiteIssueCode])};\n"
+        "const __issueJobs = Object.fromEntries(__issueCodes.map((code) => [code, {\n"
+        "  status: 'failed',\n"
+        "  issue_code: code,\n"
+        "  issue_message: `opaque-${code}`,\n"
+        "  items: [],\n"
+        "}]));\n"
     )
     trailer = """
 const output = {
@@ -516,6 +562,22 @@ const output = {
     title: window.__issueTitleForJob(__jobs.legacyRiskControl),
     auth: window.__authRequired(__jobs.legacyRiskControl),
   },
+  toast: window.__issueToastMessage(__jobs.rate, '网站正在限流'),
+  completedWarningToast: window.__warningToastMessage(__jobs.completedWarning),
+  warningPaths: {
+    completedWarning: window.__warningPresentation(__jobs.completedWarning),
+    completedCookieFallback: window.__warningPresentation(__jobs.completedCookieFallback),
+    incompleteDiscovery: window.__warningPresentation(__jobs.incompleteDiscovery),
+  },
+  solutionCoverage: Object.fromEntries(
+    __issueCodes.map((code) => [code, window.__issueResolutionText(code)])
+  ),
+  messageCoverage: Object.fromEntries(
+    __issueCodes.map((code) => [code, {
+      primary: window.__localizedPrimaryJobIssueMessage(__issueJobs[code]),
+      item: window.__localizedIssueMessage(__issueJobs[code]),
+    }])
+  ),
 };
 process.stdout.write(JSON.stringify(output));
 """
@@ -532,6 +594,8 @@ process.stdout.write(JSON.stringify(output));
     assert result["rate"]["code"] == "rate_limited"
     assert result["rate"]["title"] == "网站正在限流"
     assert "网站明确返回了限流信号" in result["rate"]["message"]
+    assert "发生了什么：" in result["rate"]["message"]
+    assert "解决办法：" in result["rate"]["message"]
     assert "opaque remote response 7f3a" in result["rate"]["message"]
     assert result["rate"]["auth"] is False
     assert result["rate"]["status"] == "被限流"
@@ -553,6 +617,53 @@ process.stdout.write(JSON.stringify(output));
         "title": "网站拒绝了本次请求",
         "auth": False,
     }
+    assert result["toast"].startswith("正在识别作者…：网站正在限流\n发生了什么：")
+    assert "\n解决办法：" in result["toast"]
+    assert "等待 1–2 分钟" in result["toast"]
+    assert result["completedWarningToast"].startswith("正在识别作者…\n发生了什么：")
+    assert "\n解决办法：" in result["completedWarningToast"]
+    assert "完全退出 Chrome" in result["completedWarningToast"]
+    for warning in result["warningPaths"].values():
+        assert warning is not None
+        assert warning["message"].startswith("发生了什么：")
+        assert "\n解决办法：" in warning["message"]
+    assert "完全退出 Chrome" in result["warningPaths"]["completedWarning"]["message"]
+    assert "完全退出 Chrome" in result["warningPaths"]["completedCookieFallback"]["message"]
+    assert "从原链接重新解析" in result["warningPaths"]["incompleteDiscovery"]["message"]
+    assert set(ISSUE_SOLUTION_MARKERS) == {
+        code.value for code in SiteIssueCode
+    }
+    assert set(result["solutionCoverage"]) == set(ISSUE_SOLUTION_MARKERS)
+    assert set(result["messageCoverage"]) == set(ISSUE_SOLUTION_MARKERS)
+    for code, marker in ISSUE_SOLUTION_MARKERS.items():
+        message = result["solutionCoverage"][code]
+        assert message.startswith("发生了什么：")
+        assert "\n解决办法：" in message
+        assert marker in message
+        solution = message.split("\n解决办法：", 1)[1].strip()
+        assert len(solution) >= 20
+        for rendered in result["messageCoverage"][code].values():
+            assert rendered.startswith("发生了什么：")
+            assert "\n解决办法：" in rendered
+            assert marker in rendered
+            assert f"opaque-{code}" in rendered
+            assert rendered.index("解决办法：") < rendered.index(
+                f"opaque-{code}"
+            )
+
+
+def test_issue_causes_and_solutions_preserve_visible_line_breaks() -> None:
+    styles = (PROJECT_ROOT / "app" / "static" / "styles.css").read_text(
+        encoding="utf-8"
+    )
+
+    assert ".auth-copy p" in styles
+    assert ".item-error" in styles
+    assert styles.count("white-space: pre-line;") >= 3
+    toast_rule = styles.rsplit(".toast {", 1)[1].split("}", 1)[0]
+    assert "overflow-wrap: anywhere;" in toast_rule
+    assert "white-space: pre-line;" in toast_rule
+    assert "word-break: break-word;" in toast_rule
 
 
 def test_discovery_activity_and_active_item_progress_are_visible(

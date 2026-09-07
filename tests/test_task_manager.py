@@ -5850,6 +5850,8 @@ def test_douyin_profile_redirect_refresh_respects_disabled_chrome_cookie(
         assert engine.download_calls == 1
         assert refresh_called is False
         assert "Chrome Cookie is disabled" in (blocked.error or "")
+        assert blocked.issue_code == SiteIssueCode.COOKIE_UNAVAILABLE
+        assert blocked.items[0].issue_code == SiteIssueCode.COOKIE_UNAVAILABLE
         assert blocked.items[0].output_paths == []
     finally:
         manager.shutdown()

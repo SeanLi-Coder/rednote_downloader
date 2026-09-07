@@ -127,6 +127,8 @@ def classify_site_issue(
         marker in lowered
         for marker in (
             "chrome cookies could not be read",
+            "cookie is disabled for this task",
+            "cookie was disabled when this task was created",
             "cookie database",
             "failed to load cookies",
             "failed to decrypt",

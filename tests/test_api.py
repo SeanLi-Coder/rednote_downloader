@@ -163,17 +163,16 @@ def test_index_injects_build_identity_and_disables_html_cache() -> None:
     ) < static_response.text.index(
         'text.includes("Douyin Live Photo authoritative quality source was temporarily unavailable")'
     )
-    assert (
-        "discoveryFailureMessage || localizeRuntimeMessage(job?.warning, job)"
-        in static_response.text
-    )
+    assert "warningPresentation(job)" in static_response.text
+    assert "showIssueToast(job" in static_response.text
+    assert "localizedPrimaryJobIssueMessage(job)" in static_response.text
     assert "抖音暂时无法创建经过验证的请求。请在 Chrome" not in static_response.text
     item_error_rule = styles_response.text.rsplit(".item-error {", 1)[1].split("}", 1)[0]
     for declaration in (
         "overflow: visible;",
         "overflow-wrap: anywhere;",
         "text-overflow: clip;",
-        "white-space: normal;",
+        "white-space: pre-line;",
     ):
         assert declaration in item_error_rule
 

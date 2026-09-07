@@ -58,6 +58,11 @@ from app.errors import (
             SiteIssueCode.COOKIE_UNAVAILABLE,
         ),
         (
+            "Douyin automatic item refresh was skipped because Chrome Cookie "
+            "is disabled for this task",
+            SiteIssueCode.COOKIE_UNAVAILABLE,
+        ),
+        (
             "This video is not available in your country",
             SiteIssueCode.REGION_RESTRICTED,
         ),

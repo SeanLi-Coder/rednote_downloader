@@ -1535,7 +1535,8 @@ class DownloadManager:
                 raise TemporaryAccessError(
                     "Douyin automatic item refresh was skipped because Chrome "
                     "Cookie is disabled for this task. Continue with Chrome Cookie "
-                    "enabled to request a fresh, identity-bound media address."
+                    "enabled to request a fresh, identity-bound media address.",
+                    issue_code=SiteIssueCode.COOKIE_UNAVAILABLE,
                 )
             profile_id = MediaDownloader._douyin_profile_id(
                 job_snapshot.source_url
