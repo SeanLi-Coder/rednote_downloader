@@ -55,9 +55,7 @@ def test_douyin_redirect_messages_execute_with_safe_legacy_and_reason_parsing(
     node = shutil.which("node")
     if node is None:
         pytest.skip("Node.js is unavailable")
-    source = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(
-        encoding="utf-8"
-    )
+    source = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
     tail = "  initialize();\n})();\n"
     assert tail in source
     source = source.replace(
@@ -216,6 +214,28 @@ def test_douyin_redirect_messages_execute_with_safe_legacy_and_reason_parsing(
             "The task was paused; completed files were preserved.",
             "连续 120 秒没有收到任何新字节后自动停止",
         ),
+        (
+            "Some Douyin image positions reported Live Photo data, but an older "
+            "version could not inspect the motion file.",
+            "部分抖音图片位带有 Live Photo 数据",
+        ),
+        (
+            "Chrome cookies could not be read, so anonymous access was used. "
+            "The profile may be incomplete and restricted high-quality formats "
+            "may be missing. Some Douyin image positions reported Live Photo "
+            "data, but no complete trusted motion rendition was available. The "
+            "highest-pixel static images will be saved for those positions. "
+            "Create a new task from the original link later to retry the dynamic "
+            "versions.",
+            "无法读取 Chrome Cookie",
+        ),
+        (
+            "A local DNS or web filter blocked Douyin before the site loaded. "
+            "Allow Douyin in the local filter, disable DNS filtering, or switch "
+            "networks, then retry the original link. Chrome verification is not "
+            "required.",
+            "在过滤器中放行抖音",
+        ),
     ]
     harness = (
         "globalThis.window = {};\n"
@@ -257,6 +277,11 @@ def test_douyin_redirect_messages_execute_with_safe_legacy_and_reason_parsing(
     assert "无法判断" in messages[9]
     assert "代理或 VPN" in messages[9]
     assert "不需要打开 Chrome 验证" in messages[9]
+    assert "稍后从原链接新建任务" in messages[-3]
+    assert "明确无水印的动态图版本" in messages[-2]
+    assert "Some Douyin image positions" not in messages[-2]
+    assert "关闭 DNS 过滤、切换网络" in messages[-1]
+    assert "不需要打开 Chrome 验证" in messages[-1]
 
 
 def test_interrupted_job_labels_queued_items_as_waiting_to_continue(
@@ -265,9 +290,7 @@ def test_interrupted_job_labels_queued_items_as_waiting_to_continue(
     node = shutil.which("node")
     if node is None:
         pytest.skip("Node.js is unavailable")
-    source = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(
-        encoding="utf-8"
-    )
+    source = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
     tail = "  initialize();\n})();\n"
     assert tail in source
     source = source.replace(
@@ -288,10 +311,7 @@ def test_interrupted_job_labels_queued_items_as_waiting_to_continue(
         "discovery_complete": False,
         "items": [
             {"id": "failed", "status": "failed", "retryable": True},
-            *[
-                {"id": f"queued-{index}", "status": "queued"}
-                for index in range(151)
-            ],
+            *[{"id": f"queued-{index}", "status": "queued"} for index in range(151)],
         ],
     }
     harness = (
@@ -322,15 +342,65 @@ def test_interrupted_job_labels_queued_items_as_waiting_to_continue(
     }
 
 
+def test_douyin_live_photo_outputs_are_labeled_by_saved_media(tmp_path: Path) -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is unavailable")
+    source = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
+    tail = "  initialize();\n})();\n"
+    assert tail in source
+    source = source.replace(
+        tail,
+        "  window.__itemType = itemType;\n})();\n",
+    )
+    items = [
+        {
+            "media_type": "video",
+            "selected_format": "douyin-highest-live-photos-or-images",
+            "output_paths": ["/tmp/2026-09-09-Live [1]-001.mp4"],
+        },
+        {
+            "media_type": "image",
+            "selected_format": "douyin-highest-live-photos-or-images",
+            "output_paths": [
+                "/tmp/2026-09-09-Live [1]-001.mp4",
+                "/tmp/2026-09-09-Live [1]-002.webp",
+            ],
+        },
+        {
+            "media_type": "image",
+            "selected_format": "douyin-highest-images",
+            "output_paths": ["/tmp/2026-09-09-Static [1]-001.webp"],
+        },
+    ]
+    harness = (
+        "globalThis.window = {};\n"
+        "globalThis.document = {querySelector: () => null};\n"
+        f"const __items = {json.dumps(items)};\n"
+    )
+    trailer = (
+        "\nprocess.stdout.write(JSON.stringify("
+        "__items.map(value => window.__itemType(value))));\n"
+    )
+
+    completed = _run_node_script(
+        node,
+        harness + source + trailer,
+        tmp_path,
+        "douyin-live-photo-item-types.js",
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == ["动态图", "动态图 + 图片", "图片"]
+
+
 def test_xiaohongshu_profile_auth_labels_the_blocked_note_as_verification_target(
     tmp_path: Path,
 ) -> None:
     node = shutil.which("node")
     if node is None:
         pytest.skip("Node.js is unavailable")
-    source = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(
-        encoding="utf-8"
-    )
+    source = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
     tail = "  initialize();\n})();\n"
     assert tail in source
     source = source.replace(
@@ -394,9 +464,7 @@ def test_nonretryable_failed_item_keeps_visible_error_without_retrying(
     node = shutil.which("node")
     if node is None:
         pytest.skip("Node.js is unavailable")
-    source = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(
-        encoding="utf-8"
-    )
+    source = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
     tail = "  initialize();\n})();\n"
     assert tail in source
     assert 'if (state.filter === "failed") return isFailed(item);' in source
@@ -443,9 +511,7 @@ def test_structured_issue_helpers_drive_titles_messages_and_auth_state(
     node = shutil.which("node")
     if node is None:
         pytest.skip("Node.js is unavailable")
-    source = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(
-        encoding="utf-8"
-    )
+    source = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
     tail = "  initialize();\n})();\n"
     assert tail in source
     assert "if (!isRunning(job) && isRetryableItem(item)" in source
@@ -513,6 +579,16 @@ def test_structured_issue_helpers_drive_titles_messages_and_auth_state(
             ),
             "items": [{"status": "completed"}],
         },
+        "completedLivePhotoFallback": {
+            "status": "completed",
+            "warning": (
+                "Some Douyin image positions reported Live Photo data, but no "
+                "complete trusted motion rendition was available. The highest-pixel "
+                "static images will be saved for those positions. Create a new task "
+                "from the original link later to retry the dynamic versions."
+            ),
+            "items": [{"status": "completed"}],
+        },
         "completedCookieFallback": {
             "status": "completed",
             "cookie_fallback_used": True,
@@ -566,6 +642,7 @@ const output = {
   completedWarningToast: window.__warningToastMessage(__jobs.completedWarning),
   warningPaths: {
     completedWarning: window.__warningPresentation(__jobs.completedWarning),
+    completedLivePhotoFallback: window.__warningPresentation(__jobs.completedLivePhotoFallback),
     completedCookieFallback: window.__warningPresentation(__jobs.completedCookieFallback),
     incompleteDiscovery: window.__warningPresentation(__jobs.incompleteDiscovery),
   },
@@ -628,11 +705,24 @@ process.stdout.write(JSON.stringify(output));
         assert warning["message"].startswith("发生了什么：")
         assert "\n解决办法：" in warning["message"]
     assert "完全退出 Chrome" in result["warningPaths"]["completedWarning"]["message"]
-    assert "完全退出 Chrome" in result["warningPaths"]["completedCookieFallback"]["message"]
-    assert "从原链接重新解析" in result["warningPaths"]["incompleteDiscovery"]["message"]
-    assert set(ISSUE_SOLUTION_MARKERS) == {
-        code.value for code in SiteIssueCode
+    assert result["warningPaths"]["completedLivePhotoFallback"] == {
+        "title": "部分 Live Photo 已保存为静态图",
+        "message": (
+            "发生了什么：作品的部分图片位标记了 Live Photo，但程序没有取得完整"
+            "可信且明确无水印的动态图，因此没有把低清或来源不明的视频冒充原始"
+            "动态图。\n解决办法：这些位置已保存最高像素静态图；若之后仍想取得动态"
+            "图，请稍后从原链接新建任务重试。"
+        ),
+        "isAlert": False,
     }
+    assert (
+        "完全退出 Chrome"
+        in result["warningPaths"]["completedCookieFallback"]["message"]
+    )
+    assert (
+        "从原链接重新解析" in result["warningPaths"]["incompleteDiscovery"]["message"]
+    )
+    assert set(ISSUE_SOLUTION_MARKERS) == {code.value for code in SiteIssueCode}
     assert set(result["solutionCoverage"]) == set(ISSUE_SOLUTION_MARKERS)
     assert set(result["messageCoverage"]) == set(ISSUE_SOLUTION_MARKERS)
     for code, marker in ISSUE_SOLUTION_MARKERS.items():
@@ -647,9 +737,7 @@ process.stdout.write(JSON.stringify(output));
             assert "\n解决办法：" in rendered
             assert marker in rendered
             assert f"opaque-{code}" in rendered
-            assert rendered.index("解决办法：") < rendered.index(
-                f"opaque-{code}"
-            )
+            assert rendered.index("解决办法：") < rendered.index(f"opaque-{code}")
 
 
 def test_issue_causes_and_solutions_preserve_visible_line_breaks() -> None:
@@ -672,9 +760,7 @@ def test_discovery_activity_and_active_item_progress_are_visible(
     node = shutil.which("node")
     if node is None:
         pytest.skip("Node.js is unavailable")
-    source = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(
-        encoding="utf-8"
-    )
+    source = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
     tail = "  initialize();\n})();\n"
     assert tail in source
     source = source.replace(
@@ -737,9 +823,7 @@ def test_discovery_activity_and_active_item_progress_are_visible(
             {
                 "id": "current",
                 "status": "downloading",
-                "progress": {
-                    "filename": "Starting Douyin original media transfer"
-                },
+                "progress": {"filename": "Starting Douyin original media transfer"},
             }
         ],
     }
@@ -846,17 +930,14 @@ def test_discovery_activity_and_active_item_progress_are_visible(
             "抖音主页第 3 页请求暂时失败（HTTP 429 限流），正在重试"
             "（2/3）（已等待 1 分 5 秒）"
         ),
-        "freshSession": (
-            "抖音主页签名会话暂时失败（接口业务状态异常），正在重新建立"
-        ),
+        "freshSession": ("抖音主页签名会话暂时失败（接口业务状态异常），正在重新建立"),
         "resume": "正在从抖音主页第 2 页续跑（已验证 44 个作品）",
         "browserStart": (
             "正在切换到有时限的抖音主页浏览器解析"
             "（签名响应未通过完整性校验，剩余 87 秒）"
         ),
         "browserScan": (
-            "正在滚动读取抖音主页（第 4/300 轮，已验证 12 个作品，"
-            "剩余 63 秒）"
+            "正在滚动读取抖音主页（第 4/300 轮，已验证 12 个作品，" "剩余 63 秒）"
         ),
         "browserAdded": "浏览器解析新增 3 个抖音作品（共 15 个，剩余 120 秒）",
         "browserTimeout": (
@@ -870,9 +951,7 @@ def test_discovery_activity_and_active_item_progress_are_visible(
         "transferStart": "正在开始传输抖音原文件",
         "qualityWait": "正在等待前一个抖音画质校验完成（已等待 12 秒）",
         "mediaCandidate": "正在检测抖音媒体候选 4/24（2k）",
-        "qualityCandidateRead": (
-            "正在读取抖音画质候选 4/24（author-feed-1）"
-        ),
+        "qualityCandidateRead": ("正在读取抖音画质候选 4/24（author-feed-1）"),
         "mediaCandidateOverall": 25,
         "qualityCandidateReadOverall": 25,
     }

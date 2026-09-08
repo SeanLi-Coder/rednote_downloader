@@ -317,8 +317,51 @@ def complete_douyin_item_metadata(
             "video_uri": video_uri,
             "minimum_width": 1440,
             "minimum_height": 2560,
-            "direct_candidates": [
-                douyin_direct_candidate(video_uri, url=direct_url)
+            "direct_candidates": [douyin_direct_candidate(video_uri, url=direct_url)],
+        },
+    }
+
+
+def complete_douyin_live_photo_item_metadata(
+    source_url: str,
+    media_id: str,
+    *,
+    owner_id: str = "MS4wLjABAAAAverified-live-photo-owner",
+) -> dict:
+    live_uri = "v0200fg10000verifiedlivephotoitem"
+    return {
+        "verification_url": source_url,
+        "item_identity_verified": True,
+        "douyin_item_media": {
+            "media_id": media_id,
+            "owner_id": owner_id,
+            "media_kind": "image",
+            "title": "Verified Live Photo",
+            "author": "Verified Author",
+            "create_time": 1_756_656_000,
+            "image_assets": [
+                {
+                    "index": 1,
+                    "width": 1440,
+                    "height": 2560,
+                    "candidates": ["https://p3-pc-sign.douyinpic.com/live-cover.webp"],
+                }
+            ],
+            "live_photo_assets": [
+                {
+                    "index": 1,
+                    "width": 1440,
+                    "height": 2560,
+                    "candidates": ["https://v26-web.douyinvod.com/live-original.mp4"],
+                    "video_uri": live_uri,
+                    "duration_ms": 2_400,
+                    "direct_candidates": [
+                        douyin_direct_candidate(
+                            live_uri,
+                            url=("https://v26-web.douyinvod.com/" "live-original.mp4"),
+                        )
+                    ],
+                }
             ],
         },
     }
@@ -1261,9 +1304,7 @@ def test_xiaohongshu_direct_binding_failure_rediscovery_replaces_wrong_item(
 
         assert blocked.status == JobStatus.FAILED
         assert blocked.discovery_complete is False
-        assert blocked.items[0].metadata[
-            XIAOHONGSHU_BINDING_REDISCOVERY_MARKER
-        ] is True
+        assert blocked.items[0].metadata[XIAOHONGSHU_BINDING_REDISCOVERY_MARKER] is True
         assert engine.download_calls == []
 
         if retry_method == "retry_item":
@@ -1281,10 +1322,7 @@ def test_xiaohongshu_direct_binding_failure_rediscovery_replaces_wrong_item(
         assert completed.items[0].id == "fresh-target"
         assert completed.items[0].media_id == expected_id
         assert completed.items[0].status == ItemStatus.COMPLETED
-        assert (
-            XIAOHONGSHU_BINDING_REDISCOVERY_MARKER
-            not in completed.items[0].metadata
-        )
+        assert XIAOHONGSHU_BINDING_REDISCOVERY_MARKER not in completed.items[0].metadata
         assert all(item.media_id != wrong_id for item in completed.items)
     finally:
         manager.shutdown()
@@ -1317,9 +1355,7 @@ def test_xiaohongshu_short_binding_failure_retry_resolves_original_link(
                         media_type=MediaType.IMAGE,
                         metadata={
                             "xiaohongshu_resolved_source_url": expected_url,
-                            "xiaohongshu_resolved_source_kind": (
-                                SourceKind.ITEM.value
-                            ),
+                            "xiaohongshu_resolved_source_kind": (SourceKind.ITEM.value),
                         },
                     )
                 ],
@@ -1472,9 +1508,7 @@ def test_xiaohongshu_short_profile_retry_preserves_completed_history(
                 DownloadItem(
                     id="completed-note",
                     media_id=completed_id.upper(),
-                    source_url=(
-                        f"https://www.xiaohongshu.com/explore/{completed_id}"
-                    ),
+                    source_url=(f"https://www.xiaohongshu.com/explore/{completed_id}"),
                     title="Completed note",
                     media_type=MediaType.IMAGE,
                     status=ItemStatus.COMPLETED,
@@ -1484,9 +1518,7 @@ def test_xiaohongshu_short_profile_retry_preserves_completed_history(
                 DownloadItem(
                     id="failed-note",
                     media_id=retry_id,
-                    source_url=(
-                        f"https://www.xiaohongshu.com/explore/{retry_id}"
-                    ),
+                    source_url=(f"https://www.xiaohongshu.com/explore/{retry_id}"),
                     title="Failed note",
                     media_type=MediaType.IMAGE,
                     status=ItemStatus.FAILED,
@@ -1623,9 +1655,9 @@ def test_persisted_xiaohongshu_direct_binding_failure_rediscovery_after_restart(
         blocked = wait_for_job(first_manager, created.id)
         assert blocked.status == JobStatus.FAILED
         persisted = JsonJobStore(state_dir).get(created.id)
-        assert persisted.items[0].metadata[
-            XIAOHONGSHU_BINDING_REDISCOVERY_MARKER
-        ] is True
+        assert (
+            persisted.items[0].metadata[XIAOHONGSHU_BINDING_REDISCOVERY_MARKER] is True
+        )
     finally:
         first_manager.shutdown()
 
@@ -1712,8 +1744,7 @@ def test_restore_migrates_only_unverified_completed_xiaohongshu_profile_images(
                 id="legacy-image",
                 media_id="6411cf99000000001300b6d9",
                 source_url=(
-                    "https://www.xiaohongshu.com/explore/"
-                    "6411cf99000000001300b6d9"
+                    "https://www.xiaohongshu.com/explore/" "6411cf99000000001300b6d9"
                 ),
                 media_type=MediaType.IMAGE,
                 status=ItemStatus.COMPLETED,
@@ -1723,8 +1754,7 @@ def test_restore_migrates_only_unverified_completed_xiaohongshu_profile_images(
                 id="verified-image",
                 media_id="6411cf99000000001300b6da",
                 source_url=(
-                    "https://www.xiaohongshu.com/explore/"
-                    "6411cf99000000001300b6da"
+                    "https://www.xiaohongshu.com/explore/" "6411cf99000000001300b6da"
                 ),
                 media_type=MediaType.IMAGE,
                 status=ItemStatus.COMPLETED,
@@ -1738,8 +1768,7 @@ def test_restore_migrates_only_unverified_completed_xiaohongshu_profile_images(
                 id="legacy-video",
                 media_id="6411cf99000000001300b6db",
                 source_url=(
-                    "https://www.xiaohongshu.com/explore/"
-                    "6411cf99000000001300b6db"
+                    "https://www.xiaohongshu.com/explore/" "6411cf99000000001300b6db"
                 ),
                 media_type=MediaType.VIDEO,
                 status=ItemStatus.COMPLETED,
@@ -1766,9 +1795,12 @@ def test_restore_migrates_only_unverified_completed_xiaohongshu_profile_images(
         assert restored.failed_items == 1
         assert items["legacy-image"].status == ItemStatus.FAILED
         assert items["legacy-image"].output_paths == [str(legacy_path)]
-        assert items["legacy-image"].metadata[
-            XIAOHONGSHU_PROFILE_MEDIA_REVALIDATION_MARKER
-        ] is True
+        assert (
+            items["legacy-image"].metadata[
+                XIAOHONGSHU_PROFILE_MEDIA_REVALIDATION_MARKER
+            ]
+            is True
+        )
         assert items["verified-image"].status == ItemStatus.COMPLETED
         assert items["legacy-video"].status == ItemStatus.COMPLETED
 
@@ -1851,10 +1883,7 @@ def test_legacy_xiaohongshu_profile_image_is_rediscovered_as_video(
             self.download_calls += 1
             assert item.media_type == MediaType.VIDEO
             assert item.output_paths == [str(old_file)]
-            assert (
-                XIAOHONGSHU_PROFILE_MEDIA_REVALIDATION_MARKER
-                not in item.metadata
-            )
+            assert XIAOHONGSHU_PROFILE_MEDIA_REVALIDATION_MARKER not in item.metadata
             return DownloadOutcome(
                 output_paths=[str(Path(output_dir) / "verified-video.mp4")],
                 title=item.title,
@@ -1884,9 +1913,10 @@ def test_legacy_xiaohongshu_profile_image_is_rediscovered_as_video(
         assert len(completed.items) == 1
         assert completed.items[0].id == "fresh-video"
         assert completed.items[0].media_type == MediaType.VIDEO
-        assert completed.items[0].metadata[
-            XIAOHONGSHU_MEDIA_VERIFICATION_MARKER
-        ] == XIAOHONGSHU_MEDIA_VERIFICATION_VERSION
+        assert (
+            completed.items[0].metadata[XIAOHONGSHU_MEDIA_VERIFICATION_MARKER]
+            == XIAOHONGSHU_MEDIA_VERIFICATION_VERSION
+        )
         assert (
             XIAOHONGSHU_PROFILE_MEDIA_REVALIDATION_MARKER
             not in completed.items[0].metadata
@@ -1927,8 +1957,7 @@ def test_persisted_xiaohongshu_profile_item_is_revalidated_before_download(
                     id="legacy-untrusted",
                     media_id="6411cf99000000001300b6d9",
                     source_url=(
-                        "https://evil.example/explore/"
-                        "6411cf99000000001300b6d9"
+                        "https://evil.example/explore/" "6411cf99000000001300b6d9"
                     ),
                     status=ItemStatus.QUEUED,
                     metadata={
@@ -2308,7 +2337,22 @@ def test_retry_repairs_persisted_douyin_item_profile_expansion(
         manager.shutdown()
 
 
+@pytest.mark.parametrize(
+    "legacy_source_template",
+    [
+        (
+            "https://www.douyin.com/user/self?from_tab_name=main"
+            "&modal_id={media_id}&showTab=favorite_collection"
+        ),
+        (
+            "https://www.douyin.com/user/"
+            "MS4wLjABAAAAvLgZS-O6Oc9diWWZ-jctzlhanUBoN7a5oJLdsTkx6F9TVD9kehAqFqdrpG3uPlmz"
+            "?from_tab_name=main&modal_id={media_id}&vid={media_id}"
+        ),
+    ],
+)
 def test_restore_migrates_single_modal_item_and_forces_direct_rediscovery(
+    legacy_source_template,
     tmp_path,
 ) -> None:
     media_id = "7664225419386607205"
@@ -2316,10 +2360,7 @@ def test_restore_migrates_single_modal_item_and_forces_direct_rediscovery(
     state_dir = tmp_path / "state"
     job = DownloadJob(
         id="legacy-modal-single",
-        source_url=(
-            "https://www.douyin.com/user/wrong-profile"
-            f"?modal_id={media_id}&from_tab_name=main"
-        ),
+        source_url=legacy_source_template.format(media_id=media_id),
         platform=Platform.DOUYIN,
         source_kind=SourceKind.PROFILE,
         output_root=str(tmp_path / "downloads"),
@@ -2673,16 +2714,16 @@ def test_restore_migrates_legacy_douyin_profile_redirect_for_rediscovery(
             DownloadItem(
                 id="preserved",
                 media_id="7664225419386607205",
-                    source_url="https://www.douyin.com/video/7664225419386607205",
+                source_url="https://www.douyin.com/video/7664225419386607205",
+                title="Preserved",
+                media_type=MediaType.VIDEO,
+                status=ItemStatus.COMPLETED,
+                output_paths=[str(preserved_file)],
+                metadata=complete_douyin_profile_metadata(
+                    profile_url,
+                    "7664225419386607205",
                     title="Preserved",
-                    media_type=MediaType.VIDEO,
-                    status=ItemStatus.COMPLETED,
-                    output_paths=[str(preserved_file)],
-                    metadata=complete_douyin_profile_metadata(
-                        profile_url,
-                        "7664225419386607205",
-                        title="Preserved",
-                    ),
+                ),
             ),
             DownloadItem(
                 id="failed",
@@ -2869,9 +2910,7 @@ def test_restore_migrates_legacy_douyin_item_redirect_for_rediscovery(
                                 "video_uri": "v0200fg10000staleitemmedia",
                                 "width": 1080,
                                 "height": 1920,
-                                "urls": [
-                                    "https://v26-web.douyinvod.com/stale.mp4"
-                                ],
+                                "urls": ["https://v26-web.douyinvod.com/stale.mp4"],
                             }
                         ],
                     },
@@ -2980,9 +3019,9 @@ def test_restore_marks_current_douyin_profile_redirect_for_safe_refresh(
         assert restored.status == JobStatus.INTERRUPTED
         assert restored.retryable is True
         assert restored.discovery_complete is False
-        assert restored.items[0].metadata[
-            DOUYIN_PROFILE_REFRESH_REQUIRED_MARKER
-        ] is True
+        assert (
+            restored.items[0].metadata[DOUYIN_PROFILE_REFRESH_REQUIRED_MARKER] is True
+        )
         assert restored.items[0].output_paths == job.items[0].output_paths
         assert restored.items[1].status == ItemStatus.QUEUED
         assert restored.error == generic_job_error
@@ -3090,9 +3129,7 @@ def test_restore_removes_unsaved_numeric_items_from_direct_video_expansion(
     target_id = "7664225419386607205"
     source_url = f"https://www.douyin.com/video/{target_id}"
     state_dir = tmp_path / "state"
-    media_ids = [target_id] + [
-        str(7670000000000000000 + index) for index in range(150)
-    ]
+    media_ids = [target_id] + [str(7670000000000000000 + index) for index in range(150)]
     job = DownloadJob(
         id="legacy-151-direct-items",
         source_url=source_url,
@@ -3310,9 +3347,7 @@ def test_restore_upgrades_previously_quarantined_profile_for_rediscovery(
         "MS4wLjABAAAA9OBQVqfaEUOvYbk2U0bSMCmaGV9OiG5-"
         "k15gEXhWLuFzBhLejblDoYncRu6bRB-x"
     )
-    submitted_url = (
-        f"https://www.douyin.com/user/{profile_id}?from_tab_name=main"
-    )
+    submitted_url = f"https://www.douyin.com/user/{profile_id}?from_tab_name=main"
     canonical_url = f"https://www.douyin.com/user/{profile_id}"
     job = DownloadJob(
         id="previously-quarantined-profile",
@@ -3412,9 +3447,9 @@ def test_restore_upgrades_quarantined_profile_and_preserves_existing_files(
         assert len(restored.items) == 1
         assert restored.items[0].output_paths == [str(output_path)]
         assert restored.items[0].retryable is False
-        assert restored.items[0].metadata[
-            DOUYIN_PROFILE_REDISCOVERY_ITEM_MARKER
-        ] is True
+        assert (
+            restored.items[0].metadata[DOUYIN_PROFILE_REDISCOVERY_ITEM_MARKER] is True
+        )
         assert output_path.read_bytes() == b"preserved-original-bytes"
     finally:
         manager.shutdown()
@@ -3536,6 +3571,7 @@ def test_restore_quarantines_numeric_queue_without_a_recoverable_profile_source(
         "https://www.douyin.com/user/%2F",
         "https://www.douyin.com/user/short",
         "https://www.douyin.com/user/MS4wLjABAAAATEST?modal_id=7664225419386607205",
+        "https://www.douyin.com/user/MS4wLjABAAAATEST?vid=7664225419386607205",
         "https://www.douyin.com/video/7664225419386607205",
         "https://www.douyin.com/user/MS4wLjABAAAATEST/extra",
         "https://user@www.douyin.com/user/MS4wLjABAAAATEST",
@@ -3565,9 +3601,7 @@ def test_legacy_profile_rediscovery_rejects_untrusted_source_anchors(
             DownloadItem(
                 id=preserved_media_id,
                 media_id=preserved_media_id,
-                source_url=(
-                    f"https://www.douyin.com/video/{preserved_media_id}"
-                ),
+                source_url=(f"https://www.douyin.com/video/{preserved_media_id}"),
                 title="Preserved unverified file",
                 status=ItemStatus.FAILED,
                 retryable=False,
@@ -3663,8 +3697,7 @@ def test_restore_preserves_files_and_rediscovers_mixed_numeric_profile_queue(
         assert restored.items[0].output_paths == [str(output_path)]
         assert restored.items[0].retryable is False
         assert (
-            restored.items[0].metadata[DOUYIN_PROFILE_REDISCOVERY_ITEM_MARKER]
-            is True
+            restored.items[0].metadata[DOUYIN_PROFILE_REDISCOVERY_ITEM_MARKER] is True
         )
         assert output_path.exists()
     finally:
@@ -3922,9 +3955,7 @@ def test_restore_migrates_legacy_douyin_profile_media_without_direct_candidates(
                     "index": 1,
                     "width": 1440,
                     "height": 2560,
-                    "candidates": [
-                        "https://p3-sign.douyinpic.com/legacy-image.jpeg"
-                    ],
+                    "candidates": ["https://p3-sign.douyinpic.com/legacy-image.jpeg"],
                 }
             ],
             "live_photo_assets": [
@@ -3956,9 +3987,7 @@ def test_restore_migrates_legacy_douyin_profile_media_without_direct_candidates(
                 source_url=f"https://www.douyin.com/video/{media_id}",
                 title=f"Legacy {media_kind}",
                 media_type=(
-                    MediaType.VIDEO
-                    if media_kind == "video"
-                    else MediaType.IMAGE
+                    MediaType.VIDEO if media_kind == "video" else MediaType.IMAGE
                 ),
                 status=ItemStatus.NEEDS_AUTH,
                 output_paths=[str(preserved_path)],
@@ -3990,9 +4019,9 @@ def test_restore_migrates_legacy_douyin_profile_media_without_direct_candidates(
         assert restored.items[0].status == ItemStatus.FAILED
         assert restored.items[0].retryable is False
         assert restored.items[0].output_paths == [str(preserved_path)]
-        assert restored.items[0].metadata[
-            DOUYIN_PROFILE_REDISCOVERY_ITEM_MARKER
-        ] is True
+        assert (
+            restored.items[0].metadata[DOUYIN_PROFILE_REDISCOVERY_ITEM_MARKER] is True
+        )
         assert preserved_path.read_bytes() == b"preserved-before-direct-renditions"
     finally:
         manager.shutdown()
@@ -4129,9 +4158,9 @@ def test_profile_rediscovery_marker_preserves_needs_auth_across_restart(
         assert restored.status == JobStatus.NEEDS_AUTH
         assert restored.auth_message == auth_message
         assert restored.verification_url == profile_url
-        assert restored.items[0].metadata[
-            DOUYIN_PROFILE_REDISCOVERY_ITEM_MARKER
-        ] is True
+        assert (
+            restored.items[0].metadata[DOUYIN_PROFILE_REDISCOVERY_ITEM_MARKER] is True
+        )
     finally:
         manager.shutdown()
 
@@ -4218,9 +4247,9 @@ def test_profile_rediscovery_marker_survives_partial_discovery_pause(
     monkeypatch.setattr(manager, "_engine_for_job", lambda restored_job: engine)
     try:
         restored = manager.get_job(job.id)
-        assert restored.items[0].metadata[
-            DOUYIN_PROFILE_REDISCOVERY_ITEM_MARKER
-        ] is True
+        assert (
+            restored.items[0].metadata[DOUYIN_PROFILE_REDISCOVERY_ITEM_MARKER] is True
+        )
 
         manager.retry_failed(job.id)
         paused = wait_for_job(manager, job.id)
@@ -4235,9 +4264,7 @@ def test_profile_rediscovery_marker_survives_partial_discovery_pause(
         assert paused.items[0].status == ItemStatus.FAILED
         assert paused.items[0].retryable is False
         assert paused.items[0].output_paths == [str(output_path)]
-        assert paused.items[0].metadata[
-            DOUYIN_PROFILE_REDISCOVERY_ITEM_MARKER
-        ] is True
+        assert paused.items[0].metadata[DOUYIN_PROFILE_REDISCOVERY_ITEM_MARKER] is True
         assert output_path.read_bytes() == b"preserved-before-partial-feed"
         assert engine.discovery_calls == 1
         assert engine.download_calls == 0
@@ -4429,9 +4456,7 @@ def test_restore_discards_legacy_douyin_item_cache_without_direct_candidates(
             should_cancel,
         ):
             self.download_calls += 1
-            assert item.metadata["douyin_item_media"]["video_uri"] != (
-                legacy_video_uri
-            )
+            assert item.metadata["douyin_item_media"]["video_uri"] != (legacy_video_uri)
             return DownloadOutcome(
                 output_paths=[str(Path(output_dir) / "fresh-target.mp4")],
                 title=item.title,
@@ -4531,6 +4556,128 @@ def test_fresh_douyin_item_without_direct_candidates_pauses_before_download(
         assert engine.download_calls == 0
     finally:
         manager.shutdown()
+
+
+def test_fresh_douyin_live_photo_item_cache_is_validated_and_preserved(
+    tmp_path,
+) -> None:
+    media_id = "7683074221437746170"
+    source_url = f"https://www.douyin.com/video/{media_id}"
+    job = DownloadJob(
+        id="bound-live-photo-item",
+        source_url=source_url,
+        platform=Platform.DOUYIN,
+        source_kind=SourceKind.ITEM,
+        output_root=str(tmp_path),
+    )
+    metadata = complete_douyin_live_photo_item_metadata(source_url, media_id)
+    item = DownloadItem(
+        id="target",
+        media_id=media_id,
+        source_url=source_url,
+        title="Verified Live Photo",
+        media_type=MediaType.IMAGE,
+        metadata=metadata,
+    )
+
+    DownloadManager._validate_discovery_result(
+        job,
+        DiscoveryResult(author="Verified Author", items=[item]),
+    )
+
+    assert item.source_url == source_url
+    assert item.metadata == metadata
+    assert item.metadata["douyin_item_media"]["media_kind"] == "image"
+
+
+def test_restore_preserves_completed_live_photo_item_with_only_mp4_output(
+    tmp_path,
+) -> None:
+    media_id = "7683074221437746170"
+    source_url = f"https://www.douyin.com/video/{media_id}"
+    state_dir = tmp_path / "state"
+    output_root = tmp_path / "downloads"
+    output_root.mkdir()
+    output_path = output_root / f"2025-09-01-Live Photo [{media_id}]-001.mp4"
+    output_path.write_bytes(b"previously-verified-live-photo")
+    item = DownloadItem(
+        id="completed-live-photo",
+        media_id=media_id,
+        source_url=source_url,
+        title="Verified Live Photo",
+        media_type=MediaType.IMAGE,
+        status=ItemStatus.COMPLETED,
+        selected_format="douyin-highest-live-photos-or-images",
+        output_paths=[str(output_path)],
+        metadata=complete_douyin_live_photo_item_metadata(source_url, media_id),
+    )
+    job = DownloadJob(
+        id="completed-live-photo-job",
+        source_url=source_url,
+        platform=Platform.DOUYIN,
+        source_kind=SourceKind.ITEM,
+        output_root=str(output_root),
+        output_dir=str(output_root),
+        status=JobStatus.COMPLETED,
+        author="Verified Author",
+        items=[item],
+        discovery_complete=True,
+    )
+    job.refresh_counts()
+    JsonJobStore(state_dir).save(job)
+
+    manager = DownloadManager(
+        state_dir=state_dir,
+        default_output_root=output_root,
+        max_workers=1,
+    )
+    try:
+        restored = manager.get_job(job.id)
+
+        assert restored.status == JobStatus.COMPLETED
+        assert restored.total_items == 1
+        assert restored.completed_items == 1
+        restored_item = restored.items[0]
+        assert restored_item.status == ItemStatus.COMPLETED
+        assert restored_item.media_type == MediaType.IMAGE
+        assert restored_item.selected_format == ("douyin-highest-live-photos-or-images")
+        assert restored_item.output_paths == [str(output_path)]
+        assert restored_item.metadata["douyin_item_media"]["media_kind"] == "image"
+        assert output_path.read_bytes() == b"previously-verified-live-photo"
+    finally:
+        manager.shutdown()
+
+
+def test_fresh_douyin_live_photo_item_rejects_wrong_owner_binding(
+    tmp_path,
+) -> None:
+    media_id = "7683074221437746170"
+    source_url = f"https://www.douyin.com/video/{media_id}"
+    job = DownloadJob(
+        id="crosswired-live-photo-item",
+        source_url=source_url,
+        platform=Platform.DOUYIN,
+        source_kind=SourceKind.ITEM,
+        output_root=str(tmp_path),
+    )
+    metadata = complete_douyin_live_photo_item_metadata(source_url, media_id)
+    metadata["douyin_item_media"]["owner_id"] = "wrong"
+    item = DownloadItem(
+        id="target",
+        media_id=media_id,
+        source_url=source_url,
+        media_type=MediaType.IMAGE,
+        metadata=metadata,
+    )
+
+    with pytest.raises(DiscoveryError, match="uploader profile"):
+        DownloadManager._validate_discovery_result(
+            job,
+            DiscoveryResult(author="Wrong Author", items=[item]),
+        )
+
+    assert "douyin_item_media" not in item.metadata
+    assert "item_identity_verified" not in item.metadata
 
 
 def test_restore_discards_douyin_item_cache_bound_to_wrong_verification_url(
@@ -4880,9 +5027,7 @@ def test_failed_douyin_item_retry_refreshes_expired_direct_urls_after_restart(
 
         assert completed.status == JobStatus.COMPLETED
         assert completed.items[0].resolution == "1440x2560"
-        assert completed.items[0].metadata["douyin_item_media"][
-            "duration_ms"
-        ] == 4_573
+        assert completed.items[0].metadata["douyin_item_media"]["duration_ms"] == 4_573
         assert engine.discovery_calls == 2
         assert engine.download_urls == [
             "https://v26-web.douyinvod.com/signed-1.mp4",
@@ -5272,8 +5417,7 @@ def test_douyin_profile_redirect_auto_refreshes_once_and_resumes_queue(
                     douyin_direct_candidate(
                         video_uri,
                         url=(
-                            "https://v26-web.douyinvod.com/"
-                            f"initial-{media_id}.mp4"
+                            "https://v26-web.douyinvod.com/" f"initial-{media_id}.mp4"
                         ),
                     )
                 ]
@@ -5302,9 +5446,9 @@ def test_douyin_profile_redirect_auto_refreshes_once_and_resumes_queue(
             callback,
             should_cancel,
         ):
-            direct_url = item.metadata["douyin_profile_media"][
-                "direct_candidates"
-            ][0]["urls"][0]
+            direct_url = item.metadata["douyin_profile_media"]["direct_candidates"][0][
+                "urls"
+            ][0]
             self.download_calls.append((item.media_id, direct_url))
             if (
                 item.media_id == media_ids[1]
@@ -5481,9 +5625,9 @@ def test_douyin_profile_refresh_rejects_lower_detail_and_uses_feed_floor(
             callback,
             should_cancel,
         ):
-            direct_url = item.metadata["douyin_profile_media"][
-                "direct_candidates"
-            ][0]["urls"][0]
+            direct_url = item.metadata["douyin_profile_media"]["direct_candidates"][0][
+                "urls"
+            ][0]
             self.download_calls.append(direct_url)
             if direct_url == initial_url:
                 raise DouyinMediaRefreshRequiredError(
@@ -5605,9 +5749,7 @@ def test_douyin_profile_refresh_quality_guard_checks_live_photo_bitrate() -> Non
     def live_metadata(bit_rate: int) -> dict:
         return {
             "media_kind": "image",
-            "image_assets": [
-                {"index": 1, "width": 1440, "height": 2560}
-            ],
+            "image_assets": [{"index": 1, "width": 1440, "height": 2560}],
             "live_photo_assets": [
                 {
                     "index": 1,
@@ -5692,9 +5834,9 @@ def test_douyin_profile_redirect_refresh_attempt_is_capped_at_one(
             callback,
             should_cancel,
         ):
-            direct_url = item.metadata["douyin_profile_media"][
-                "direct_candidates"
-            ][0]["urls"][0]
+            direct_url = item.metadata["douyin_profile_media"]["direct_candidates"][0][
+                "urls"
+            ][0]
             self.download_calls.append((item.media_id, direct_url))
             raise DouyinMediaRefreshRequiredError(redirect_error)
 
@@ -5722,10 +5864,7 @@ def test_douyin_profile_redirect_refresh_attempt_is_capped_at_one(
         metadata["direct_candidates"] = [
             douyin_direct_candidate(
                 video_uri,
-                url=(
-                    "https://v26-web.douyinvod.com/"
-                    f"revision-2-{media_id}.mp4"
-                ),
+                url=("https://v26-web.douyinvod.com/" f"revision-2-{media_id}.mp4"),
             )
         ]
         return metadata
@@ -6015,9 +6154,7 @@ def test_douyin_profile_auto_refresh_preserves_local_configuration_issue(
         assert interrupted.status == JobStatus.INTERRUPTED
         assert interrupted.issue_code == SiteIssueCode.LOCAL_CONFIGURATION
         assert interrupted.items[0].issue_code == SiteIssueCode.LOCAL_CONFIGURATION
-        assert "required local component is unavailable" in (
-            interrupted.error or ""
-        )
+        assert "required local component is unavailable" in (interrupted.error or "")
         assert "ffprobe was not found" in (interrupted.error or "")
         assert engine.download_calls == 1
     finally:
@@ -6092,9 +6229,7 @@ def test_douyin_direct_auto_refresh_preserves_local_configuration_issue(
         assert interrupted.status == JobStatus.INTERRUPTED
         assert interrupted.issue_code == SiteIssueCode.LOCAL_CONFIGURATION
         assert interrupted.items[0].issue_code == SiteIssueCode.LOCAL_CONFIGURATION
-        assert "required local component is unavailable" in (
-            interrupted.error or ""
-        )
+        assert "required local component is unavailable" in (interrupted.error or "")
         assert "ffmpeg was not found" in (interrupted.error or "")
         assert engine.discovery_calls == 2
         assert engine.download_calls == 1
@@ -6436,9 +6571,9 @@ def test_restore_marks_active_douyin_redirect_item_before_status_recovery(
         assert restored.discovery_complete is False
         assert restored.items[0].status == ItemStatus.FAILED
         assert restored.items[0].retryable is True
-        assert restored.items[0].metadata[
-            DOUYIN_PROFILE_REFRESH_REQUIRED_MARKER
-        ] is True
+        assert (
+            restored.items[0].metadata[DOUYIN_PROFILE_REFRESH_REQUIRED_MARKER] is True
+        )
         assert "de709a9bd45e" not in (restored.items[0].error or "")
     finally:
         manager.shutdown()
@@ -6550,9 +6685,10 @@ def test_douyin_profile_retry_waits_for_complete_feed_then_retires_removed_item(
 
         assert interrupted.status == JobStatus.INTERRUPTED
         assert interrupted.discovery_complete is False
-        assert interrupted.items[0].metadata[
-            DOUYIN_PROFILE_REFRESH_REQUIRED_MARKER
-        ] is True
+        assert (
+            interrupted.items[0].metadata[DOUYIN_PROFILE_REFRESH_REQUIRED_MARKER]
+            is True
+        )
         assert interrupted.items[0].output_paths == engine.preserved_paths
         preserved_bytes = {
             path: Path(path).read_bytes() for path in engine.preserved_paths
@@ -6566,9 +6702,10 @@ def test_douyin_profile_retry_waits_for_complete_feed_then_retires_removed_item(
         assert "partial author feed" in (partial_refresh.error or "")
         assert len(partial_refresh.items) == 4
         assert engine.download_calls == [media_ids[0]]
-        assert partial_refresh.items[0].metadata[
-            DOUYIN_PROFILE_REFRESH_REQUIRED_MARKER
-        ] is True
+        assert (
+            partial_refresh.items[0].metadata[DOUYIN_PROFILE_REFRESH_REQUIRED_MARKER]
+            is True
+        )
 
         manager.retry_item(created.id, partial_refresh.items[0].id)
         completed_refresh = wait_for_job(manager, created.id)
@@ -6578,13 +6715,9 @@ def test_douyin_profile_retry_waits_for_complete_feed_then_retires_removed_item(
         assert completed_refresh.total_items == 3
         assert completed_refresh.completed_items == 2
         assert completed_refresh.failed_items == 1
-        assert {item.media_id for item in completed_refresh.items} == set(
-            media_ids[:3]
-        )
+        assert {item.media_id for item in completed_refresh.items} == set(media_ids[:3])
         removed_item = next(
-            item
-            for item in completed_refresh.items
-            if item.media_id == media_ids[0]
+            item for item in completed_refresh.items if item.media_id == media_ids[0]
         )
         assert removed_item.status == ItemStatus.FAILED
         assert removed_item.retryable is False
@@ -6814,7 +6947,9 @@ def test_douyin_profile_rediscovery_queues_matched_recovery_and_skips_missing() 
     assert DOUYIN_PROFILE_REDISCOVERY_ITEM_MARKER not in retired.metadata
 
 
-def test_complete_douyin_profile_refresh_retires_only_missing_unfinished_items() -> None:
+def test_complete_douyin_profile_refresh_retires_only_missing_unfinished_items() -> (
+    None
+):
     previous = [
         DownloadItem(
             id="partial-missing",
@@ -7734,9 +7869,7 @@ def test_discovery_activity_is_published_and_cleared_after_completion(
                     DownloadItem(
                         id="activity-item",
                         media_id="LXb3EKWsInQ",
-                        source_url=(
-                            "https://www.youtube.com/watch?v=LXb3EKWsInQ"
-                        ),
+                        source_url=("https://www.youtube.com/watch?v=LXb3EKWsInQ"),
                         title="Activity item",
                         media_type=MediaType.VIDEO,
                     )
@@ -7770,9 +7903,7 @@ def test_discovery_activity_is_published_and_cleared_after_completion(
 
     def listener(event, job) -> None:
         if event.event == "activity":
-            published_events.append(
-                (event.event, event.revision, job.activity_message)
-            )
+            published_events.append((event.event, event.revision, job.activity_message))
 
     manager.add_listener(listener)
     try:

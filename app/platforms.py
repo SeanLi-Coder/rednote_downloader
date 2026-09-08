@@ -72,26 +72,31 @@ def identify_url(value: str) -> UrlInfo:
     if _is_domain(host, "douyin.com"):
         user_match = re.fullmatch(r"/user/[^/]+", path)
         modal_values = query_with_blanks.get("modal_id", [])
-        modal_ids = set(modal_values)
+        vid_values = query_with_blanks.get("vid", [])
+        item_query_present = (
+            "modal_id" in query_with_blanks or "vid" in query_with_blanks
+        )
+        item_query_values = [*modal_values, *vid_values]
+        item_query_ids = set(item_query_values)
         video_match = re.fullmatch(r"/video/(\d+)", path)
-        if video_match:
-            media_id = video_match.group(1)
+        note_match = re.fullmatch(r"/note/(\d+)", path)
+        if video_match or note_match:
+            media_id = (video_match or note_match).group(1)
             url = f"https://www.douyin.com/video/{media_id}"
             kind = SourceKind.ITEM
         elif (
             user_match
-            and len(modal_ids) == 1
-            and all(re.fullmatch(r"\d+", value) for value in modal_values)
+            and item_query_present
+            and len(item_query_ids) == 1
+            and all(re.fullmatch(r"\d+", value) for value in item_query_values)
         ):
-            media_id = next(iter(modal_ids))
+            media_id = next(iter(item_query_ids))
             url = f"https://www.douyin.com/video/{media_id}"
             kind = SourceKind.ITEM
-        elif user_match and "modal_id" in query_with_blanks:
-            raise UnsupportedUrlError("Invalid or ambiguous Douyin modal video URL")
+        elif user_match and item_query_present:
+            raise UnsupportedUrlError("Invalid or ambiguous Douyin modal/vid video URL")
         elif user_match:
             kind = SourceKind.PROFILE
-        elif re.search(r"/note/\d+", path):
-            raise UnsupportedUrlError("Douyin image posts are not supported yet")
         else:
             raise UnsupportedUrlError("Unsupported Douyin URL")
         return UrlInfo(url=url, platform=Platform.DOUYIN, kind=kind)

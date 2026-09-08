@@ -79,6 +79,7 @@ _EXPLICIT_AUTH_API_MARKERS = (
     "session expired",
     "not logged in",
 )
+_DNS_FILTER_BLOCK_HOST = "blocked.dnsfilter.com"
 
 # These two official runtimes are required by the current SecSDK glue bootstrap.
 # The glue script itself is always taken from the current Douyin HTML instead of
@@ -227,6 +228,10 @@ class _TransientSigningFailure(_SigningFailure):
     def __init__(self, message: str, *, category: str = "transient") -> None:
         super().__init__(message)
         self.category = category
+
+
+class _NetworkFilterSigningFailure(_SigningFailure):
+    pass
 
 
 class _AuthenticationSigningFailure(_SigningFailure):
@@ -571,6 +576,7 @@ def _extract_sdk_glue_tags(source_html: str) -> tuple[str, ...]:
         )
     if len(source_html.encode("utf-8")) > _MAX_SOURCE_HTML_BYTES:
         raise _SigningFailure("Douyin HTML response was unexpectedly large")
+    _raise_if_dns_filter_block_page(source_html)
     parser = _SdkGlueParser()
     try:
         parser.feed(source_html)
@@ -619,9 +625,7 @@ def _load_chrome_cookie_jar(cookie_profile: str | None) -> CookieJar:
             "chrome", profile=cookie_profile, logger=_QuietCookieLogger()
         )
     except Exception as exc:
-        raise _CookieAccessSigningFailure(
-            "Chrome cookies could not be read"
-        ) from exc
+        raise _CookieAccessSigningFailure("Chrome cookies could not be read") from exc
 
 
 def _cookie_jar_to_playwright(cookie_jar: CookieJar) -> list[dict[str, Any]]:
@@ -667,6 +671,44 @@ def _is_allowed_douyin_origin(value: str) -> bool:
         return parsed.port in {None, 443}
     except ValueError:
         return False
+
+
+def _is_dns_filter_block_url(value: str) -> bool:
+    try:
+        parsed = urlsplit(value)
+        return (
+            parsed.scheme == "https"
+            and (parsed.hostname or "").lower() == _DNS_FILTER_BLOCK_HOST
+            and parsed.username is None
+            and parsed.password is None
+            and parsed.port in {None, 443}
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_dns_filter_block_page(source_html: str) -> bool:
+    if not isinstance(source_html, str):
+        return False
+    return bool(
+        re.search(
+            r"<title\b[^>]*>\s*website\s+filtered\s*</title>",
+            source_html,
+            re.IGNORECASE,
+        )
+        and re.search(
+            r"https://blocked[.]dnsfilter[.]com(?:[/:?#]|[\"'])",
+            source_html,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _raise_if_dns_filter_block_page(source_html: str) -> None:
+    if _is_dns_filter_block_page(source_html):
+        raise _NetworkFilterSigningFailure(
+            "A local DNS or web filter blocked Douyin before the site loaded"
+        )
 
 
 def _explicit_auth_url_issue_code(value: str) -> SiteIssueCode | None:
@@ -718,9 +760,7 @@ def _fetch_source_html_with_urllib(
         _raise_if_cancelled(should_cancel)
         if budget is not None:
             budget.remaining_seconds()
-        with opener.open(
-            request, timeout=max(timeout_ms / 1_000, 0.001)
-        ) as response:
+        with opener.open(request, timeout=max(timeout_ms / 1_000, 0.001)) as response:
             _raise_if_cancelled(should_cancel)
             if budget is not None:
                 budget.remaining_seconds()
@@ -730,6 +770,10 @@ def _fetch_source_html_with_urllib(
                 raise _AuthenticationSigningFailure(
                     "Douyin HTML redirected to an explicit login or verification page",
                     issue_code=redirect_issue,
+                )
+            if _is_dns_filter_block_url(response.geturl()):
+                raise _NetworkFilterSigningFailure(
+                    "A local DNS or web filter redirected the Douyin request"
                 )
             if not _is_allowed_douyin_origin(response.geturl()):
                 raise _SigningFailure(
@@ -785,6 +829,10 @@ def _fetch_source_html_with_urllib(
                     "Douyin HTML redirected to an explicit login or verification page",
                     issue_code=redirect_issue,
                 ) from exc
+            if _is_dns_filter_block_url(exc.geturl()):
+                raise _NetworkFilterSigningFailure(
+                    "A local DNS or web filter redirected the Douyin request"
+                ) from exc
             if not _is_allowed_douyin_origin(exc.geturl()):
                 raise _SigningFailure(
                     "Douyin HTML redirected outside the trusted origin"
@@ -809,6 +857,7 @@ def _fetch_source_html_with_urllib(
                     source_html = body.decode(charset, errors="replace")
                 except Exception:
                     source_html = ""
+                _raise_if_dns_filter_block_page(source_html)
                 auth_issue = _explicit_auth_html_issue_code(source_html)
                 if auth_issue is not None:
                     raise _AuthenticationSigningFailure(
@@ -881,6 +930,8 @@ def _extract_glue_with_context_fallback(
         raise
     except _AuthenticationSigningFailure:
         raise
+    except _NetworkFilterSigningFailure:
+        raise
     except Exception as exc:
         _raise_if_cancelled(should_cancel)
         budget.note_failure(exc)
@@ -910,6 +961,10 @@ def _extract_glue_with_context_fallback(
                     "Douyin HTML redirected to an explicit login or verification page",
                     issue_code=redirect_issue,
                 )
+            if _is_dns_filter_block_url(response.url):
+                raise _NetworkFilterSigningFailure(
+                    "A local DNS or web filter redirected the Douyin request"
+                )
             if not _is_allowed_douyin_origin(response.url):
                 raise _SigningFailure(
                     "Douyin HTML redirected outside the trusted origin"
@@ -926,6 +981,7 @@ def _extract_glue_with_context_fallback(
             if type(status) is int and status == 403:
                 source_html = response.text()
                 budget.remaining_seconds()
+                _raise_if_dns_filter_block_page(source_html)
                 auth_issue = _explicit_auth_html_issue_code(source_html)
                 if auth_issue is not None:
                     raise _AuthenticationSigningFailure(
@@ -936,10 +992,7 @@ def _extract_glue_with_context_fallback(
                     "Douyin browser HTML request was temporarily rejected",
                     category="http-403",
                 )
-            if (
-                type(status) is not int
-                or not 200 <= status < 300
-            ):
+            if type(status) is not int or not 200 <= status < 300:
                 raise _SigningFailure(
                     "Douyin HTML returned an invalid browser response"
                 )
@@ -1406,6 +1459,14 @@ def _raise_signing_error(
     verification_url: str,
     cause: Exception,
 ) -> None:
+    if isinstance(cause, _NetworkFilterSigningFailure):
+        raise TemporaryAccessError(
+            "A local DNS or web filter blocked Douyin before the site loaded. "
+            "Allow Douyin in the local filter, disable DNS filtering, or switch "
+            "networks, then retry the original link. Chrome verification is not "
+            "required.",
+            issue_code=SiteIssueCode.NETWORK_ERROR,
+        ) from cause
     if isinstance(cause, _SigningNoProgressTimeout):
         code = _transient_site_issue_code(cause.category)
         raise TemporaryAccessError(
@@ -1560,9 +1621,7 @@ def fetch_signed_aweme_detail(
                 try:
                     if not attempt:
                         _emit_status(status_callback, "Fetching Douyin signed detail")
-                    effective_timeout_ms = budget.clamp_timeout_ms(
-                        request_timeout_ms
-                    )
+                    effective_timeout_ms = budget.clamp_timeout_ms(request_timeout_ms)
                     _start_signed_fetch(
                         page,
                         _DETAIL_API_PATH,
@@ -1771,12 +1830,9 @@ def fetch_signed_profile_awemes(
                             budget=budget,
                         )
                 if has_more and (
-                    next_cursor == cursor
-                    or str(next_cursor) in verified_page_cursors
+                    next_cursor == cursor or str(next_cursor) in verified_page_cursors
                 ):
-                    raise _SigningFailure(
-                        "Douyin profile pagination did not advance"
-                    )
+                    raise _SigningFailure("Douyin profile pagination did not advance")
                 collected_before_page = len(collected)
                 for aweme in awemes:
                     aweme_id = str(aweme["aweme_id"])

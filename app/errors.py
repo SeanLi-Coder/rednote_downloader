@@ -344,6 +344,8 @@ def classify_site_issue(
             "timed out",
             "timeout",
             "no media progress",
+            "local dns or web filter blocked",
+            "blocked.dnsfilter.com",
         )
     ):
         return SiteIssueCode.NETWORK_ERROR

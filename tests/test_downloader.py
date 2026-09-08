@@ -34,6 +34,8 @@ from app.downloader import (
     DOUYIN_YTDLP_RETRIES,
     DOUYIN_YTDLP_SOCKET_TIMEOUT_SECONDS,
     OUTPUT_TEMPLATE,
+    DiscoveryResult,
+    DownloadOutcome,
     DownloaderConfig,
     MediaDownloader,
     _DouyinProbeIntegrityChanged,
@@ -571,12 +573,10 @@ def test_douyin_profile_items_keep_canonical_ids_and_profile_verification_url(
                             "index": 1,
                             "width": 1440,
                             "height": 2560,
-                            "candidates": [
-                                "https://p3-pc-sign.douyinpic.com/original"
-                            ],
+                            "candidates": ["https://p3-pc-sign.douyinpic.com/original"],
                         }
                     ],
-                }
+                },
             },
         ),
     )
@@ -668,6 +668,12 @@ def test_douyin_profile_image_downloads_highest_images_and_live_photos(
                 "height": 1920,
                 "candidates": ["https://p9-pc-sign.douyinpic.com/image-2"],
             },
+            {
+                "index": 3,
+                "width": 1440,
+                "height": 2560,
+                "candidates": ["https://p9-pc-sign.douyinpic.com/image-3"],
+            },
         ],
         "live_photo_assets": [
             {
@@ -677,7 +683,15 @@ def test_douyin_profile_image_downloads_highest_images_and_live_photos(
                 "candidates": ["https://v26-web.douyinvod.com/live-1.mp4"],
                 "video_uri": "v0200fg10000verifiedlivephoto",
                 "duration_ms": 2_000,
-            }
+            },
+            {
+                "index": 3,
+                "width": 1440,
+                "height": 2560,
+                "candidates": ["https://v26-web.douyinvod.com/live-3.mp4"],
+                "video_uri": "v0200fg10000verifiedlivephoto3",
+                "duration_ms": 2_500,
+            },
         ],
     }
     item = DownloadItem(
@@ -695,9 +709,7 @@ def test_douyin_profile_image_downloads_highest_images_and_live_photos(
     monkeypatch.setattr(
         "app.downloader.is_complete_profile_media_metadata",
         lambda value, expected_id, expected_owner: (
-            value is cached
-            and expected_id == media_id
-            and expected_owner == profile_id
+            value is cached and expected_id == media_id and expected_owner == profile_id
         ),
     )
     monkeypatch.setattr("app.downloader.YoutubeDL", FakeYoutubeDL)
@@ -751,12 +763,12 @@ def test_douyin_profile_image_downloads_highest_images_and_live_photos(
     )
 
     assert calls == [
-        (MediaType.IMAGE, 1, 1, 3, True, False),
+        (MediaType.VIDEO, 1, 1, 3, True, True),
         (MediaType.IMAGE, 2, 2, 3, True, False),
-        (MediaType.VIDEO, 1, 3, 3, True, True),
+        (MediaType.VIDEO, 3, 3, 3, True, True),
     ]
     assert outcome.output_paths == [
-        str(tmp_path / "asset-001.jpg"),
+        str(tmp_path / "asset-001.mp4"),
         str(tmp_path / "asset-002.jpg"),
         str(tmp_path / "asset-003.mp4"),
     ]
@@ -764,7 +776,7 @@ def test_douyin_profile_image_downloads_highest_images_and_live_photos(
     assert outcome.author == "Verified Author"
     assert outcome.upload_date == "2025-09-01"
     assert outcome.media_type == MediaType.IMAGE
-    assert outcome.selected_format == "douyin-highest-images+live-photos"
+    assert outcome.selected_format == "douyin-highest-live-photos-or-images"
     assert outcome.resolution == "2160x3840"
     completed = [event for event in events if event.event == "asset_completed"]
     assert len(completed) == 3
@@ -918,9 +930,7 @@ def test_douyin_profile_retry_reuses_completed_live_photo_without_network(
                         "bit_rate": 20_000_000,
                         "codec_hint": "hevc",
                         "video_uri": "v0200fg10000verifiedlivephoto",
-                        "urls": [
-                            "https://v26-web.douyinvod.com/live-1-4k.mp4"
-                        ],
+                        "urls": ["https://v26-web.douyinvod.com/live-1-4k.mp4"],
                     }
                 ],
             }
@@ -992,10 +1002,12 @@ def test_douyin_profile_retry_reuses_completed_live_photo_without_network(
     assert verification_floor.bit_rate is None
     assert verification_floor.video_codec is None
     assert verification_floor.duration == 2.0
-    assert outcome.output_paths == [str(saved_image.resolve()), str(saved_live_photo.resolve())]
+    assert outcome.output_paths == [str(saved_live_photo.resolve())]
+    assert outcome.media_type == MediaType.IMAGE
+    assert outcome.selected_format == "douyin-highest-live-photos-or-images"
     assert outcome.resolution == "2160x3840"
     completed = [event for event in events if event.event == "asset_completed"]
-    assert len(completed) == 2
+    assert len(completed) == 1
     assert completed[-1].output_paths == outcome.output_paths
 
 
@@ -1149,14 +1161,274 @@ def test_douyin_item_discovery_without_chrome_cookie_fails_closed(
         DirectItemYoutubeDL.created_options[0]["socket_timeout"]
         == DOUYIN_YTDLP_SOCKET_TIMEOUT_SECONDS
     )
-    assert (
-        DirectItemYoutubeDL.created_options[0]["retries"]
-        == DOUYIN_YTDLP_RETRIES
-    )
+    assert DirectItemYoutubeDL.created_options[0]["retries"] == DOUYIN_YTDLP_RETRIES
     assert (
         DirectItemYoutubeDL.created_options[0]["extractor_retries"]
         == DOUYIN_YTDLP_RETRIES
     )
+
+
+def test_douyin_item_discovery_accepts_bound_live_photo_signed_detail(
+    monkeypatch,
+) -> None:
+    media_id = "7683074221437746170"
+    owner_id = "MS4wLjABAAAAvLgZS-O6Oc9diWWZ-jctzlhanUBoN7a5oJLdsTkx6F9"
+    source_url = f"https://www.douyin.com/video/{media_id}"
+    live_uri = "v0200fg10000verifiedlivephotoitem"
+
+    class ImageParserFailureYoutubeDL(FakeYoutubeDL):
+        def extract_info(self, url: str, download: bool, process: bool = True):
+            assert url == source_url
+            assert download is False
+            assert process is False
+            raise DownloadError("An extractor error has occurred")
+
+    def fetch_detail(requested_id: str, **kwargs):
+        assert requested_id == media_id
+        assert kwargs["verification_url"] == source_url
+        assert kwargs["expected_sec_uid"] is None
+        return {
+            "aweme_id": media_id,
+            "aweme_type": 68,
+            "desc": "Bound Live Photo",
+            "create_time": 1_756_656_000,
+            "author": {"sec_uid": owner_id, "nickname": "Verified Author"},
+            "images": [
+                {
+                    "width": 1440,
+                    "height": 2560,
+                    "url_list": ["https://p3-pc-sign.douyinpic.com/live-cover.webp"],
+                    "video": {
+                        "duration": 2_400,
+                        "play_addr": {
+                            "uri": live_uri,
+                            "width": 1440,
+                            "height": 2560,
+                            "url_list": [
+                                "https://v26-web.douyinvod.com/live-original.mp4"
+                            ],
+                        },
+                    },
+                }
+            ],
+        }
+
+    monkeypatch.setattr("app.downloader.YoutubeDL", ImageParserFailureYoutubeDL)
+    monkeypatch.setattr("app.downloader.fetch_signed_aweme_detail", fetch_detail)
+    monkeypatch.setattr(
+        "app.downloader.DouyinIE",
+        lambda *args, **kwargs: pytest.fail(
+            "A Live Photo detail must not be sent to yt-dlp's video-only parser"
+        ),
+    )
+    monkeypatch.setattr(
+        "app.downloader.discover_item_metadata_from_profile",
+        lambda *args, **kwargs: pytest.fail(
+            "The exact signed detail already contains complete bound metadata"
+        ),
+    )
+    engine = MediaDownloader(DownloaderConfig(cookie_browser="chrome"))
+
+    result = engine.discover(source_url, Platform.DOUYIN, SourceKind.ITEM)
+
+    assert result.author == "Verified Author"
+    assert len(result.items) == 1
+    item = result.items[0]
+    assert item.media_id == media_id
+    assert item.source_url == source_url
+    assert item.media_type == MediaType.IMAGE
+    assert item.upload_date == "2025-09-01"
+    assert item.metadata["verification_url"] == source_url
+    assert item.metadata["item_identity_verified"] is True
+    cached = item.metadata["douyin_item_media"]
+    assert cached["owner_id"] == owner_id
+    assert cached["live_photo_assets"][0]["video_uri"] == live_uri
+    assert cached["live_photo_assets"][0]["direct_candidates"][0]["urls"] == [
+        "https://v26-web.douyinvod.com/live-original.mp4"
+    ]
+
+
+def test_douyin_item_without_video_uses_bound_static_image_detail(
+    monkeypatch,
+) -> None:
+    media_id = "7683074221437746170"
+    owner_id = "MS4wLjABAAAAvLgZS-O6Oc9diWWZ-jctzlhanUBoN7a5oJLdsTkx6F9"
+    source_url = f"https://www.douyin.com/video/{media_id}"
+
+    class NoVideoYoutubeDL(FakeYoutubeDL):
+        def extract_info(self, url: str, download: bool, process: bool = True):
+            return {"id": media_id, "title": media_id, "formats": []}
+
+    monkeypatch.setattr("app.downloader.YoutubeDL", NoVideoYoutubeDL)
+    monkeypatch.setattr(
+        "app.downloader.fetch_signed_aweme_detail",
+        lambda *args, **kwargs: {
+            "aweme_id": media_id,
+            "aweme_type": 68,
+            "desc": "Static fallback",
+            "create_time": 1_756_656_000,
+            "author": {"sec_uid": owner_id, "nickname": "Verified Author"},
+            "images": [
+                {
+                    "width": 1440,
+                    "height": 2560,
+                    "url_list": [
+                        "https://p3-pc-sign.douyinpic.com/static-original.webp"
+                    ],
+                    "video": {
+                        "play_addr": {
+                            "width": 1080,
+                            "height": 1920,
+                            "url_list": ["https://evil.example/not-trusted.mp4"],
+                        }
+                    },
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        "app.downloader.discover_item_metadata_from_profile",
+        lambda *args, **kwargs: pytest.fail(
+            "Complete exact item metadata must not trigger a profile scan"
+        ),
+    )
+    engine = MediaDownloader(DownloaderConfig(cookie_browser="chrome"))
+
+    result = engine.discover(source_url, Platform.DOUYIN, SourceKind.ITEM)
+
+    assert len(result.items) == 1
+    item = result.items[0]
+    assert item.media_type == MediaType.IMAGE
+    assert item.title == "Static fallback"
+    cached = item.metadata["douyin_item_media"]
+    assert cached["media_kind"] == "image"
+    assert cached["image_assets"][0]["candidates"] == [
+        "https://p3-pc-sign.douyinpic.com/static-original.webp"
+    ]
+    assert "live_photo_assets" not in cached
+    assert cached["live_photo_static_fallback_indexes"] == [1]
+    assert result.warning is not None
+    assert "highest-pixel static images will be saved" in result.warning
+
+
+def test_douyin_short_link_resolving_to_note_uses_single_item_live_photo_path(
+    monkeypatch,
+) -> None:
+    media_id = "7683074221437746170"
+    short_url = "https://v.douyin.com/live-photo-fixture/"
+    canonical_url = f"https://www.douyin.com/video/{media_id}"
+    result = DiscoveryResult(
+        author="Verified Author",
+        items=[
+            DownloadItem(
+                id="bound-live-photo",
+                media_id=media_id,
+                source_url=canonical_url,
+                media_type=MediaType.IMAGE,
+            )
+        ],
+    )
+    engine = MediaDownloader(DownloaderConfig(cookie_browser="chrome"))
+    monkeypatch.setattr(
+        engine,
+        "_resolve_short_url",
+        lambda url: (
+            f"https://www.douyin.com/note/{media_id}?previous_page=web_code_link",
+            False,
+        ),
+    )
+    calls = []
+
+    def discover_item(url, should_cancel):
+        calls.append((url, should_cancel()))
+        return result
+
+    monkeypatch.setattr(engine, "_discover_douyin_item", discover_item)
+
+    discovered = engine.discover(
+        short_url,
+        Platform.DOUYIN,
+        SourceKind.SHORT_LINK,
+    )
+
+    assert discovered is result
+    assert calls == [(canonical_url, False)]
+
+
+def test_douyin_incomplete_image_detail_never_enters_video_only_parser(
+    monkeypatch,
+) -> None:
+    media_id = "7683074221437746170"
+    owner_id = "MS4wLjABAAAAvLgZS-O6Oc9diWWZ-jctzlhanUBoN7a5oJLdsTkx6F9"
+    source_url = f"https://www.douyin.com/video/{media_id}"
+
+    class ImageParserFailureYoutubeDL:
+        def extract_info(self, url: str, download: bool, process: bool = True):
+            raise DownloadError("An extractor error has occurred")
+
+    monkeypatch.setattr(
+        "app.downloader.fetch_signed_aweme_detail",
+        lambda *args, **kwargs: {
+            "aweme_id": media_id,
+            "aweme_type": 68,
+            "author": {"sec_uid": owner_id, "nickname": "Verified Author"},
+            "images": [{"width": 1440, "height": 2560, "url_list": []}],
+        },
+    )
+    monkeypatch.setattr(
+        "app.downloader.DouyinIE",
+        lambda *args, **kwargs: pytest.fail(
+            "An incomplete image detail must not enter the video-only parser"
+        ),
+    )
+    engine = MediaDownloader(DownloaderConfig(cookie_browser="chrome"))
+
+    with pytest.raises(TemporaryAccessError) as error:
+        engine._extract_douyin_raw_info(
+            ImageParserFailureYoutubeDL(),
+            source_url,
+            expected_id=media_id,
+            expected_profile_id=None,
+            verification_url=source_url,
+            profile_metadata=None,
+            fallback_title=media_id,
+            should_cancel=lambda: False,
+        )
+
+    assert error.value.issue_code == SiteIssueCode.SITE_RESPONSE_CHANGED
+    assert "complete trusted media metadata" in str(error.value)
+    assert "Chrome verification is not required" in str(error.value)
+
+
+def test_douyin_item_image_cache_uses_live_photo_downloader(monkeypatch, tmp_path):
+    media_id = "7683074221437746170"
+    item = DownloadItem(
+        id="live-photo-item",
+        media_id=media_id,
+        source_url=f"https://www.douyin.com/video/{media_id}",
+        media_type=MediaType.IMAGE,
+        metadata={
+            "verification_url": f"https://www.douyin.com/video/{media_id}",
+            "item_identity_verified": True,
+            "douyin_item_media": {"media_kind": "image"},
+        },
+    )
+    expected = DownloadOutcome(output_paths=[str(tmp_path / "live.mp4")])
+    engine = MediaDownloader(DownloaderConfig(cookie_browser="chrome"))
+    monkeypatch.setattr(
+        engine,
+        "_download_douyin_profile_image",
+        lambda *args, **kwargs: expected,
+    )
+    monkeypatch.setattr(
+        engine,
+        "_download_with_ytdlp",
+        lambda *args, **kwargs: pytest.fail(
+            "A bound Live Photo item must not use the ordinary video downloader"
+        ),
+    )
+
+    assert engine.download_item(item, Platform.DOUYIN, tmp_path) is expected
 
 
 @pytest.mark.parametrize(
@@ -1238,9 +1510,7 @@ def test_douyin_item_discovery_enriches_quality_from_bound_author_profile(
     result = engine.discover(source_url, Platform.DOUYIN, SourceKind.ITEM)
 
     assert calls == [(owner_id, media_id)]
-    assert [
-        (event.event, event.message) for event in discovery_events
-    ] == [
+    assert [(event.event, event.message) for event in discovery_events] == [
         ("probing", "Reading Douyin item metadata with bounded retries"),
         ("probing", "Checking bound Douyin author feed"),
     ]
@@ -1324,9 +1594,7 @@ def test_douyin_item_discovery_rejects_crosswired_enrichment_media_identity(
                     "width": 1440,
                     "height": 2560,
                     "video_uri": "v0200fg10000differentidentity",
-                    "urls": [
-                        "https://v26-web.douyinvod.com/crosswired.mp4"
-                    ],
+                    "urls": ["https://v26-web.douyinvod.com/crosswired.mp4"],
                 }
             ],
         },
@@ -1920,9 +2188,7 @@ def test_douyin_verified_profile_metadata_skips_per_item_detail() -> None:
                         "width": 1080,
                         "height": 1920,
                         "video_uri": video_uri,
-                        "urls": [
-                            "https://v26-web.douyinvod.com/profile-direct.mp4"
-                        ],
+                        "urls": ["https://v26-web.douyinvod.com/profile-direct.mp4"],
                     }
                 ],
                 "duration_ms": 72_800,
@@ -1979,9 +2245,7 @@ def test_douyin_verified_item_metadata_duration_reaches_quality_probes(
                         "width": 1080,
                         "height": 1920,
                         "video_uri": video_uri,
-                        "urls": [
-                            "https://v26-web.douyinvod.com/item-direct.mp4"
-                        ],
+                        "urls": ["https://v26-web.douyinvod.com/item-direct.mp4"],
                     }
                 ],
                 "duration_ms": 4_573,
@@ -2198,10 +2462,10 @@ def test_douyin_profile_direct_rendition_beats_throttled_ratio_endpoints(
                 "minimum_height": 2560,
                 "direct_candidates": [
                     {
-                            "width": 1440,
-                            "height": 2560,
-                            "video_uri": "v0200fg10000fixturevideoid",
-                            "bit_rate": 1_320_511,
+                        "width": 1440,
+                        "height": 2560,
+                        "video_uri": "v0200fg10000fixturevideoid",
+                        "bit_rate": 1_320_511,
                         "codec_hint": "hevc",
                         "urls": [direct_url],
                     }
@@ -2710,9 +2974,7 @@ def test_douyin_default_probe_uses_independent_line_after_unknown_redirect(
     first, second = map(urlsplit, attempts)
     assert first.scheme == second.scheme == "https"
     assert first.path == second.path == "/aweme/v1/play/"
-    assert parse_qs(first.query)["video_id"] == parse_qs(second.query)[
-        "video_id"
-    ]
+    assert parse_qs(first.query)["video_id"] == parse_qs(second.query)["video_id"]
 
 
 def test_douyin_default_probe_does_not_request_second_origin_after_success(
@@ -2737,9 +2999,7 @@ def test_douyin_default_probe_does_not_request_second_origin_after_success(
     )
 
     assert result and result["width"] == 1080
-    assert [urlsplit(value).hostname for value in attempts] == [
-        "api-play-hl.amemv.com"
-    ]
+    assert [urlsplit(value).hostname for value in attempts] == ["api-play-hl.amemv.com"]
 
 
 def test_douyin_default_probe_exhausts_four_routes_without_following_rejected_cdn(
@@ -2751,9 +3011,7 @@ def test_douyin_default_probe_exhausts_four_routes_without_following_rejected_cd
     def reject(ydl, url, **kwargs):
         del ydl, kwargs
         parsed = urlsplit(url)
-        attempts.append(
-            (parsed.hostname or "", parse_qs(parsed.query)["line"][0])
-        )
+        attempts.append((parsed.hostname or "", parse_qs(parsed.query)["line"][0]))
         raise _DouyinRedirectRejected(
             "media endpoint redirected to an unrecognized Douyin CDN host",
             redirect_host_fingerprint="38c1b2b0b3d0",
@@ -3149,9 +3407,7 @@ def test_douyin_quality_probe_budget_is_shared_across_candidates_and_retries(
             should_cancel=lambda: False,
         )
 
-    assert Clock.current == pytest.approx(
-        DOUYIN_QUALITY_PROBE_IDLE_TIMEOUT_SECONDS
-    )
+    assert Clock.current == pytest.approx(DOUYIN_QUALITY_PROBE_IDLE_TIMEOUT_SECONDS)
     assert len(request_timeouts) > 3
     assert max(request_timeouts) <= 10.0
     assert request_timeouts[-1] <= 10.0
@@ -3588,9 +3844,10 @@ def test_douyin_probe_caps_range_omits_cookie_and_validates_duration(
     assert result["filesize"] == 10_425_019
     assert result["url"] == "https://v26-web.douyinvod.com/verified-video.mp4"
     assert result["probe_prefix_size"] == 256 * 1024
-    assert result["probe_prefix_sha256"] == hashlib.sha256(
-        payload[: 256 * 1024]
-    ).hexdigest()
+    assert (
+        result["probe_prefix_sha256"]
+        == hashlib.sha256(payload[: 256 * 1024]).hexdigest()
+    )
     assert ffprobe_calls == [(payload[: 256 * 1024], None)]
     assert "cookie" not in request_headers
     assert request_headers["range"] == "bytes=0-262143"
@@ -3663,10 +3920,7 @@ def test_douyin_probe_rejects_unrecognized_final_redirect_before_ffprobe(
     ) as error:
         engine._probe_douyin_candidate(
             ydl,
-            (
-                "https://api-play.amemv.com/aweme/v1/play/"
-                "?video_id=fixture&ratio=4k"
-            ),
+            ("https://api-play.amemv.com/aweme/v1/play/" "?video_id=fixture&ratio=4k"),
             expected_duration=72.8,
             should_cancel=lambda: False,
         )
@@ -3690,9 +3944,7 @@ def test_douyin_regional_media_allowlist_covers_every_verified_domain_family() -
         "idouyinvod.com",
         "pstatp.com",
     )
-    source_url = (
-        "https://api-play.amemv.com/aweme/v1/play/?video_id=verified-fixture"
-    )
+    source_url = "https://api-play.amemv.com/aweme/v1/play/?video_id=verified-fixture"
     engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
 
     assert DOUYIN_REGIONAL_MEDIA_DOMAINS == expected_domains
@@ -3708,9 +3960,7 @@ def test_douyin_regional_media_allowlist_covers_every_verified_domain_family() -
 
 
 def test_douyin_regional_media_allowlist_rejects_lookalikes_and_invalid_urls() -> None:
-    source_url = (
-        "https://api-play.amemv.com/aweme/v1/play/?video_id=verified-fixture"
-    )
+    source_url = "https://api-play.amemv.com/aweme/v1/play/?video_id=verified-fixture"
     engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
 
     assert engine._is_verified_douyin_media_redirect(
@@ -3882,9 +4132,10 @@ def test_douyin_unknown_redirect_never_persists_token_in_two_label_host() -> Non
 
     message = str(rejection)
     assert rejection.redirect_host is None
-    assert rejection.redirect_host_fingerprint == hashlib.sha256(
-        hostname.encode("ascii")
-    ).hexdigest()[:12]
+    assert (
+        rejection.redirect_host_fingerprint
+        == hashlib.sha256(hostname.encode("ascii")).hexdigest()[:12]
+    )
     assert hostname not in message
     assert "secret-token" not in message
 
@@ -3965,26 +4216,38 @@ def test_external_error_redaction_rejects_untrusted_redirect_port_text() -> None
 def test_douyin_redirect_policy_distinguishes_known_unbound_and_unknown_hosts() -> None:
     engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
 
-    assert engine._douyin_media_redirect_rejection_reason(
-        "https://v26-web.douyinvod.com/original.mp4",
-        MediaType.VIDEO,
-        allow_verified_regional=False,
-    ) is None
-    assert engine._douyin_media_redirect_rejection_reason(
-        "https://edge.video.pstatp.com/original.mp4",
-        MediaType.VIDEO,
-        allow_verified_regional=False,
-    ) == "unverified-source-binding"
-    assert engine._douyin_media_redirect_rejection_reason(
-        "https://edge.video.pstatp.com/original.mp4",
-        MediaType.VIDEO,
-        allow_verified_regional=True,
-    ) is None
-    assert engine._douyin_media_redirect_rejection_reason(
-        "https://unrecognized-cdn.vendor-cdn.net/original.mp4",
-        MediaType.VIDEO,
-        allow_verified_regional=True,
-    ) == "unrecognized-host"
+    assert (
+        engine._douyin_media_redirect_rejection_reason(
+            "https://v26-web.douyinvod.com/original.mp4",
+            MediaType.VIDEO,
+            allow_verified_regional=False,
+        )
+        is None
+    )
+    assert (
+        engine._douyin_media_redirect_rejection_reason(
+            "https://edge.video.pstatp.com/original.mp4",
+            MediaType.VIDEO,
+            allow_verified_regional=False,
+        )
+        == "unverified-source-binding"
+    )
+    assert (
+        engine._douyin_media_redirect_rejection_reason(
+            "https://edge.video.pstatp.com/original.mp4",
+            MediaType.VIDEO,
+            allow_verified_regional=True,
+        )
+        is None
+    )
+    assert (
+        engine._douyin_media_redirect_rejection_reason(
+            "https://unrecognized-cdn.vendor-cdn.net/original.mp4",
+            MediaType.VIDEO,
+            allow_verified_regional=True,
+        )
+        == "unrecognized-host"
+    )
 
 
 def test_douyin_media_open_fails_closed_without_request_director() -> None:
@@ -4431,9 +4694,7 @@ def test_douyin_redirect_policy_runs_without_buffering_redirect_body(
         def do_GET(self):
             if self.path == "/redirect":
                 counts["source"] += 1
-                target_url = (
-                    f"http://127.0.0.1:{self.server.server_port}/blocked"
-                )
+                target_url = f"http://127.0.0.1:{self.server.server_port}/blocked"
                 self.send_response(302)
                 self.send_header("Location", target_url)
                 self.send_header("Content-Length", str(len(redirect_body)))
@@ -4611,7 +4872,9 @@ def test_douyin_probe_accepts_regional_redirect_and_skips_full_complete_prefix(
         def urlopen(self, request):
             self.calls += 1
             if self.calls > 1:
-                raise AssertionError("A complete prefix must not trigger a full download")
+                raise AssertionError(
+                    "A complete prefix must not trigger a full download"
+                )
             self.request = request
             return self.response
 
@@ -4780,8 +5043,7 @@ def test_douyin_incomplete_prefix_downloads_identical_full_file_and_cleans_temp(
     ]
     assert all(event.event == "probing" for event in full_probe_events)
     assert all(
-        event.message
-        == "Reading the Douyin original file to verify quality (default)"
+        event.message == "Reading the Douyin original file to verify quality (default)"
         for event in full_probe_events
     )
 
@@ -4792,9 +5054,7 @@ def test_douyin_full_probe_reuses_verified_file_without_second_cdn_download(
 ) -> None:
     prefix = b"\x00\x00\x00\x18ftypisom-prefix"
     full_payload = prefix + b"-middle-moov-tail"
-    candidate_url = (
-        "https://api-play.amemv.com/aweme/v1/play/?video_id=reuse-fixture"
-    )
+    candidate_url = "https://api-play.amemv.com/aweme/v1/play/?video_id=reuse-fixture"
     final_url = "https://edge.video.pstatp.com/original.mp4"
 
     class Read1OnlyRaw(BytesIO):
@@ -5142,9 +5402,7 @@ def test_douyin_transfer_bytes_refresh_budget_and_allow_slow_drip(
     assert path.read_bytes() == payload
     assert Clock.current > DOUYIN_TRANSFER_IDLE_TIMEOUT_SECONDS
     byte_events = [
-        event
-        for event in events
-        if event.progress and event.progress.downloaded_bytes
+        event for event in events if event.progress and event.progress.downloaded_bytes
     ]
     assert byte_events
     assert byte_events[-1].progress.downloaded_bytes == len(payload)
@@ -5235,7 +5493,11 @@ def test_douyin_probe_reuse_scope_cleans_files_for_all_exit_paths(
         "probe_prefix_size": 12,
         "probe_prefix_sha256": "a" * 64,
     }
-    with pytest.raises(RuntimeError) if failure == "exception" else contextlib.nullcontext():
+    with (
+        pytest.raises(RuntimeError)
+        if failure == "exception"
+        else contextlib.nullcontext()
+    ):
         with engine._douyin_probe_reuse_scope(tmp_path):
             reuse_directory = engine._douyin_probe_context.reuse.directory
             candidate = reuse_directory / "candidate.mp4"
@@ -5257,9 +5519,7 @@ def test_douyin_probe_reuse_scope_cleans_files_for_all_exit_paths(
                     audio_codec="aac",
                     probe_prefix_size=12,
                     probe_prefix_sha256="a" * 64,
-                    redirect_source_url=(
-                        "https://api-play.amemv.com/aweme/v1/play/"
-                    ),
+                    redirect_source_url=("https://api-play.amemv.com/aweme/v1/play/"),
                 )
                 with pytest.raises(DownloadCancelledError):
                     engine._download_first_available_asset(
@@ -5318,9 +5578,7 @@ def test_douyin_full_probe_rejects_changed_or_unsafe_media_and_cleans_temp(
     prefix = b"\x00\x00\x00\x18ftypisom-PREFIX"
     changed_prefix = b"\x00\x00\x00\x18ftypisom-BROKEN"
     full_payload = prefix + b"-complete-tail"
-    candidate_url = (
-        "https://api-play.amemv.com/aweme/v1/play/?video_id=failure-fixture"
-    )
+    candidate_url = "https://api-play.amemv.com/aweme/v1/play/?video_id=failure-fixture"
     trusted_final_url = "https://edge.video.pstatp.com/original.mp4"
     cancellation = {"active": False}
 
@@ -5361,9 +5619,7 @@ def test_douyin_full_probe_rejects_changed_or_unsafe_media_and_cleans_temp(
                     prefix,
                     {
                         "Content-Type": "video/mp4",
-                        "Content-Range": (
-                            f"bytes 0-{len(prefix) - 1}/{expected_size}"
-                        ),
+                        "Content-Range": (f"bytes 0-{len(prefix) - 1}/{expected_size}"),
                     },
                     trusted_final_url,
                 )
@@ -5427,9 +5683,7 @@ def test_douyin_full_probe_rejects_changed_or_unsafe_media_and_cleans_temp(
     assert not temporary_paths[0].exists()
     assert not temporary_paths[0].parent.exists()
     if failure_mode in {"prefix_changed", "size_changed"}:
-        assert engine._should_pause_douyin_probe_error(
-            exception_type(message)
-        )
+        assert engine._should_pause_douyin_probe_error(exception_type(message))
     if failure_mode in {"unknown_host", "size_changed", "cancelled"}:
         assert ydl.responses[1].offset == 0
 
@@ -5510,9 +5764,7 @@ def test_douyin_redirect_rejection_skips_internal_retries_and_pauses_upstream(
     assert not engine._is_retryable_douyin_probe_error(
         _DouyinRedirectRejected("rejected")
     )
-    assert engine._should_pause_douyin_probe_error(
-        _DouyinRedirectRejected("rejected")
-    )
+    assert engine._should_pause_douyin_probe_error(_DouyinRedirectRejected("rejected"))
     with pytest.raises(
         DouyinMediaRefreshRequiredError,
         match="task was paused",
@@ -5942,9 +6194,7 @@ def test_douyin_cached_direct_candidates_reuse_strict_asset_allowlist() -> None:
         {
             "width": 1440,
             "height": 2560,
-            "urls": [
-                "https://v5-dy-ov-experiment.zjcdn.com/original.mp4"
-            ],
+            "urls": ["https://v5-dy-ov-experiment.zjcdn.com/original.mp4"],
         }
     ]
 
@@ -5952,9 +6202,7 @@ def test_douyin_cached_direct_candidates_reuse_strict_asset_allowlist() -> None:
 def test_douyin_cached_direct_candidates_prefer_refreshable_play_endpoint() -> None:
     engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
     video_uri = "v0200fg10000verifiedfixture"
-    timestamped = (
-        "https://v26-web.douyinvod.com/original.mp4?dy_q=1787846400"
-    )
+    timestamped = "https://v26-web.douyinvod.com/original.mp4?dy_q=1787846400"
     plain_cdn = "https://v11-web.douyinvod.com/original.mp4"
     play_endpoint = (
         "https://www.douyin.com/aweme/v1/play/"
@@ -6059,10 +6307,13 @@ def test_douyin_official_probe_retries_transient_timeout(monkeypatch) -> None:
     )
     assert attempts == {"author-feed": 1, "default": 3}
     assert delays == [1.0, 2.0]
-    assert sum(
-        message.startswith("Retrying Douyin quality default")
-        for message in messages
-    ) == 2
+    assert (
+        sum(
+            message.startswith("Retrying Douyin quality default")
+            for message in messages
+        )
+        == 2
+    )
 
 
 @pytest.mark.parametrize("status", [401, 403, 404, 410, 429, 503])
@@ -6120,8 +6371,8 @@ def test_douyin_live_photo_selects_verified_default_over_lower_direct(
     asset = RemoteAsset(
         candidates=["https://v26-web.douyinvod.com/direct-low.mp4"],
         index=1,
-        width=720,
-        height=1280,
+        width=1080,
+        height=1920,
         video_uri="v0200fg10000verifiedlivephoto",
         duration=1.834,
         quality_candidates=[
@@ -6189,16 +6440,12 @@ def test_douyin_live_photo_selects_verified_default_over_lower_direct(
     assert selected.probe_prefix_size == 32
     assert selected.probe_prefix_sha256 == "a" * 64
     assert selected.candidates[0].endswith("/default-final.mp4")
-    assert parse_qs(urlsplit(selected.candidates[1]).query)["ratio"] == [
-        "default"
-    ]
+    assert parse_qs(urlsplit(selected.candidates[1]).query)["ratio"] == ["default"]
     assert [urlsplit(value).hostname for value in selected.candidates[1:3]] == [
         "api-play-hl.amemv.com",
         "api-play.amemv.com",
     ]
-    assert selected.format_id == (
-        "douyin-highest-live-photo-default-1080x1920"
-    )
+    assert selected.format_id == ("douyin-highest-live-photo-default-1080x1920")
 
 
 def test_douyin_live_photo_equal_media_keeps_direct_and_default_sources(
@@ -6674,15 +6921,14 @@ def test_external_error_redaction_sanitizes_saved_douyin_redirect_hosts(
 
 
 def test_external_error_redaction_removes_http_reason_and_ip_literals() -> None:
-    assert safe_external_error_message(
-        "HTTP Error 400: token=SECRET 127.0.0.1 [::1]"
-    ) == "HTTP Error 400"
+    assert (
+        safe_external_error_message("HTTP Error 400: token=SECRET 127.0.0.1 [::1]")
+        == "HTTP Error 400"
+    )
     sanitized = safe_external_error_message(
         "Media transport failed at 127.0.0.1 and [::1]"
     )
-    assert sanitized == (
-        "Media transport failed at [redacted IP] and [redacted IP]"
-    )
+    assert sanitized == ("Media transport failed at [redacted IP] and [redacted IP]")
     for host_value in (
         "::1",
         "2130706433",
@@ -6898,15 +7144,21 @@ def test_douyin_ffprobe_uses_short_timeouts_and_never_passes_a_url(
 
     monkeypatch.setattr(engine, "_run_ffprobe", run)
 
-    assert engine._ffprobe_douyin_media(
-        b"fixture",
-        should_cancel=lambda: False,
-    ) is None
-    assert engine._ffprobe_douyin_media(
-        b"fixture",
-        local_path=local_path,
-        should_cancel=lambda: False,
-    ) is None
+    assert (
+        engine._ffprobe_douyin_media(
+            b"fixture",
+            should_cancel=lambda: False,
+        )
+        is None
+    )
+    assert (
+        engine._ffprobe_douyin_media(
+            b"fixture",
+            local_path=local_path,
+            should_cancel=lambda: False,
+        )
+        is None
+    )
     assert [call[2] for call in calls] == [3.0, 15.0]
     assert [call[0][call[0].index("-i") + 1] for call in calls] == [
         "pipe:0",
@@ -7431,8 +7683,7 @@ def _configure_verified_douyin_transfer(
                 "_douyin_probe_prefix_size": len(payload),
                 "_douyin_probe_prefix_sha256": hashlib.sha256(payload).hexdigest(),
                 "_douyin_probe_source_url": (
-                    "https://api-play.amemv.com/aweme/v1/play/"
-                    "?video_id=fixture"
+                    "https://api-play.amemv.com/aweme/v1/play/" "?video_id=fixture"
                 ),
             }
         )
@@ -7627,13 +7878,10 @@ def test_douyin_verified_transfer_tries_next_bound_candidate_after_unknown_redir
 ) -> None:
     media_id = "7664225419386607205"
     payload = b"\x00\x00\x00\x18ftypisom" + b"verified-original-bytes"
-    source_url = (
-        "https://api-play.amemv.com/aweme/v1/play/?video_id=fixture"
-    )
+    source_url = "https://api-play.amemv.com/aweme/v1/play/?video_id=fixture"
     selected_url = "https://v26-web.douyinvod.com/verified.mp4"
     unknown_url = (
-        "https://unrecognized-cdn.vendor-cdn.net/original.mp4"
-        "?token=must-not-persist"
+        "https://unrecognized-cdn.vendor-cdn.net/original.mp4" "?token=must-not-persist"
     )
     engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
     _inject_fake_douyin_media_opener(monkeypatch, engine)
@@ -7794,9 +8042,7 @@ def test_douyin_verified_transfer_pauses_on_unknown_redirect_without_read_or_fil
     assert direct_ydl.requests[0].url == (
         "https://api-play.amemv.com/aweme/v1/play/?video_id=fixture"
     )
-    assert direct_ydl.requests[1].url == (
-        "https://v26-web.douyinvod.com/verified.mp4"
-    )
+    assert direct_ydl.requests[1].url == ("https://v26-web.douyinvod.com/verified.mp4")
     assert all(response.offset == 0 for response in direct_ydl.responses)
     assert all(response.closed for response in direct_ydl.responses)
     assert not list(tmp_path.iterdir())
@@ -8270,7 +8516,9 @@ def test_ytdlp_partial_file_is_preserved_for_resumable_download_failure(
     with pytest.raises(MediaDownloadError, match="fixture transfer failed"):
         engine.download_item(item, Platform.YOUTUBE, tmp_path)
 
-    partial_path = tmp_path / ".parts" / "failed-job" / "failed-item" / "fixture.mp4.part"
+    partial_path = (
+        tmp_path / ".parts" / "failed-job" / "failed-item" / "fixture.mp4.part"
+    )
     assert partial_path.read_bytes() == b"partial-media"
 
 
@@ -8312,11 +8560,7 @@ def test_ytdlp_partial_file_is_preserved_for_resumable_cancellation(
         )
 
     partial_path = (
-        tmp_path
-        / ".parts"
-        / "cancelled-job"
-        / "cancelled-item"
-        / "fixture.mp4.part"
+        tmp_path / ".parts" / "cancelled-job" / "cancelled-item" / "fixture.mp4.part"
     )
     assert partial_path.read_bytes() == b"partial-media"
 
@@ -8585,9 +8829,7 @@ def _iso_bmff_image(brand: bytes, width: int, height: int) -> bytes:
     ftyp = box(b"ftyp", brand + b"\x00\x00\x00\x00" + brand)
     ispe = box(
         b"ispe",
-        b"\x00\x00\x00\x00"
-        + width.to_bytes(4, "big")
-        + height.to_bytes(4, "big"),
+        b"\x00\x00\x00\x00" + width.to_bytes(4, "big") + height.to_bytes(4, "big"),
     )
     ipco = box(b"ipco", ispe)
     iprp = box(b"iprp", ipco)
@@ -8597,9 +8839,10 @@ def _iso_bmff_image(brand: bytes, width: int, height: int) -> bytes:
 
 @pytest.mark.parametrize("brand", [b"avif", b"avis", b"heic", b"heix"])
 def test_iso_bmff_image_dimensions_parse_avif_and_heic(brand: bytes) -> None:
-    assert MediaDownloader._image_dimensions(
-        _iso_bmff_image(brand, 1920, 2560)
-    ) == (1920, 2560)
+    assert MediaDownloader._image_dimensions(_iso_bmff_image(brand, 1920, 2560)) == (
+        1920,
+        2560,
+    )
 
 
 @pytest.mark.parametrize(
@@ -8617,9 +8860,7 @@ def test_iso_bmff_extension_uses_compatible_brands_and_content_type(
     expected: str,
 ) -> None:
     ftyp_payload = b"mif1" + b"\x00\x00\x00\x00" + compatible_brand + b"mif1"
-    first_bytes = (
-        (len(ftyp_payload) + 8).to_bytes(4, "big") + b"ftyp" + ftyp_payload
-    )
+    first_bytes = (len(ftyp_payload) + 8).to_bytes(4, "big") + b"ftyp" + ftyp_payload
 
     assert (
         MediaDownloader._asset_extension(
@@ -9286,9 +9527,7 @@ def test_douyin_transfer_read_interruption_pauses_after_finite_retries(
             ydl,
             [
                 RemoteAsset(
-                    candidates=[
-                        "https://v26-web.douyinvod.com/interrupted.mp4"
-                    ],
+                    candidates=["https://v26-web.douyinvod.com/interrupted.mp4"],
                     index=1,
                 )
             ],
@@ -9670,9 +9909,7 @@ def test_xhs_live_photo_without_declared_dimensions_rejects_lower_bitrate(
         engine._verify_local_video_asset(
             path,
             RemoteAsset(
-                candidates=[
-                    "https://sns-video-bd.xhscdn.com/live-photo.mp4"
-                ],
+                candidates=["https://sns-video-bd.xhscdn.com/live-photo.mp4"],
                 index=1,
                 bit_rate=2_000_000,
                 format_id="HD",

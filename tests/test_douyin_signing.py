@@ -56,6 +56,19 @@ GLUE_HTML = """
   <script data-sdk-glue-default="init">window.initializeGlue();</script>
 </head></html>
 """
+DNS_FILTER_HTML = """
+<!doctype html>
+<html lang="en">
+  <head>
+    <title>Website Filtered</title>
+    <link href="https://blocked.dnsfilter.com/main.css" rel="stylesheet">
+  </head>
+  <body>
+    <div id="app"></div>
+    <script src="https://blocked.dnsfilter.com/index.js"></script>
+  </body>
+</html>
+"""
 
 
 class FakeClock:
@@ -479,10 +492,7 @@ def test_explicit_auth_api_message_distinguishes_login_and_verification(
     status_message: str,
     expected: SiteIssueCode | None,
 ) -> None:
-    assert (
-        _explicit_auth_api_issue_code({"status_msg": status_message})
-        == expected
-    )
+    assert _explicit_auth_api_issue_code({"status_msg": status_message}) == expected
 
 
 @pytest.mark.parametrize(
@@ -583,6 +593,17 @@ def test_missing_sdk_glue_is_transient_but_unsafe_glue_is_not() -> None:
             'src="https://malicious.example/sdk-glue.js"></script>'
         )
     assert not isinstance(captured.value, _TransientSigningFailure)
+
+
+def test_dnsfilter_replacement_page_is_a_distinct_network_filter_failure() -> None:
+    with pytest.raises(
+        douyin_signing._NetworkFilterSigningFailure,
+        match="local DNS or web filter",
+    ) as captured:
+        _extract_sdk_glue_tags(DNS_FILTER_HTML)
+
+    assert not isinstance(captured.value, _TransientSigningFailure)
+    assert not isinstance(captured.value, _AuthenticationSigningFailure)
 
 
 @pytest.mark.parametrize(
@@ -721,9 +742,7 @@ def test_validate_profile_response_keeps_owned_video_and_photo_posts() -> None:
                     "uri": "photo-1",
                     "width": 1080,
                     "height": 1920,
-                    "url_list": [
-                        "https://p3-pc-sign.douyinpic.com/photo-1.webp"
-                    ],
+                    "url_list": ["https://p3-pc-sign.douyinpic.com/photo-1.webp"],
                 }
             ],
         }
@@ -971,6 +990,45 @@ def _install_fake_playwright(
     return page, context, browser, manager
 
 
+def test_dnsfilter_replacement_page_maps_to_actionable_network_error(
+    monkeypatch,
+) -> None:
+    page, context, browser, _manager = _install_fake_playwright(monkeypatch)
+    source_fetches = 0
+
+    def fetch_dnsfilter_page(*args, **kwargs):
+        nonlocal source_fetches
+        source_fetches += 1
+        return DNS_FILTER_HTML
+
+    monkeypatch.setattr(
+        "app.douyin_signing._fetch_source_html_with_urllib",
+        fetch_dnsfilter_page,
+    )
+
+    with pytest.raises(TemporaryAccessError) as captured:
+        fetch_signed_aweme_detail(
+            AWEME_ID,
+            verification_url=VIDEO_URL,
+            expected_sec_uid=SEC_UID,
+            signer_settle_ms=0,
+        )
+
+    message = str(captured.value)
+    assert captured.value.issue_code == SiteIssueCode.NETWORK_ERROR
+    assert "Allow Douyin in the local filter" in message
+    assert "disable DNS filtering" in message
+    assert "switch networks" in message
+    assert "retry the original link" in message
+    assert "Chrome verification is not required" in message
+    assert source_fetches == 1
+    assert context.request.requested_url is None
+    assert context.new_page_calls == 0
+    assert page.started is False
+    assert context.closed is True
+    assert browser.closed is True
+
+
 def test_fetch_signed_aweme_detail_uses_same_origin_and_closes_resources(
     monkeypatch,
 ) -> None:
@@ -1155,7 +1213,9 @@ def test_detail_retry_status_reports_only_safe_reason_category(
     assert retry_statuses == [
         f"Retrying Douyin signed detail request 2/3 (reason: {reason})"
     ]
-    assert all("http" not in value.lower() or reason in value for value in retry_statuses)
+    assert all(
+        "http" not in value.lower() or reason in value for value in retry_statuses
+    )
 
 
 def test_browser_html_429_is_transient_and_response_is_disposed(monkeypatch) -> None:
@@ -1207,6 +1267,34 @@ def test_browser_html_bare_403_is_transient_and_response_is_disposed(
             lambda: False,
         )
 
+    assert response.disposed is True
+
+
+def test_browser_html_dnsfilter_replacement_page_is_not_authentication(
+    monkeypatch,
+) -> None:
+    response = FakeApiResponse(body=DNS_FILTER_HTML)
+    context = SimpleNamespace(
+        request=SimpleNamespace(get=lambda url, timeout: response)
+    )
+    monkeypatch.setattr(
+        "app.douyin_signing._fetch_source_html_with_urllib",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            OSError("temporary source request failure")
+        ),
+    )
+
+    with pytest.raises(douyin_signing._NetworkFilterSigningFailure) as captured:
+        _extract_glue_with_context_fallback(
+            context,
+            VIDEO_URL,
+            object(),
+            "Test User Agent",
+            1_000,
+            lambda: False,
+        )
+
+    assert not isinstance(captured.value, _AuthenticationSigningFailure)
     assert response.disposed is True
 
 
@@ -1654,15 +1742,14 @@ def test_distinct_verified_profile_pages_refresh_no_progress_budget(
     ]
     assert clock.now == pytest.approx(238, abs=0.25)
     assert clock.now > 120
-    assert [
-        value for value in statuses if value.startswith("Verified Douyin")
-    ] == [
+    assert [value for value in statuses if value.startswith("Verified Douyin")] == [
         "Verified Douyin signed profile page 1 (1 items)",
         "Verified Douyin signed profile page 2 (1 items)",
     ]
-    assert [
-        request["params"]["max_cursor"] for request in page.signed_requests
-    ] == ["0", "123"]
+    assert [request["params"]["max_cursor"] for request in page.signed_requests] == [
+        "0",
+        "123",
+    ]
 
 
 def test_duplicate_only_profile_page_does_not_refresh_no_progress_budget(
@@ -1729,9 +1816,11 @@ def test_duplicate_only_profile_page_does_not_refresh_no_progress_budget(
         )
 
     assert clock.now == pytest.approx(120, abs=0.01)
-    assert [
-        request["params"]["max_cursor"] for request in page.signed_requests
-    ] == ["0", "123", "456"]
+    assert [request["params"]["max_cursor"] for request in page.signed_requests] == [
+        "0",
+        "123",
+        "456",
+    ]
 
 
 def test_fresh_signing_session_resumes_from_failed_profile_cursor(
@@ -1778,7 +1867,9 @@ def test_fresh_signing_session_resumes_from_failed_profile_cursor(
                     return first_page
                 return {"state": "failed", "reason": "request_failed"}
             if self.current_cursor != "123":
-                raise AssertionError("A fresh session replayed an already verified page")
+                raise AssertionError(
+                    "A fresh session replayed an already verified page"
+                )
             return second_page
 
         def wait_for_timeout(self, timeout: int) -> None:

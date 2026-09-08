@@ -43,6 +43,7 @@ from .douyin import discover_profile as discover_douyin_profile
 from .douyin import discover_item_metadata_from_profile
 from .douyin import is_complete_profile_media_metadata
 from .douyin import quality_floor_dimensions
+from .douyin import verified_aweme_metadata
 from .douyin_signing import fetch_signed_aweme_detail
 from .errors import (
     AuthenticationRequiredError,
@@ -180,6 +181,12 @@ COOKIE_ACCESS_MESSAGE = (
     "system cookie-access prompt, or disable Chrome Cookie in settings to continue "
     "explicitly without login and create a new task. Opening a verification page is "
     "not required."
+)
+DOUYIN_LIVE_PHOTO_STATIC_FALLBACK_WARNING = (
+    "Some Douyin image positions reported Live Photo data, but no complete trusted "
+    "motion rendition was available. The highest-pixel static images will be saved "
+    "for those positions. Create a new task from the original link later to retry "
+    "the dynamic versions."
 )
 DOUYIN_ITEM_EXPANSION_MESSAGE = (
     "Douyin returned an uploader profile instead of the requested video. "
@@ -477,14 +484,17 @@ def _is_auth_error(message: str) -> bool:
     lowered = message.lower()
     if any(marker in lowered for marker in AUTH_ERROR_MARKERS):
         return True
-    return re.search(
-        r"(?<![a-z])(?:sign|log) in(?:\s+required|\s+to\b|[.!,:;]|$)|"
-        r"\blog into an account\b|"
-        r"\b(?:need|must) (?:to )?be logged in\b|"
-        r"\b(?:you (?:are|re)|you're) not logged in\b|"
-        r"\b(?:login|session) (?:has )?expired\b",
-        lowered,
-    ) is not None
+    return (
+        re.search(
+            r"(?<![a-z])(?:sign|log) in(?:\s+required|\s+to\b|[.!,:;]|$)|"
+            r"\blog into an account\b|"
+            r"\b(?:need|must) (?:to )?be logged in\b|"
+            r"\b(?:you (?:are|re)|you're) not logged in\b|"
+            r"\b(?:login|session) (?:has )?expired\b",
+            lowered,
+        )
+        is not None
+    )
 
 
 def _is_temporary_access_error(message: str) -> bool:
@@ -868,6 +878,20 @@ class MediaDownloader:
                                 else None
                             ),
                             profile.warning,
+                            (
+                                DOUYIN_LIVE_PHOTO_STATIC_FALLBACK_WARNING
+                                if any(
+                                    isinstance(
+                                        item.metadata.get("douyin_profile_media"),
+                                        dict,
+                                    )
+                                    and item.metadata["douyin_profile_media"].get(
+                                        "live_photo_static_fallback_indexes"
+                                    )
+                                    for item in items
+                                )
+                                else None
+                            ),
                         )
                         if value
                     )
@@ -927,7 +951,7 @@ class MediaDownloader:
         if not expected_id:
             raise DiscoveryError("The Douyin URL has no video identifier")
 
-        def operation(use_cookies: bool) -> tuple[dict[str, Any], str]:
+        def operation(use_cookies: bool) -> tuple[dict[str, Any], str | None]:
             options = {
                 **self._douyin_ytdlp_options(use_cookies),
                 "skip_download": True,
@@ -949,13 +973,42 @@ class MediaDownloader:
                 )
                 self._validate_douyin_info(info, expected_id, url)
                 video_uri = self._douyin_video_uri(info, expected_id, url)
-                if not video_uri:
-                    raise TemporaryAccessError(
-                        "Douyin did not return a verified media identity for the "
-                        "requested video. Retry the original video; Chrome verification "
-                        "is not required unless Douyin explicitly shows a CAPTCHA or "
-                        "login page."
+                if (
+                    video_uri is None
+                    and not isinstance(info.get("_douyin_profile_media"), dict)
+                    and use_cookies
+                ):
+                    detail = fetch_signed_aweme_detail(
+                        expected_id,
+                        verification_url=url,
+                        expected_sec_uid=None,
+                        cookie_profile=self.config.cookie_profile,
+                        should_cancel=should_cancel,
+                        status_callback=self._report_discovery,
                     )
+                    verified_metadata = verified_aweme_metadata(
+                        detail,
+                        expected_id,
+                    )
+                    if verified_metadata:
+                        info["_douyin_profile_media"] = verified_metadata
+                        info["channel_id"] = verified_metadata["owner_id"]
+                        info["channel"] = str(
+                            verified_metadata.get("author") or "Douyin Author"
+                        )
+                        info["title"] = str(
+                            verified_metadata.get("title")
+                            or info.get("title")
+                            or expected_id
+                        )
+                        create_time = verified_metadata.get("create_time")
+                        if type(create_time) is int and create_time > 0:
+                            info["timestamp"] = create_time
+                        if verified_metadata.get("media_kind") == "video":
+                            video_uri = (
+                                str(verified_metadata.get("video_uri") or "").strip()
+                                or None
+                            )
             return info, video_uri
 
         (info, video_uri), fallback = self._run_with_cookie_fallback(
@@ -970,10 +1023,11 @@ class MediaDownloader:
             title = "Untitled Douyin video"
         cached_media: dict[str, Any] = {
             "media_id": expected_id,
-            "video_uri": video_uri,
             "title": title,
             "author": author,
         }
+        if video_uri:
+            cached_media["video_uri"] = video_uri
         native_formats = info.get("formats")
         quality_candidates: list[Any] = [info]
         if isinstance(native_formats, list):
@@ -1004,12 +1058,18 @@ class MediaDownloader:
             )
         if owner_id:
             try:
-                enriched_media = discover_item_metadata_from_profile(
-                    owner_id,
-                    expected_id,
-                    cookie_profile=self.config.cookie_profile,
-                    should_cancel=should_cancel,
-                    status_callback=self._report_discovery,
+                embedded_media = info.get("_douyin_profile_media")
+                enriched_media = (
+                    embedded_media
+                    if isinstance(embedded_media, dict)
+                    else discover_item_metadata_from_profile(
+                        owner_id,
+                        expected_id,
+                        cookie_profile=self.config.cookie_profile,
+                        prefer_exact_detail=video_uri is None,
+                        should_cancel=should_cancel,
+                        status_callback=self._report_discovery,
+                    )
                 )
             except DownloadCancelledError:
                 raise
@@ -1064,15 +1124,87 @@ class MediaDownloader:
                     "author feed, so the highest quality could not be confirmed. "
                     "Retry the original video; Chrome verification was not requested."
                 )
-            enriched_video_uri = str(
-                enriched_media.get("video_uri") or ""
-            ).strip()
-            if enriched_video_uri != video_uri:
+            if enriched_media.get("media_kind") == "image":
+                if not is_complete_profile_media_metadata(
+                    enriched_media,
+                    expected_id,
+                    owner_id,
+                ):
+                    raise MediaDownloadError(
+                        "Douyin image metadata failed item or author identity "
+                        "validation. The cross-wired response was blocked; Chrome "
+                        "verification was not requested.",
+                        issue_code=SiteIssueCode.SITE_RESPONSE_CHANGED,
+                    )
+                image_title = str(enriched_media.get("title") or title).strip()
+                if (
+                    not image_title
+                    or image_title == expected_id
+                    or image_title.isdigit()
+                ):
+                    image_title = "Untitled Douyin image"
+                image_author = str(
+                    enriched_media.get("author") or author or "Douyin Author"
+                ).strip()
+                create_time = enriched_media.get("create_time")
+                if type(create_time) is not int or create_time <= 0:
+                    raise TemporaryAccessError(
+                        "Douyin returned the Live Photo without a verified publish "
+                        "time. Retry the original item so it can be named correctly."
+                    )
+                upload_date = self._douyin_upload_date(create_time)
+                item = DownloadItem(
+                    id=_item_key(Platform.DOUYIN, expected_id, url, 1),
+                    media_id=expected_id,
+                    source_url=url,
+                    title=image_title,
+                    upload_date=upload_date,
+                    author=image_author,
+                    playlist_index=1,
+                    extractor_key="Douyin",
+                    media_type=MediaType.IMAGE,
+                    metadata={
+                        "verification_url": url,
+                        "item_identity_verified": True,
+                        "douyin_item_media": enriched_media,
+                    },
+                )
+                return DiscoveryResult(
+                    author=image_author,
+                    items=[item],
+                    cookie_fallback_used=fallback,
+                    warning=(
+                        " ".join(
+                            value
+                            for value in (
+                                COOKIE_FALLBACK_WARNING if fallback else None,
+                                (
+                                    DOUYIN_LIVE_PHOTO_STATIC_FALLBACK_WARNING
+                                    if enriched_media.get(
+                                        "live_photo_static_fallback_indexes"
+                                    )
+                                    else None
+                                ),
+                            )
+                            if value
+                        )
+                        or None
+                    ),
+                )
+            enriched_video_uri = str(enriched_media.get("video_uri") or "").strip()
+            if not re.fullmatch(r"[A-Za-z0-9_-]{10,200}", enriched_video_uri):
+                raise TemporaryAccessError(
+                    "Douyin returned the requested item without a verified video "
+                    "identity. Retry the original link; no lower-quality fallback "
+                    "was downloaded."
+                )
+            if video_uri and enriched_video_uri != video_uri:
                 raise MediaDownloadError(
                     "Douyin author-feed enrichment returned a different media "
                     "identity for the requested video. The cross-wired response was "
                     "blocked; Chrome verification was not requested."
                 )
+            cached_media["video_uri"] = enriched_video_uri
             if "direct_candidates" in enriched_media:
                 cached_media["direct_candidates"] = enriched_media["direct_candidates"]
             enriched_duration_ms = _normalized_douyin_duration_ms(
@@ -1166,12 +1298,13 @@ class MediaDownloader:
             with self._douyin_probe_reuse_scope(output_path):
                 if (
                     (
-                        isinstance(
-                            item.metadata.get("douyin_profile_media"), dict
-                        )
-                        and item.metadata["douyin_profile_media"].get(
-                            "media_kind"
-                        )
+                        isinstance(item.metadata.get("douyin_profile_media"), dict)
+                        and item.metadata["douyin_profile_media"].get("media_kind")
+                        == "image"
+                    )
+                    or (
+                        isinstance(item.metadata.get("douyin_item_media"), dict)
+                        and item.metadata["douyin_item_media"].get("media_kind")
                         == "image"
                     )
                     or (
@@ -1205,9 +1338,7 @@ class MediaDownloader:
         china_timezone = timezone(timedelta(hours=8))
         try:
             return (
-                datetime.fromtimestamp(create_time, china_timezone)
-                .date()
-                .isoformat()
+                datetime.fromtimestamp(create_time, china_timezone).date().isoformat()
             )
         except (OverflowError, OSError, ValueError) as exc:
             raise DiscoveryError("The Douyin publish time is invalid") from exc
@@ -1339,9 +1470,7 @@ class MediaDownloader:
         issue_code = classify_site_issue(message)
         raise MediaDownloadError(
             safe_message,
-            issue_code=(
-                issue_code if issue_code != SiteIssueCode.UNKNOWN else None
-            ),
+            issue_code=(issue_code if issue_code != SiteIssueCode.UNKNOWN else None),
         ) from exc
 
     def _discover_with_ytdlp(
@@ -1578,8 +1707,7 @@ class MediaDownloader:
             or "\\" in raw_value
             or any(character.isspace() for character in raw_value)
             or any(
-                ord(character) < 32 or ord(character) == 127
-                for character in raw_value
+                ord(character) < 32 or ord(character) == 127 for character in raw_value
             )
         ):
             return None, "malformed-url"
@@ -1609,9 +1737,13 @@ class MediaDownloader:
             return None, "non-ascii-host"
         labels = hostname.split(".")
         is_ip_literal = cls._looks_like_ip_literal(hostname)
-        is_dns_hostname = not is_ip_literal and len(labels) >= 2 and not any(
-            not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
-            for label in labels
+        is_dns_hostname = (
+            not is_ip_literal
+            and len(labels) >= 2
+            and not any(
+                not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+                for label in labels
+            )
         )
         if parsed.scheme.lower() != "https":
             return None, "non-https-scheme"
@@ -1664,9 +1796,8 @@ class MediaDownloader:
             return validation_reason
         if cls._is_trusted_douyin_asset_url(value, media_type):
             return None
-        if (
-            media_type == MediaType.VIDEO
-            and cls._is_douyin_regional_media_host(hostname)
+        if media_type == MediaType.VIDEO and cls._is_douyin_regional_media_host(
+            hostname
         ):
             return None if allow_verified_regional else "unverified-source-binding"
         return "unrecognized-host"
@@ -1680,9 +1811,7 @@ class MediaDownloader:
         hostname, _ = cls._douyin_redirect_diagnostic(value)
         if reason == "nonstandard-port":
             try:
-                hostname = (
-                    (urlsplit(value).hostname or "").lower().rstrip(".") or None
-                )
+                hostname = (urlsplit(value).hostname or "").lower().rstrip(".") or None
             except (TypeError, ValueError):
                 hostname = None
         visible_hostname = (
@@ -1695,9 +1824,7 @@ class MediaDownloader:
             reason == "unrecognized-host"
             or (reason == "nonstandard-port" and not visible_hostname)
         ):
-            host_fingerprint = hashlib.sha256(
-                hostname.encode("ascii")
-            ).hexdigest()[:12]
+            host_fingerprint = hashlib.sha256(hostname.encode("ascii")).hexdigest()[:12]
         redirect_port = None
         if reason == "nonstandard-port":
             try:
@@ -1906,9 +2033,7 @@ class MediaDownloader:
         if not hostname:
             return False
         if media_type == MediaType.IMAGE:
-            return hostname == "douyinpic.com" or hostname.endswith(
-                ".douyinpic.com"
-            )
+            return hostname == "douyinpic.com" or hostname.endswith(".douyinpic.com")
         return cls._is_douyin_direct_media_host(hostname)
 
     @classmethod
@@ -1926,8 +2051,7 @@ class MediaDownloader:
                 continue
             if (
                 expected_video_uri
-                and str(value.get("video_uri") or "").strip()
-                != expected_video_uri
+                and str(value.get("video_uri") or "").strip() != expected_video_uri
             ):
                 continue
             try:
@@ -1952,9 +2076,9 @@ class MediaDownloader:
                     continue
                 try:
                     parsed_candidate = urlsplit(candidate_url)
-                    candidate_video_ids = parse_qs(
-                        parsed_candidate.query
-                    ).get("video_id")
+                    candidate_video_ids = parse_qs(parsed_candidate.query).get(
+                        "video_id"
+                    )
                 except (TypeError, ValueError):
                     continue
                 if (
@@ -2093,8 +2217,37 @@ class MediaDownloader:
     @staticmethod
     def _should_use_douyin_signed_detail(error: DownloadError) -> bool:
         message = str(error).lower()
-        return _is_auth_error(message) or any(
-            marker in message for marker in DOUYIN_EMPTY_DETAIL_MARKERS
+        if any(
+            marker in message
+            for marker in (
+                "connection reset",
+                "connection refused",
+                "network is unreachable",
+                "temporary failure in name resolution",
+                "name or service not known",
+                "proxy error",
+                "certificate verify",
+                "ssl error",
+                "timed out",
+                "timeout",
+            )
+        ):
+            return False
+        return (
+            _is_auth_error(message)
+            or any(marker in message for marker in DOUYIN_EMPTY_DETAIL_MARKERS)
+            or any(
+                marker in message
+                for marker in (
+                    "an extractor error has occurred",
+                    "unable to extract video data",
+                    "no video formats found",
+                    "requested format is not available",
+                    "keyerror",
+                    "'video'",
+                    '"video"',
+                )
+            )
         )
 
     def _extract_douyin_raw_info(
@@ -2169,6 +2322,38 @@ class MediaDownloader:
             should_cancel=should_cancel,
             status_callback=status_callback,
         )
+        verified_metadata = verified_aweme_metadata(
+            detail,
+            expected_id,
+            expected_profile_id=expected_profile_id,
+        )
+        if verified_metadata and verified_metadata.get("media_kind") == "image":
+            return {
+                "id": expected_id,
+                "channel_id": verified_metadata["owner_id"],
+                "channel": str(verified_metadata.get("author") or "Douyin Author"),
+                "title": str(
+                    verified_metadata.get("title") or fallback_title or expected_id
+                ),
+                "timestamp": verified_metadata.get("create_time"),
+                "formats": [],
+                "_douyin_profile_media": verified_metadata,
+                "webpage_url": source_url,
+                "original_url": source_url,
+                "extractor": "Douyin",
+                "extractor_key": "Douyin",
+            }
+        images = detail.get("images")
+        is_image_post = str(detail.get("aweme_type") or "") == "68" or (
+            isinstance(images, list) and bool(images)
+        )
+        if is_image_post:
+            raise TemporaryAccessError(
+                "Douyin returned the requested image or Live Photo item without "
+                "complete trusted media metadata. Retry the original link so the "
+                "item can be parsed again; Chrome verification is not required.",
+                issue_code=SiteIssueCode.SITE_RESPONSE_CHANGED,
+            )
         parsed = DouyinIE(ydl)._parse_aweme_video_app(detail)
         if not isinstance(parsed, dict):
             raise DownloadError("Douyin signed detail returned no downloadable media")
@@ -2380,9 +2565,7 @@ class MediaDownloader:
         line: str = "0",
     ) -> str:
         hostname = hostname or (
-            DOUYIN_DEFAULT_PROBE_HOST
-            if ratio == "default"
-            else DOUYIN_RATIO_PROBE_HOST
+            DOUYIN_DEFAULT_PROBE_HOST if ratio == "default" else DOUYIN_RATIO_PROBE_HOST
         )
         query = urlencode(
             {
@@ -2610,11 +2793,10 @@ class MediaDownloader:
                 ]
                 actual_width = int(direct_probe.get("width") or 0)
                 actual_height = int(direct_probe.get("height") or 0)
-                if (
-                    min(actual_width, actual_height)
-                    < min(declared_width, declared_height)
-                    or max(actual_width, actual_height)
-                    < max(declared_width, declared_height)
+                if min(actual_width, actual_height) < min(
+                    declared_width, declared_height
+                ) or max(actual_width, actual_height) < max(
+                    declared_width, declared_height
                 ):
                     direct_failures.append(
                         (
@@ -2712,9 +2894,7 @@ class MediaDownloader:
                     "probing later items; wait briefly and continue the task. No "
                     f"lower-quality fallback was downloaded. Probe details: {details}"
                 )
-            failures.extend(
-                (label, reason) for label, reason, _ in unresolved_direct
-            )
+            failures.extend((label, reason) for label, reason, _ in unresolved_direct)
 
         unique_probes: dict[tuple[Any, ...], dict[str, Any]] = {}
         unsupported_probes: list[dict[str, Any]] = []
@@ -2818,9 +2998,7 @@ class MediaDownloader:
                     "filesize": probe.get("filesize"),
                     "duration": probe.get("duration"),
                     "_douyin_probe_prefix_size": probe.get("probe_prefix_size"),
-                    "_douyin_probe_prefix_sha256": probe.get(
-                        "probe_prefix_sha256"
-                    ),
+                    "_douyin_probe_prefix_sha256": probe.get("probe_prefix_sha256"),
                     "_douyin_probe_source_url": probe.get("source_url"),
                     "_douyin_probe_source_urls": list(
                         probe.get("source_candidates") or []
@@ -2877,9 +3055,7 @@ class MediaDownloader:
                 last_lock_status_at = (
                     lock_wait_started_at - DOUYIN_LOCK_STATUS_INTERVAL_SECONDS
                 )
-                while not DOUYIN_MEDIA_PROBE_LOCK.acquire(
-                    timeout=lock_timeout
-                ):
+                while not DOUYIN_MEDIA_PROBE_LOCK.acquire(timeout=lock_timeout):
                     if should_cancel():
                         raise DownloadCancelled("Task cancelled")
                     if isinstance(quality_run, _DouyinQualityProbeRun):
@@ -2913,10 +3089,7 @@ class MediaDownloader:
                             expected_duration=expected_duration,
                             should_cancel=should_cancel,
                         )
-                        if (
-                            probe
-                            and isinstance(quality_run, _DouyinQualityProbeRun)
-                        ):
+                        if probe and isinstance(quality_run, _DouyinQualityProbeRun):
                             quality_run.budget.refresh()
                         return probe
                     finally:
@@ -2935,10 +3108,7 @@ class MediaDownloader:
                 self._close_douyin_probe_error(exc)
                 if isinstance(quality_run, _DouyinQualityProbeRun):
                     quality_run.budget.remaining()
-                if (
-                    attempt >= DOUYIN_PROBE_ATTEMPTS
-                    or not retryable
-                ):
+                if attempt >= DOUYIN_PROBE_ATTEMPTS or not retryable:
                     raise
                 if callback:
                     callback(
@@ -2951,9 +3121,7 @@ class MediaDownloader:
                             ),
                         )
                     )
-                retry_delay = DOUYIN_PROBE_RETRY_BASE_SECONDS * (
-                    2 ** (attempt - 1)
-                )
+                retry_delay = DOUYIN_PROBE_RETRY_BASE_SECONDS * (2 ** (attempt - 1))
                 if isinstance(quality_run, _DouyinQualityProbeRun):
                     retry_delay = min(
                         retry_delay,
@@ -2997,9 +3165,7 @@ class MediaDownloader:
                 _DouyinProbeIntegrityChanged,
                 _DouyinProbeResponseChanged,
             ),
-        ) or (
-            cls._is_retryable_douyin_probe_error(exc)
-        )
+        ) or (cls._is_retryable_douyin_probe_error(exc))
 
     @staticmethod
     def _close_douyin_probe_error(exc: Exception) -> None:
@@ -3116,11 +3282,15 @@ class MediaDownloader:
         callback: EventCallback | None = None,
         should_cancel: CancelCallback,
     ) -> dict[str, Any] | None:
-        ratio = ratio or getattr(
-            self._douyin_probe_context,
-            "ratio",
-            None,
-        ) or "default"
+        ratio = (
+            ratio
+            or getattr(
+                self._douyin_probe_context,
+                "ratio",
+                None,
+            )
+            or "default"
+        )
         callback = callback or getattr(
             self._douyin_probe_context,
             "callback",
@@ -3366,9 +3536,7 @@ class MediaDownloader:
             expected_filesize is not None
             and expected_filesize > DOUYIN_MAX_PROBE_FILE_BYTES
         ):
-            raise _DouyinProbeRejected(
-                "media file exceeded the safe probe size limit"
-            )
+            raise _DouyinProbeRejected("media file exceeded the safe probe size limit")
         quality_run = getattr(self._douyin_probe_context, "quality_run", None)
         request_timeout = DOUYIN_PROBE_HTTP_TIMEOUT_SECONDS
         if isinstance(quality_run, _DouyinQualityProbeRun):
@@ -3405,9 +3573,7 @@ class MediaDownloader:
             speed = downloaded / elapsed if downloaded else None
             eta = (
                 max(0.0, (expected_filesize - downloaded) / speed)
-                if expected_filesize is not None
-                and speed is not None
-                and speed > 0
+                if expected_filesize is not None and speed is not None and speed > 0
                 else None
             )
             percent = (
@@ -3447,9 +3613,7 @@ class MediaDownloader:
                     redirect_reason,
                 )
             content_type = (
-                str(response.headers.get("Content-Type") or "")
-                .split(";", 1)[0]
-                .lower()
+                str(response.headers.get("Content-Type") or "").split(";", 1)[0].lower()
             )
             if content_type and not (
                 content_type.startswith("video/")
@@ -3463,9 +3627,7 @@ class MediaDownloader:
                 raise _DouyinProbeResponseChanged(
                     "media endpoint did not return video data"
                 )
-            declared_length = str(
-                response.headers.get("Content-Length") or ""
-            )
+            declared_length = str(response.headers.get("Content-Length") or "")
             if declared_length.isdigit():
                 declared_size = int(declared_length)
                 if declared_size > DOUYIN_MAX_PROBE_FILE_BYTES:
@@ -3508,9 +3670,7 @@ class MediaDownloader:
             with contextlib.suppress(Exception):
                 response.close()
         if downloaded <= 0:
-            raise _DouyinProbeResponseChanged(
-                "media endpoint returned an empty file"
-            )
+            raise _DouyinProbeResponseChanged("media endpoint returned an empty file")
         if expected_filesize is not None and downloaded != expected_filesize:
             raise _DouyinProbeIntegrityChanged(
                 "media size changed between the range probe and local probe"
@@ -4035,10 +4195,7 @@ class MediaDownloader:
                             for value in (
                                 redirect_source_url,
                                 str(selected["url"]),
-                                *(
-                                    selected.get("_douyin_probe_source_urls")
-                                    or []
-                                ),
+                                *(selected.get("_douyin_probe_source_urls") or []),
                             )
                             if isinstance(value, str) and value
                         )
@@ -4047,11 +4204,7 @@ class MediaDownloader:
                         selected_candidates
                     )
                     title = str(raw_result.get("title") or item.title or "").strip()
-                    if (
-                        not title
-                        or title == expected_douyin_id
-                        or title.isdigit()
-                    ):
+                    if not title or title == expected_douyin_id or title.isdigit():
                         title = "Untitled Douyin video"
                     selected_asset = RemoteAsset(
                         candidates=selected_candidates,
@@ -4065,10 +4218,8 @@ class MediaDownloader:
                             or self._float_or_none(raw_result.get("duration"))
                         ),
                         bit_rate=selected_bit_rate or None,
-                        video_codec=str(selected.get("vcodec") or "").lower()
-                        or None,
-                        audio_codec=str(selected.get("acodec") or "").lower()
-                        or None,
+                        video_codec=str(selected.get("vcodec") or "").lower() or None,
+                        audio_codec=str(selected.get("acodec") or "").lower() or None,
                         probe_prefix_size=int(
                             selected.get("_douyin_probe_prefix_size") or 0
                         )
@@ -4149,9 +4300,7 @@ class MediaDownloader:
             self._cleanup_ytdlp_parts_dir(
                 parts_dir,
                 output_dir,
-                remove_contents=(
-                    platform == Platform.DOUYIN or operation_succeeded
-                ),
+                remove_contents=(platform == Platform.DOUYIN or operation_succeeded),
             )
         unique_paths = self._existing_unique_paths(paths)
         if not unique_paths:
@@ -4195,21 +4344,33 @@ class MediaDownloader:
     ) -> DownloadOutcome:
         if should_cancel():
             raise DownloadCancelledError("Task cancelled")
-        profile_url = str(item.metadata.get("profile_url") or "").strip()
-        profile_id = self._douyin_profile_id(profile_url)
         media_id = str(item.media_id or "").strip()
         canonical_item_url = (
             f"https://www.douyin.com/video/{media_id}" if media_id else ""
         )
+        item_cached = item.metadata.get("douyin_item_media")
+        profile_cached = item.metadata.get("douyin_profile_media")
+        cached = item_cached if isinstance(item_cached, dict) else profile_cached
+        is_bound_item = (
+            isinstance(item_cached, dict)
+            and item.metadata.get("item_identity_verified") is True
+            and item.metadata.get("verification_url") == canonical_item_url
+        )
+        profile_url = str(item.metadata.get("profile_url") or "").strip()
+        if is_bound_item:
+            profile_url = (
+                "https://www.douyin.com/user/"
+                f"{str(item_cached.get('owner_id') or '').strip()}"
+            )
+        profile_id = self._douyin_profile_id(profile_url)
         try:
             profile_source = identify_url(profile_url)
             item_source = identify_url(item.source_url)
         except (TypeError, ValueError):
             profile_source = None
             item_source = None
-        cached = item.metadata.get("douyin_profile_media")
         if (
-            item.metadata.get("profile_owner_verified") is not True
+            not (is_bound_item or item.metadata.get("profile_owner_verified") is True)
             or not profile_id
             or not media_id
             or profile_source is None
@@ -4231,8 +4392,7 @@ class MediaDownloader:
         if not is_complete_profile_media_metadata(cached, media_id, profile_id):
             live_assets = cached.get("live_photo_assets")
             if isinstance(live_assets, list) and any(
-                isinstance(value, dict)
-                and value.get("direct_candidates") is None
+                isinstance(value, dict) and value.get("direct_candidates") is None
                 for value in live_assets
             ):
                 raise TemporaryAccessError(
@@ -4279,87 +4439,102 @@ class MediaDownloader:
                 )
             )
 
+        live_photo_by_index = {asset.index: asset for asset in live_photo_assets}
         output_paths: list[str] = []
         completed_assets: list[RemoteAsset] = []
-        total_assets = len(image_assets) + len(live_photo_assets)
+        total_assets = len(image_assets)
         progress_index = 0
-        with YoutubeDL(self._base_options(False)) as ydl:
-            for asset in image_assets:
-                progress_index += 1
+
+        def transfer_preferred_asset(
+            ydl: YoutubeDL,
+            image_asset: RemoteAsset,
+            position: int,
+        ) -> tuple[Path, RemoteAsset, bool]:
+            live_asset = live_photo_by_index.get(image_asset.index)
+            try:
+                if live_asset:
+                    reused = self._existing_douyin_live_photo_asset(
+                        item,
+                        output_dir,
+                        media_id,
+                        live_asset,
+                        should_cancel=should_cancel,
+                    )
+                    if reused:
+                        return reused[0], reused[1], True
+                    selected = self._select_highest_douyin_live_photo_asset(
+                        ydl,
+                        live_asset,
+                        callback=callback,
+                        should_cancel=should_cancel,
+                    )
+                    path, chosen = self._download_first_available_asset(
+                        ydl,
+                        [selected],
+                        output_dir,
+                        upload_date,
+                        title,
+                        media_id,
+                        profile_url,
+                        platform=Platform.DOUYIN,
+                        media_type=MediaType.VIDEO,
+                        callback=callback,
+                        should_cancel=should_cancel,
+                        asset_index=live_asset.index,
+                        progress_index=position,
+                        progress_count=total_assets,
+                        verify_declared_dimensions=True,
+                        require_quality_fingerprint=True,
+                    )
+                    return path, chosen, False
+
                 reused = self._existing_douyin_image_asset(
                     item,
                     output_dir,
                     media_id,
-                    asset,
+                    image_asset,
                 )
                 if reused:
-                    path, chosen = reused
-                    if callback:
-                        callback(
-                            EngineEvent(
-                                event="downloading",
-                                progress=TransferProgress(
-                                    downloaded_bytes=int(chosen.size or 0),
-                                    total_bytes=chosen.size,
-                                    percent=progress_index * 100.0 / total_assets,
-                                    fragment_index=progress_index,
-                                    fragment_count=total_assets,
-                                    filename=str(path),
-                                ),
-                            )
-                        )
-                else:
-                    try:
-                        path, chosen = self._download_first_available_asset(
-                            ydl,
-                            [asset],
-                            output_dir,
-                            upload_date,
-                            title,
-                            media_id,
-                            profile_url,
-                            platform=Platform.DOUYIN,
-                            media_type=MediaType.IMAGE,
-                            callback=callback,
-                            should_cancel=should_cancel,
-                            asset_index=asset.index,
-                            progress_index=progress_index,
-                            progress_count=total_assets,
-                            verify_declared_dimensions=True,
-                        )
-                    except DownloadCancelledError:
-                        raise
-                    except TemporaryAccessError:
-                        raise
-                    except Exception as exc:
-                        raise MediaDownloadError(
-                            f"Image {asset.index} failed: "
-                            f"{safe_external_error_message(exc)}",
-                            issue_code=getattr(exc, "issue_code", None),
-                        ) from exc
-                output_paths.append(str(path))
-                completed_assets.append(chosen)
-                if callback:
-                    callback(
-                        EngineEvent(
-                            event="asset_completed",
-                            output_paths=list(output_paths),
-                            selected_format=chosen.format_id,
-                            resolution=self._asset_resolution(chosen),
-                        )
-                    )
-
-            for asset in live_photo_assets:
-                progress_index += 1
-                reused = self._existing_douyin_live_photo_asset(
-                    item,
+                    return reused[0], reused[1], True
+                path, chosen = self._download_first_available_asset(
+                    ydl,
+                    [image_asset],
                     output_dir,
+                    upload_date,
+                    title,
                     media_id,
-                    asset,
+                    profile_url,
+                    platform=Platform.DOUYIN,
+                    media_type=MediaType.IMAGE,
+                    callback=callback,
                     should_cancel=should_cancel,
+                    asset_index=image_asset.index,
+                    progress_index=position,
+                    progress_count=total_assets,
+                    verify_declared_dimensions=True,
+                )
+                return path, chosen, False
+            except DownloadCancelledError:
+                raise
+            except TemporaryAccessError:
+                raise
+            except Exception as exc:
+                label = "Live Photo" if live_asset else "Image"
+                raise MediaDownloadError(
+                    f"{label} {image_asset.index} failed: "
+                    f"{safe_external_error_message(exc)}",
+                    issue_code=getattr(exc, "issue_code", None),
+                ) from exc
+
+        with YoutubeDL(self._base_options(False)) as ydl:
+            for image_asset in image_assets:
+                progress_index += 1
+                path, chosen, reused = transfer_preferred_asset(
+                    ydl,
+                    image_asset,
+                    progress_index,
                 )
                 if reused:
-                    path, chosen = reused
                     if callback:
                         callback(
                             EngineEvent(
@@ -4374,42 +4549,6 @@ class MediaDownloader:
                                 ),
                             )
                         )
-                else:
-                    try:
-                        asset = self._select_highest_douyin_live_photo_asset(
-                            ydl,
-                            asset,
-                            callback=callback,
-                            should_cancel=should_cancel,
-                        )
-                        path, chosen = self._download_first_available_asset(
-                            ydl,
-                            [asset],
-                            output_dir,
-                            upload_date,
-                            title,
-                            media_id,
-                            profile_url,
-                            platform=Platform.DOUYIN,
-                            media_type=MediaType.VIDEO,
-                            callback=callback,
-                            should_cancel=should_cancel,
-                            asset_index=asset.index,
-                            progress_index=progress_index,
-                            progress_count=total_assets,
-                            verify_declared_dimensions=True,
-                            require_quality_fingerprint=True,
-                        )
-                    except DownloadCancelledError:
-                        raise
-                    except TemporaryAccessError:
-                        raise
-                    except Exception as exc:
-                        raise MediaDownloadError(
-                            f"Live Photo {asset.index} failed: "
-                            f"{safe_external_error_message(exc)}",
-                            issue_code=getattr(exc, "issue_code", None),
-                        ) from exc
                 output_paths.append(str(path))
                 completed_assets.append(chosen)
                 if callback:
@@ -4427,7 +4566,7 @@ class MediaDownloader:
             key=lambda value: int(value.width or 0) * int(value.height or 0),
         )
         selected_format = (
-            "douyin-highest-images+live-photos"
+            "douyin-highest-live-photos-or-images"
             if live_photo_assets
             else "douyin-highest-images"
         )
@@ -4481,9 +4620,7 @@ class MediaDownloader:
     ) -> RemoteAsset:
         video_uri = str(asset.video_uri or "").strip()
         if not re.fullmatch(r"[A-Za-z0-9_-]{10,200}", video_uri):
-            raise MediaDownloadError(
-                "Douyin Live Photo has no verified media identity"
-            )
+            raise MediaDownloadError("Douyin Live Photo has no verified media identity")
 
         if not asset.quality_candidates:
             raise TemporaryAccessError(
@@ -4718,7 +4855,9 @@ class MediaDownloader:
             ):
                 self._merge_douyin_probe_source_candidates(best, probe)
         best_rank = self._douyin_probe_quality_key(best)
-        if any(self._douyin_probe_quality_key(value) > best_rank for value in unsupported):
+        if any(
+            self._douyin_probe_quality_key(value) > best_rank for value in unsupported
+        ):
             raise MediaDownloadError(
                 "Douyin Live Photo highest candidate uses an unsupported video codec",
                 issue_code=SiteIssueCode.LOCAL_CONFIGURATION,
@@ -4757,9 +4896,7 @@ class MediaDownloader:
             if requested_ratio == "default":
                 best_urls.extend(self._douyin_default_probe_urls(video_uri))
             else:
-                best_urls.append(
-                    self._douyin_ratio_url(video_uri, requested_ratio)
-                )
+                best_urls.append(self._douyin_ratio_url(video_uri, requested_ratio))
         elif requested_ratio.startswith("author-feed-"):
             with contextlib.suppress(ValueError, IndexError):
                 rendition_index = int(requested_ratio.rsplit("-", 1)[1]) - 1
@@ -4896,9 +5033,7 @@ class MediaDownloader:
             and value
             and (
                 cls._is_trusted_douyin_asset_url(value, MediaType.VIDEO)
-                or cls._is_douyin_regional_media_host(
-                    cls._strict_https_hostname(value)
-                )
+                or cls._is_douyin_regional_media_host(cls._strict_https_hostname(value))
             )
         ]
         target["source_candidates"] = list(dict.fromkeys(candidates))
@@ -4943,9 +5078,7 @@ class MediaDownloader:
             default=None,
         )
         best_pixels = (
-            int(best.get("width") or 0) * int(best.get("height") or 0)
-            if best
-            else 0
+            int(best.get("width") or 0) * int(best.get("height") or 0) if best else 0
         )
         best_bit_rate = int(best.get("bit_rate") or 0) if best else 0
         unresolved: list[tuple[str, str, bool]] = []
@@ -4991,9 +5124,13 @@ class MediaDownloader:
             if not dimensions:
                 continue
             width, height = dimensions
-            if asset.width and asset.height and (
-                min(width, height) < min(asset.width, asset.height)
-                or max(width, height) < max(asset.width, asset.height)
+            if (
+                asset.width
+                and asset.height
+                and (
+                    min(width, height) < min(asset.width, asset.height)
+                    or max(width, height) < max(asset.width, asset.height)
+                )
             ):
                 continue
             return (
@@ -5137,16 +5274,13 @@ class MediaDownloader:
                         url
                         for url in rendition.get("urls") or []
                         if isinstance(url, str)
-                        and cls._is_trusted_douyin_asset_url(
-                            url, MediaType.VIDEO
-                        )
+                        and cls._is_trusted_douyin_asset_url(url, MediaType.VIDEO)
                     ][:5]
                     if (
                         rendition_width <= 0
                         or rendition_height <= 0
                         or not rendition_urls
-                        or str(rendition.get("video_uri") or "").strip()
-                        != video_uri
+                        or str(rendition.get("video_uri") or "").strip() != video_uri
                     ):
                         continue
                     parsed_rendition: dict[str, Any] = {
@@ -5156,9 +5290,7 @@ class MediaDownloader:
                     }
                     if rendition_bit_rate > 0:
                         parsed_rendition["bit_rate"] = rendition_bit_rate
-                    codec_hint = str(
-                        rendition.get("codec_hint") or ""
-                    ).strip().lower()
+                    codec_hint = str(rendition.get("codec_hint") or "").strip().lower()
                     if codec_hint in {
                         "h264",
                         "hevc",
@@ -5176,9 +5308,7 @@ class MediaDownloader:
                         "urls": list(candidates),
                     }
                 ]
-            duration_ms = _normalized_douyin_duration_ms(
-                value.get("duration_ms")
-            )
+            duration_ms = _normalized_douyin_duration_ms(value.get("duration_ms"))
             result.append(
                 RemoteAsset(
                     candidates=candidates,
@@ -5186,14 +5316,8 @@ class MediaDownloader:
                     width=width,
                     height=height,
                     format_id=f"{format_prefix}-{width}x{height}",
-                    video_uri=(
-                        str(value.get("video_uri") or "").strip() or None
-                    ),
-                    duration=(
-                        duration_ms / 1_000
-                        if duration_ms is not None
-                        else None
-                    ),
+                    video_uri=(str(value.get("video_uri") or "").strip() or None),
+                    duration=(duration_ms / 1_000 if duration_ms is not None else None),
                     quality_candidates=quality_candidates,
                 )
             )
@@ -5208,9 +5332,11 @@ class MediaDownloader:
     @staticmethod
     def _xiaohongshu_note_media_type(note: Any) -> MediaType:
         raw = note.raw if isinstance(getattr(note, "raw", None), dict) else {}
-        raw_type = str(
-            raw.get("type") or raw.get("noteType") or raw.get("note_type") or ""
-        ).strip().lower()
+        raw_type = (
+            str(raw.get("type") or raw.get("noteType") or raw.get("note_type") or "")
+            .strip()
+            .lower()
+        )
         if raw_type == "video" or note.videos:
             return MediaType.VIDEO
         return MediaType.IMAGE
@@ -5241,9 +5367,7 @@ class MediaDownloader:
         expected_profile_id = str(
             item.metadata.get("xiaohongshu_profile_id") or ""
         ).strip()
-        membership_verified = item.metadata.get(
-            "profile_note_membership_verified"
-        )
+        membership_verified = item.metadata.get("profile_note_membership_verified")
         if expected_profile_id or membership_verified is not None:
             if (
                 membership_verified is not True
@@ -5286,9 +5410,7 @@ class MediaDownloader:
             with YoutubeDL(options) as ydl:
                 if note.videos:
                     declared_assets = [
-                        asset
-                        for asset in note.videos
-                        if asset.width and asset.height
+                        asset for asset in note.videos if asset.width and asset.height
                     ]
                     declared_floor = (
                         max(
@@ -5711,9 +5833,7 @@ class MediaDownloader:
                         candidate,
                         headers=request_headers,
                         extensions=(
-                            {"timeout": request_timeout}
-                            if is_douyin_source
-                            else {}
+                            {"timeout": request_timeout} if is_douyin_source else {}
                         ),
                     )
                     if is_douyin_source:
@@ -5769,9 +5889,7 @@ class MediaDownloader:
                         self._douyin_media_redirect_rejection_reason(
                             final_url,
                             media_type,
-                            allow_verified_regional=(
-                                allow_verified_douyin_redirect
-                            ),
+                            allow_verified_regional=(allow_verified_douyin_redirect),
                         )
                         if is_douyin_source
                         else None
@@ -5825,9 +5943,7 @@ class MediaDownloader:
                             )
                         )
                     stream_chunk_size = (
-                        DOUYIN_STREAM_CHUNK_BYTES
-                        if is_douyin_source
-                        else 1024 * 1024
+                        DOUYIN_STREAM_CHUNK_BYTES if is_douyin_source else 1024 * 1024
                     )
                     first_chunk = (
                         self._read_douyin_stream_chunk(response, stream_chunk_size)
@@ -5858,11 +5974,15 @@ class MediaDownloader:
                                 "Highest-available image dimensions could not be verified"
                             )
                         actual_width, actual_height = actual_dimensions
-                        if asset.width and asset.height and (
-                            min(actual_width, actual_height)
-                            < min(asset.width, asset.height)
-                            or max(actual_width, actual_height)
-                            < max(asset.width, asset.height)
+                        if (
+                            asset.width
+                            and asset.height
+                            and (
+                                min(actual_width, actual_height)
+                                < min(asset.width, asset.height)
+                                or max(actual_width, actual_height)
+                                < max(asset.width, asset.height)
+                            )
                         ):
                             raise MediaDownloadError(
                                 "Media server returned an image below its declared "
@@ -5935,9 +6055,7 @@ class MediaDownloader:
                         speed = downloaded / elapsed if downloaded else None
                         eta = (
                             max(0.0, (total - downloaded) / speed)
-                            if total is not None
-                            and speed is not None
-                            and speed > 0
+                            if total is not None and speed is not None and speed > 0
                             else None
                         )
                         callback(
@@ -5994,10 +6112,7 @@ class MediaDownloader:
                                 )
                             handle.flush()
                             os.fsync(handle.fileno())
-                        if (
-                            verify_declared_dimensions
-                            and media_type == MediaType.VIDEO
-                        ):
+                        if verify_declared_dimensions and media_type == MediaType.VIDEO:
                             chosen = self._verify_local_video_asset(
                                 temporary,
                                 asset,
@@ -6124,9 +6239,7 @@ class MediaDownloader:
         if douyin_refresh_errors:
             raise douyin_refresh_errors[-1]
         detail = errors[-1] if errors else "No asset URLs were available"
-        raise MediaDownloadError(
-            f"All highest-available media URLs failed: {detail}"
-        )
+        raise MediaDownloadError(f"All highest-available media URLs failed: {detail}")
 
     @staticmethod
     def _is_retryable_douyin_transfer_error(exc: Exception) -> bool:
@@ -6209,8 +6322,7 @@ class MediaDownloader:
                 ) from exc
             if (
                 len(prefix) != asset.probe_prefix_size
-                or hashlib.sha256(prefix).hexdigest()
-                != asset.probe_prefix_sha256
+                or hashlib.sha256(prefix).hexdigest() != asset.probe_prefix_sha256
             ):
                 raise MediaDownloadError(
                     "Downloaded video content did not match the verified Douyin "
@@ -6247,9 +6359,13 @@ class MediaDownloader:
             raise MediaDownloadError(
                 "Highest-available video dimensions could not be verified"
             )
-        if asset.width and asset.height and (
-            min(actual_width, actual_height) < min(asset.width, asset.height)
-            or max(actual_width, actual_height) < max(asset.width, asset.height)
+        if (
+            asset.width
+            and asset.height
+            and (
+                min(actual_width, actual_height) < min(asset.width, asset.height)
+                or max(actual_width, actual_height) < max(asset.width, asset.height)
+            )
         ):
             raise MediaDownloadError(
                 "Media server returned a video below its declared "
@@ -6461,7 +6577,11 @@ class MediaDownloader:
                 collect(payload_start + child_offset, box_end, depth + 1)
 
         collect(0, len(data), 0)
-        return max(dimensions, key=lambda value: value[0] * value[1]) if dimensions else None
+        return (
+            max(dimensions, key=lambda value: value[0] * value[1])
+            if dimensions
+            else None
+        )
 
     def _xhs_output_path(
         self,
@@ -6500,8 +6620,7 @@ class MediaDownloader:
             box_end = min(len(first_bytes), box_size) if box_size >= 12 else 12
             brands = {first_bytes[8:12]}
             brands.update(
-                first_bytes[offset : offset + 4]
-                for offset in range(16, box_end - 3, 4)
+                first_bytes[offset : offset + 4] for offset in range(16, box_end - 3, 4)
             )
             if brands & {b"avif", b"avis"}:
                 return "avif"

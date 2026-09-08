@@ -54,6 +54,11 @@ from app.errors import (
         ("Media endpoint returned HTTP 408", SiteIssueCode.NETWORK_ERROR),
         ("Secure media connection failed", SiteIssueCode.NETWORK_ERROR),
         (
+            "A local DNS or web filter blocked Douyin before the site loaded",
+            SiteIssueCode.NETWORK_ERROR,
+        ),
+        ("Website Filtered by blocked.dnsfilter.com", SiteIssueCode.NETWORK_ERROR),
+        (
             "Chrome cookies could not be read from the cookie database",
             SiteIssueCode.COOKIE_UNAVAILABLE,
         ),
@@ -109,10 +114,7 @@ def test_classify_site_issue_uses_authentication_context(
     message: str,
     expected: SiteIssueCode,
 ) -> None:
-    assert (
-        classify_site_issue(message, authentication_required=True)
-        == expected
-    )
+    assert classify_site_issue(message, authentication_required=True) == expected
 
 
 def test_classify_site_issue_preserves_explicit_code_for_opaque_error() -> None:

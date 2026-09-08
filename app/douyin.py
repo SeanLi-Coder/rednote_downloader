@@ -364,10 +364,17 @@ def _direct_quality_candidate(
     *,
     bit_rate: Any = None,
     codec_hint: str | None = None,
+    fallback_dimensions: tuple[int, int] | None = None,
+    prefer_fallback_dimensions: bool = False,
 ) -> dict[str, Any] | None:
     if not isinstance(address, dict):
         return None
-    dimensions = quality_floor_dimensions([address], cap_full_hd=False)
+    dimensions = (
+        fallback_dimensions
+        if prefer_fallback_dimensions and fallback_dimensions
+        else quality_floor_dimensions([address], cap_full_hd=False)
+        or fallback_dimensions
+    )
     urls = _safe_direct_media_urls(address)
     if not dimensions or not urls:
         return None
@@ -397,11 +404,12 @@ def _highest_live_photo_asset(
 ) -> dict[str, Any] | None:
     if not isinstance(video, dict) or not video:
         return None
+    outer_dimensions = quality_floor_dimensions([video], cap_full_hd=False)
     address_values = [
-        (video.get("play_addr"), None, None),
-        (video.get("play_addr_h264"), None, "h264"),
-        (video.get("play_addr_265"), None, "hevc"),
-        (video.get("play_addr_bytevc1"), None, "hevc"),
+        (video.get("play_addr"), None, None, outer_dimensions),
+        (video.get("play_addr_h264"), None, "h264", outer_dimensions),
+        (video.get("play_addr_265"), None, "hevc", outer_dimensions),
+        (video.get("play_addr_bytevc1"), None, "hevc", outer_dimensions),
     ]
     bit_rates = video.get("bit_rate")
     if isinstance(bit_rates, list):
@@ -415,19 +423,103 @@ def _highest_live_photo_asset(
                 else "h264"
             )
             address_values.append(
-                (value.get("play_addr"), value.get("bit_rate"), codec_hint)
+                (
+                    value.get("play_addr"),
+                    value.get("bit_rate"),
+                    codec_hint,
+                    quality_floor_dimensions([value], cap_full_hd=False)
+                    or outer_dimensions,
+                )
             )
-    candidates = [
-        candidate
-        for address, bit_rate, codec_hint in address_values
-        if (
-            candidate := _direct_quality_candidate(
-                address,
-                bit_rate=bit_rate,
-                codec_hint=codec_hint,
+    play_candidates: list[dict[str, Any]] = []
+    unusable_play_renditions: list[tuple[tuple[int, int] | None, str, int]] = []
+    for address, bit_rate, codec_hint, fallback_dimensions in address_values:
+        if not isinstance(address, dict) or not address:
+            continue
+        candidate = _direct_quality_candidate(
+            address,
+            bit_rate=bit_rate,
+            codec_hint=codec_hint,
+            fallback_dimensions=fallback_dimensions,
+        )
+        if candidate:
+            play_candidates.append(candidate)
+            continue
+        dimensions = (
+            quality_floor_dimensions([address], cap_full_hd=False)
+            or fallback_dimensions
+        )
+        raw_uri = str(address.get("uri") or "").strip()
+        raw_urls = address.get("url_list")
+        advertised = bool(dimensions or raw_uri) or (
+            isinstance(raw_urls, list) and bool(raw_urls)
+        )
+        if not advertised:
+            continue
+        try:
+            declared_bit_rate = int(bit_rate or address.get("bit_rate") or 0)
+        except (TypeError, ValueError, OverflowError):
+            declared_bit_rate = 0
+        unusable_play_renditions.append(
+            (
+                dimensions,
+                raw_uri if re.fullmatch(r"[A-Za-z0-9_-]{10,200}", raw_uri) else "",
+                max(0, declared_bit_rate),
             )
         )
-    ]
+    if play_candidates and any(
+        not candidate.get("video_uri") for candidate in play_candidates
+    ):
+        return None
+    candidates = list(play_candidates)
+    visible_play_uris = {
+        value
+        for address, _, _, _ in address_values
+        if isinstance(address, dict)
+        and re.fullmatch(
+            r"[A-Za-z0-9_-]{10,200}",
+            value := str(address.get("uri") or "").strip(),
+        )
+    }
+    has_watermark = video.get("has_watermark")
+    explicitly_unwatermarked = has_watermark is False or (
+        type(has_watermark) is int and has_watermark == 0
+    )
+    if not candidates and outer_dimensions and explicitly_unwatermarked:
+        download_addr = video.get("download_addr")
+        download_dimensions = outer_dimensions
+        if isinstance(download_addr, dict):
+            try:
+                download_width = int(download_addr.get("width") or 0)
+            except (TypeError, ValueError, OverflowError):
+                download_width = 0
+            if download_width > 0 and outer_dimensions[0] > 0:
+                download_dimensions = (
+                    download_width,
+                    max(
+                        1,
+                        round(
+                            download_width * outer_dimensions[1] / outer_dimensions[0]
+                        ),
+                    ),
+                )
+        download_candidate = _direct_quality_candidate(
+            download_addr,
+            codec_hint="h264",
+            fallback_dimensions=download_dimensions,
+            prefer_fallback_dimensions=True,
+        )
+        download_uri = (
+            str(download_candidate.get("video_uri") or "").strip()
+            if download_candidate
+            else ""
+        )
+        if (
+            download_candidate
+            and download_uri
+            and (not visible_play_uris or visible_play_uris == {download_uri})
+        ):
+            candidates = [download_candidate]
     if not candidates:
         return None
     candidate_uris = {
@@ -435,11 +527,28 @@ def _highest_live_photo_asset(
         for candidate in candidates
         if candidate.get("video_uri")
     }
-    if len(candidate_uris) != 1 or any(
-        not candidate.get("video_uri") for candidate in candidates
-    ):
+    if len(candidate_uris) != 1:
         return None
     video_uri = next(iter(candidate_uris))
+    if visible_play_uris and visible_play_uris != {video_uri}:
+        return None
+    best_candidate = max(
+        candidates,
+        key=lambda value: (
+            value["width"] * value["height"],
+            int(value.get("bit_rate") or 0),
+        ),
+    )
+    best_pixels = best_candidate["width"] * best_candidate["height"]
+    best_bit_rate = int(best_candidate.get("bit_rate") or 0)
+    for dimensions, declared_uri, declared_bit_rate in unusable_play_renditions:
+        if not dimensions or declared_uri != video_uri:
+            return None
+        declared_pixels = dimensions[0] * dimensions[1]
+        if declared_pixels > best_pixels or (
+            declared_pixels == best_pixels and declared_bit_rate > best_bit_rate
+        ):
+            return None
     candidates.sort(
         key=lambda value: (
             value["width"] * value["height"],
@@ -480,10 +589,17 @@ def _highest_live_photo_asset(
             break
     if not urls:
         return None
+    asset_width = candidates[0]["width"]
+    asset_height = candidates[0]["height"]
+    if (
+        outer_dimensions
+        and outer_dimensions[0] * outer_dimensions[1] > asset_width * asset_height
+    ):
+        asset_width, asset_height = outer_dimensions
     result: dict[str, Any] = {
         "index": index,
-        "width": candidates[0]["width"],
-        "height": candidates[0]["height"],
+        "width": asset_width,
+        "height": asset_height,
         "candidates": urls,
         "video_uri": video_uri,
         "direct_candidates": unique_highest_candidates,
@@ -636,6 +752,19 @@ def is_complete_profile_media_metadata(
     if len(set(image_indexes)) != len(image_indexes):
         return False
     live_assets = cached.get("live_photo_assets")
+    fallback_indexes = cached.get("live_photo_static_fallback_indexes")
+    if fallback_indexes is None:
+        normalized_fallback_indexes: list[int] = []
+    elif (
+        not isinstance(fallback_indexes, list)
+        or not fallback_indexes
+        or any(type(value) is not int or value <= 0 for value in fallback_indexes)
+        or len(set(fallback_indexes)) != len(fallback_indexes)
+        or not set(fallback_indexes).issubset(set(image_indexes))
+    ):
+        return False
+    else:
+        normalized_fallback_indexes = fallback_indexes
     if live_assets is None:
         return True
     if not isinstance(live_assets, list) or not live_assets:
@@ -646,6 +775,7 @@ def is_complete_profile_media_metadata(
     return (
         len(set(live_indexes)) == len(live_indexes)
         and set(live_indexes).issubset(set(image_indexes))
+        and set(live_indexes).isdisjoint(normalized_fallback_indexes)
     )
 
 
@@ -668,6 +798,7 @@ def _minimal_aweme_metadata(
             return None
         image_assets: list[dict[str, Any]] = []
         live_photo_assets: list[dict[str, Any]] = []
+        static_fallback_indexes: list[int] = []
         for index, image in enumerate(images, start=1):
             asset = _image_asset(image, index=index)
             if not asset:
@@ -676,9 +807,10 @@ def _minimal_aweme_metadata(
             nested_video = image.get("video") if isinstance(image, dict) else None
             if isinstance(nested_video, dict) and nested_video:
                 live_asset = _highest_live_photo_asset(nested_video, index=index)
-                if not live_asset:
-                    return None
-                live_photo_assets.append(live_asset)
+                if live_asset:
+                    live_photo_assets.append(live_asset)
+                else:
+                    static_fallback_indexes.append(index)
         metadata: dict[str, Any] = {
             "media_id": aweme_id,
             "owner_id": owner_id,
@@ -688,6 +820,8 @@ def _minimal_aweme_metadata(
         }
         if live_photo_assets:
             metadata["live_photo_assets"] = live_photo_assets
+        if static_fallback_indexes:
+            metadata["live_photo_static_fallback_indexes"] = static_fallback_indexes
         create_time = aweme.get("create_time")
         if isinstance(create_time, int) and create_time > 0:
             metadata["create_time"] = create_time
@@ -760,10 +894,7 @@ def _minimal_aweme_metadata(
             )
             if candidate:
                 direct_candidates.append(candidate)
-    if any(
-        candidate.get("video_uri") != video_uri
-        for candidate in direct_candidates
-    ):
+    if any(candidate.get("video_uri") != video_uri for candidate in direct_candidates):
         return None
     if direct_candidates:
         direct_candidates.sort(
@@ -814,6 +945,35 @@ def _minimal_aweme_metadata(
     return aweme_id, metadata
 
 
+def verified_aweme_metadata(
+    aweme: dict[str, Any],
+    media_id: str,
+    *,
+    expected_profile_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Return complete metadata only when an aweme is bound to the target item."""
+    if not media_id.isdigit():
+        return None
+    aweme_id = str(aweme.get("aweme_id") or aweme.get("awemeId") or "").strip()
+    author = aweme.get("author")
+    if aweme_id != media_id or not isinstance(author, dict):
+        return None
+    owner_id = str(author.get("sec_uid") or author.get("secUid") or "").strip()
+    if (
+        not re.fullmatch(r"[A-Za-z0-9_-]{10,200}", owner_id)
+        or expected_profile_id is not None
+        and owner_id != expected_profile_id
+    ):
+        return None
+    parsed = _minimal_aweme_metadata(aweme, owner_id)
+    if not parsed or parsed[0] != media_id:
+        return None
+    metadata = parsed[1]
+    if not is_complete_profile_media_metadata(metadata, media_id, owner_id):
+        return None
+    return metadata
+
+
 def discover_item_metadata_from_profile(
     profile_id: str,
     media_id: str,
@@ -847,11 +1007,13 @@ def discover_item_metadata_from_profile(
         except (DiscoveryError, TemporaryAccessError) as exc:
             detail_error = exc
         else:
-            parsed = _minimal_aweme_metadata(detail, profile_id)
-            if parsed and is_complete_profile_media_metadata(
-                parsed[1], media_id, profile_id
-            ):
-                return parsed[1]
+            metadata = verified_aweme_metadata(
+                detail,
+                media_id,
+                expected_profile_id=profile_id,
+            )
+            if metadata:
+                return metadata
             detail_error = TemporaryAccessError(
                 "Douyin returned the requested item detail without complete, "
                 "verified media metadata.",
@@ -870,16 +1032,18 @@ def discover_item_metadata_from_profile(
     for aweme in awemes:
         if str(aweme.get("aweme_id") or "").strip() != media_id:
             continue
-        parsed = _minimal_aweme_metadata(aweme, profile_id)
-        if not parsed or not is_complete_profile_media_metadata(
-            parsed[1], media_id, profile_id
-        ):
+        metadata = verified_aweme_metadata(
+            aweme,
+            media_id,
+            expected_profile_id=profile_id,
+        )
+        if not metadata:
             raise TemporaryAccessError(
                 "Douyin returned the requested profile item without complete, "
                 "verified media metadata. Retry after a short wait.",
                 issue_code=SiteIssueCode.SITE_RESPONSE_CHANGED,
             )
-        return parsed[1]
+        return metadata
     if detail_error is not None:
         raise detail_error
     return None
@@ -1312,9 +1476,7 @@ def discover_profile(
                     should_cancel,
                 )
                 try:
-                    body_text = page.locator("body").inner_text(
-                        timeout=body_timeout_ms
-                    )
+                    body_text = page.locator("body").inner_text(timeout=body_timeout_ms)
                 except Exception:
                     check_browser_budget()
                     body_text = page.content()

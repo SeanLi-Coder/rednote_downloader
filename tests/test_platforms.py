@@ -30,6 +30,11 @@ from app.platforms import UnsupportedUrlError, extract_url, identify_url
             Platform.DOUYIN,
             SourceKind.ITEM,
         ),
+        (
+            "https://www.douyin.com/note/7683074221437746170",
+            Platform.DOUYIN,
+            SourceKind.ITEM,
+        ),
         ("https://v.douyin.com/example/", Platform.DOUYIN, SourceKind.SHORT_LINK),
         (
             "https://space.bilibili.com/946974/video",
@@ -91,9 +96,7 @@ def test_extract_url_accepts_share_text_and_removes_fragment() -> None:
 def test_douyin_trailing_dot_hostname_is_normalized_before_platform_routing() -> None:
     value = "https://www.douyin.com./video/7664225419386607205"
 
-    assert extract_url(value) == (
-        "https://www.douyin.com/video/7664225419386607205"
-    )
+    assert extract_url(value) == ("https://www.douyin.com/video/7664225419386607205")
     info = identify_url(value)
     assert info.platform == Platform.DOUYIN
     assert info.kind == SourceKind.ITEM
@@ -147,6 +150,44 @@ def test_douyin_target_urls_are_canonicalized_as_the_same_item(value: str) -> No
     assert info.url == "https://www.douyin.com/video/7649279395044040154"
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        (
+            "https://www.douyin.com/user/self?from_tab_name=main"
+            "&modal_id=7683074221437746170&showTab=favorite_collection"
+        ),
+        (
+            "https://www.douyin.com/user/MS4wLjABAAAAvLgZS-O6Oc9diWWZ-"
+            "jctzlhanUBoN7a5oJLdsTkx6F9TVD9kehAqFqdrpG3uPlmz"
+            "?from_tab_name=main&modal_id=7683074221437746170"
+            "&vid=7683074221437746170"
+        ),
+        (
+            "https://www.douyin.com/user/MS4wLjABAAAAvLgZS-O6Oc9diWWZ-"
+            "jctzlhanUBoN7a5oJLdsTkx6F9TVD9kehAqFqdrpG3uPlmz"
+            "?vid=7683074221437746170"
+        ),
+    ],
+)
+def test_douyin_live_photo_urls_bind_to_the_exact_item(value: str) -> None:
+    info = identify_url(value)
+
+    assert info.platform == Platform.DOUYIN
+    assert info.kind == SourceKind.ITEM
+    assert info.url == "https://www.douyin.com/video/7683074221437746170"
+
+
+def test_douyin_note_url_uses_the_bound_single_item_pipeline() -> None:
+    info = identify_url(
+        "https://www.douyin.com/note/7683074221437746170?previous_page=web_code_link"
+    )
+
+    assert info.platform == Platform.DOUYIN
+    assert info.kind == SourceKind.ITEM
+    assert info.url == "https://www.douyin.com/video/7683074221437746170"
+
+
 def test_douyin_video_url_drops_tracking_and_ignores_conflicting_modal_id() -> None:
     info = identify_url(
         "https://www.douyin.com/video/7664225419386607205"
@@ -164,6 +205,10 @@ def test_douyin_video_url_drops_tracking_and_ignores_conflicting_modal_id() -> N
         "modal_id=invalid",
         "modal_id=7664225419386607205&modal_id=invalid",
         "modal_id=7664225419386607205&modal_id=7677923079457231738",
+        "vid=",
+        "vid=invalid",
+        "vid=7664225419386607205&vid=7677923079457231738",
+        "modal_id=7664225419386607205&vid=7677923079457231738",
     ],
 )
 def test_douyin_rejects_invalid_or_ambiguous_profile_modal_id(query: str) -> None:
@@ -181,7 +226,6 @@ def test_douyin_rejects_invalid_or_ambiguous_profile_modal_id(query: str) -> Non
         "https://example.com/video/123",
         "https://www.xiaohongshu.com/search_result",
         "https://www.douyin.com/search/example",
-        "https://www.douyin.com/note/7628957913016552758",
         "https://www.douyin.com/video/7664225419386607205oops",
         "https://www.douyin.com/video/7664225419386607205/other",
         (

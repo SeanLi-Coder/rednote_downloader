@@ -213,9 +213,7 @@ def test_item_metadata_profile_lookup_uses_exact_detail_when_preferred(
                     "uri": video_uri,
                     "width": 1080,
                     "height": 1920,
-                    "url_list": [
-                        "https://v26-web.douyinvod.com/item-target.mp4"
-                    ],
+                    "url_list": ["https://v26-web.douyinvod.com/item-target.mp4"],
                 }
             },
         }
@@ -224,7 +222,9 @@ def test_item_metadata_profile_lookup_uses_exact_detail_when_preferred(
     monkeypatch.setattr(
         "app.douyin.fetch_signed_profile_awemes",
         lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("The profile feed must not be requested after detail success")
+            AssertionError(
+                "The profile feed must not be requested after detail success"
+            )
         ),
     )
 
@@ -273,9 +273,7 @@ def test_item_metadata_profile_lookup_uses_targeted_feed_by_default(
                         "uri": video_uri,
                         "width": 1080,
                         "height": 1920,
-                        "url_list": [
-                            "https://v26-web.douyinvod.com/item-target.mp4"
-                        ],
+                        "url_list": ["https://v26-web.douyinvod.com/item-target.mp4"],
                     }
                 },
             }
@@ -323,9 +321,7 @@ def test_item_metadata_preferred_detail_falls_back_to_targeted_feed(
                         "uri": video_uri,
                         "width": 1440,
                         "height": 2560,
-                        "url_list": [
-                            "https://v26-web.douyinvod.com/feed-target.mp4"
-                        ],
+                        "url_list": ["https://v26-web.douyinvod.com/feed-target.mp4"],
                     }
                 },
             }
@@ -613,7 +609,9 @@ def test_douyin_browser_fallback_shares_budget_and_stops_without_progress(
     assert page.header_response_received is True
     assert page.response_json_calls == 0
     assert page.waits and all(0 < value <= 4_000 for value in page.waits)
-    assert any("Starting bounded Douyin browser profile fallback" in s for s in statuses)
+    assert any(
+        "Starting bounded Douyin browser profile fallback" in s for s in statuses
+    )
     assert any("Scanning Douyin browser fallback round" in s for s in statuses)
     assert all(profile_id not in status for status in statuses)
     assert "PRIVATE_FAKE_BUDGET_TIMEOUT" not in str(captured.value)
@@ -710,9 +708,7 @@ def test_douyin_browser_budget_refreshes_only_for_new_verified_items(
             owner_id: str = profile_id,
         ) -> None:
             assert self.callback is not None
-            self.callback(
-                FakeRequest(response_data(media_id, has_more, owner_id))
-            )
+            self.callback(FakeRequest(response_data(media_id, has_more, owner_id)))
 
         def goto(self, url: str, wait_until: str, timeout: int) -> None:
             self.url = url
@@ -1180,9 +1176,7 @@ def test_douyin_minimal_metadata_accepts_265_and_bitrate_uris() -> None:
                     "uri": "v0200fg10000265fixtureid",
                     "width": 1080,
                     "height": 1920,
-                    "url_list": [
-                        "https://v26-web.douyinvod.com/verified-265.mp4"
-                    ],
+                    "url_list": ["https://v26-web.douyinvod.com/verified-265.mp4"],
                 }
             },
         },
@@ -1329,6 +1323,288 @@ def test_douyin_realistic_photo_post_uses_images_not_top_level_music_video() -> 
     assert is_complete_profile_media_metadata(metadata, media_id, profile_id)
 
 
+def test_douyin_live_photo_uses_outer_video_dimensions_when_address_omits_them() -> (
+    None
+):
+    profile_id = "MS4wLjABAAAAexpected"
+    media_id = "7683074221437746170"
+    result = _minimal_aweme_metadata(
+        {
+            "aweme_id": media_id,
+            "aweme_type": 68,
+            "author": {"sec_uid": profile_id},
+            "images": [
+                {
+                    "width": 1440,
+                    "height": 2560,
+                    "url_list": ["https://p3-pc-sign.douyinpic.com/live-cover.webp"],
+                    "video": {
+                        "width": 1080,
+                        "height": 1920,
+                        "play_addr": {
+                            "uri": "v0200fg10000outerdimensions",
+                            "url_list": ["https://v26-web.douyinvod.com/live-play.mp4"],
+                        },
+                    },
+                }
+            ],
+        },
+        profile_id,
+    )
+
+    assert result is not None
+    live = result[1]["live_photo_assets"][0]
+    assert (live["width"], live["height"]) == (1080, 1920)
+    assert (
+        live["direct_candidates"][0]["width"],
+        live["direct_candidates"][0]["height"],
+    ) == (
+        1080,
+        1920,
+    )
+
+
+def test_douyin_live_photo_uses_unwatermarked_download_addr_as_last_resort() -> None:
+    profile_id = "MS4wLjABAAAAexpected"
+    media_id = "7683074221437746170"
+    result = _minimal_aweme_metadata(
+        {
+            "aweme_id": media_id,
+            "aweme_type": 68,
+            "author": {"sec_uid": profile_id},
+            "images": [
+                {
+                    "width": 1440,
+                    "height": 2560,
+                    "url_list": ["https://p3-pc-sign.douyinpic.com/live-cover.webp"],
+                    "video": {
+                        "width": 1080,
+                        "height": 1920,
+                        "has_watermark": 0,
+                        "download_addr": {
+                            "uri": "v0200fg10000downloadaddress",
+                            "width": 720,
+                            "height": 720,
+                            "url_list": [
+                                "https://v26-web.douyinvod.com/live-download.mp4"
+                            ],
+                        },
+                    },
+                }
+            ],
+        },
+        profile_id,
+    )
+
+    assert result is not None
+    live = result[1]["live_photo_assets"][0]
+    assert (live["width"], live["height"]) == (1080, 1920)
+    assert (
+        live["direct_candidates"][0]["width"],
+        live["direct_candidates"][0]["height"],
+    ) == (720, 1280)
+    assert live["video_uri"] == "v0200fg10000downloadaddress"
+    assert live["candidates"] == ["https://v26-web.douyinvod.com/live-download.mp4"]
+
+
+def test_douyin_live_photo_never_uses_watermarked_download_addr() -> None:
+    profile_id = "MS4wLjABAAAAexpected"
+    media_id = "7683074221437746170"
+    result = _minimal_aweme_metadata(
+        {
+            "aweme_id": media_id,
+            "aweme_type": 68,
+            "author": {"sec_uid": profile_id},
+            "images": [
+                {
+                    "width": 1440,
+                    "height": 2560,
+                    "url_list": ["https://p3-pc-sign.douyinpic.com/live-cover.webp"],
+                    "video": {
+                        "width": 1080,
+                        "height": 1920,
+                        "has_watermark": 1,
+                        "download_addr": {
+                            "uri": "v0200fg10000watermarkeddownload",
+                            "width": 1080,
+                            "height": 1920,
+                            "url_list": [
+                                "https://v26-web.douyinvod.com/watermarked.mp4"
+                            ],
+                        },
+                    },
+                }
+            ],
+        },
+        profile_id,
+    )
+
+    assert result is not None
+    assert "live_photo_assets" not in result[1]
+    assert result[1]["live_photo_static_fallback_indexes"] == [1]
+
+
+@pytest.mark.parametrize("watermark_value", [None, 0.0, "0"])
+def test_douyin_live_photo_requires_explicit_unwatermarked_download_addr(
+    watermark_value,
+) -> None:
+    profile_id = "MS4wLjABAAAAexpected"
+    media_id = "7683074221437746170"
+    result = _minimal_aweme_metadata(
+        {
+            "aweme_id": media_id,
+            "aweme_type": 68,
+            "author": {"sec_uid": profile_id},
+            "images": [
+                {
+                    "width": 1440,
+                    "height": 2560,
+                    "url_list": ["https://p3-pc-sign.douyinpic.com/live-cover.webp"],
+                    "video": {
+                        "width": 1080,
+                        "height": 1920,
+                        "has_watermark": watermark_value,
+                        "download_addr": {
+                            "uri": "v0200fg10000unknownwatermark",
+                            "width": 1080,
+                            "height": 1920,
+                            "url_list": ["https://v26-web.douyinvod.com/unknown.mp4"],
+                        },
+                    },
+                }
+            ],
+        },
+        profile_id,
+    )
+
+    assert result is not None
+    assert "live_photo_assets" not in result[1]
+    assert result[1]["live_photo_static_fallback_indexes"] == [1]
+
+
+def test_douyin_live_photo_rejects_conflicting_visible_play_and_download_ids() -> None:
+    profile_id = "MS4wLjABAAAAexpected"
+    media_id = "7683074221437746170"
+    result = _minimal_aweme_metadata(
+        {
+            "aweme_id": media_id,
+            "aweme_type": 68,
+            "author": {"sec_uid": profile_id},
+            "images": [
+                {
+                    "width": 1440,
+                    "height": 2560,
+                    "url_list": ["https://p3-pc-sign.douyinpic.com/live-cover.webp"],
+                    "video": {
+                        "width": 1080,
+                        "height": 1920,
+                        "has_watermark": 0,
+                        "play_addr": {
+                            "uri": "v0200fg10000visibleplayidentity",
+                            "url_list": ["https://evil.example/play.mp4"],
+                        },
+                        "download_addr": {
+                            "uri": "v0200fg10000differentdownload",
+                            "width": 1080,
+                            "height": 1920,
+                            "url_list": ["https://v26-web.douyinvod.com/download.mp4"],
+                        },
+                    },
+                }
+            ],
+        },
+        profile_id,
+    )
+
+    assert result is not None
+    assert "live_photo_assets" not in result[1]
+    assert result[1]["live_photo_static_fallback_indexes"] == [1]
+
+
+def test_douyin_live_photo_does_not_drop_untrusted_higher_rendition() -> None:
+    profile_id = "MS4wLjABAAAAexpected"
+    media_id = "7683074221437746170"
+    live_uri = "v0200fg10000sameverifiedidentity"
+    result = _minimal_aweme_metadata(
+        {
+            "aweme_id": media_id,
+            "aweme_type": 68,
+            "author": {"sec_uid": profile_id},
+            "images": [
+                {
+                    "width": 1440,
+                    "height": 2560,
+                    "url_list": ["https://p3-pc-sign.douyinpic.com/live-cover.webp"],
+                    "video": {
+                        "play_addr": {
+                            "uri": live_uri,
+                            "width": 1080,
+                            "height": 1920,
+                            "url_list": [
+                                "https://unrecognized.example/high-original.mp4"
+                            ],
+                        },
+                        "play_addr_h264": {
+                            "uri": live_uri,
+                            "width": 720,
+                            "height": 1280,
+                            "url_list": [
+                                "https://v11-web.douyinvod.com/trusted-low.mp4"
+                            ],
+                        },
+                    },
+                }
+            ],
+        },
+        profile_id,
+    )
+
+    assert result is not None
+    assert "live_photo_assets" not in result[1]
+    assert result[1]["live_photo_static_fallback_indexes"] == [1]
+
+
+def test_douyin_live_photo_does_not_drop_unidentified_higher_rendition() -> None:
+    profile_id = "MS4wLjABAAAAexpected"
+    media_id = "7683074221437746170"
+    result = _minimal_aweme_metadata(
+        {
+            "aweme_id": media_id,
+            "aweme_type": 68,
+            "author": {"sec_uid": profile_id},
+            "images": [
+                {
+                    "width": 1440,
+                    "height": 2560,
+                    "url_list": ["https://p3-pc-sign.douyinpic.com/live-cover.webp"],
+                    "video": {
+                        "play_addr": {
+                            "width": 1080,
+                            "height": 1920,
+                            "url_list": [
+                                "https://v26-web.douyinvod.com/high-without-id.mp4"
+                            ],
+                        },
+                        "play_addr_h264": {
+                            "uri": "v0200fg10000identifiedlower",
+                            "width": 720,
+                            "height": 1280,
+                            "url_list": [
+                                "https://v11-web.douyinvod.com/identified-low.mp4"
+                            ],
+                        },
+                    },
+                }
+            ],
+        },
+        profile_id,
+    )
+
+    assert result is not None
+    assert "live_photo_assets" not in result[1]
+    assert result[1]["live_photo_static_fallback_indexes"] == [1]
+
+
 def test_douyin_image_metadata_requires_trusted_complete_assets() -> None:
     profile_id = "MS4wLjABAAAAexpected"
     media_id = "7676078420824775161"
@@ -1403,14 +1679,37 @@ def test_douyin_static_only_image_metadata_is_complete() -> None:
                 "index": 1,
                 "width": 1440,
                 "height": 2560,
-                "candidates": [
-                    "https://p3-pc-sign.douyinpic.com/static-only.webp"
-                ],
+                "candidates": ["https://p3-pc-sign.douyinpic.com/static-only.webp"],
             }
         ],
+        "live_photo_static_fallback_indexes": [1],
     }
 
     assert is_complete_profile_media_metadata(metadata, media_id, profile_id)
+
+
+@pytest.mark.parametrize("fallback_indexes", [[], [2], [1, 1], ["1"]])
+def test_douyin_static_fallback_indexes_must_bind_unique_image_positions(
+    fallback_indexes,
+) -> None:
+    profile_id = "MS4wLjABAAAAexpected"
+    media_id = "7676078420824775161"
+    metadata = {
+        "media_id": media_id,
+        "owner_id": profile_id,
+        "media_kind": "image",
+        "image_assets": [
+            {
+                "index": 1,
+                "width": 1440,
+                "height": 2560,
+                "candidates": ["https://p3-pc-sign.douyinpic.com/static-only.webp"],
+            }
+        ],
+        "live_photo_static_fallback_indexes": fallback_indexes,
+    }
+
+    assert not is_complete_profile_media_metadata(metadata, media_id, profile_id)
 
 
 def test_douyin_live_photo_metadata_requires_direct_candidates() -> None:
@@ -1425,9 +1724,7 @@ def test_douyin_live_photo_metadata_requires_direct_candidates() -> None:
                 "index": 1,
                 "width": 1440,
                 "height": 2560,
-                "candidates": [
-                    "https://p3-pc-sign.douyinpic.com/live-cover.webp"
-                ],
+                "candidates": ["https://p3-pc-sign.douyinpic.com/live-cover.webp"],
             }
         ],
         "live_photo_assets": [
@@ -1435,9 +1732,7 @@ def test_douyin_live_photo_metadata_requires_direct_candidates() -> None:
                 "index": 1,
                 "width": 1080,
                 "height": 1920,
-                "candidates": [
-                    "https://v26-web.douyinvod.com/live-without-direct.mp4"
-                ],
+                "candidates": ["https://v26-web.douyinvod.com/live-without-direct.mp4"],
                 "video_uri": "v0200fg10000livephotoasset",
             }
         ],
@@ -1446,7 +1741,7 @@ def test_douyin_live_photo_metadata_requires_direct_candidates() -> None:
     assert not is_complete_profile_media_metadata(metadata, media_id, profile_id)
 
 
-def test_douyin_live_photo_rejects_multiple_highest_media_identities() -> None:
+def test_douyin_live_photo_uses_static_when_media_identities_conflict() -> None:
     profile_id = "MS4wLjABAAAAexpected"
     media_id = "7676078420824775161"
     result = _minimal_aweme_metadata(
@@ -1458,25 +1753,19 @@ def test_douyin_live_photo_rejects_multiple_highest_media_identities() -> None:
                 {
                     "width": 1080,
                     "height": 1920,
-                    "url_list": [
-                        "https://p3-pc-sign.douyinpic.com/photo.webp"
-                    ],
+                    "url_list": ["https://p3-pc-sign.douyinpic.com/photo.webp"],
                     "video": {
                         "play_addr": {
                             "uri": "v0200fg10000liveidentityA",
                             "width": 1080,
                             "height": 1920,
-                            "url_list": [
-                                "https://v26-web.douyinvod.com/live-a.mp4"
-                            ],
+                            "url_list": ["https://v26-web.douyinvod.com/live-a.mp4"],
                         },
                         "play_addr_h264": {
                             "uri": "v0200fg10000liveidentityB",
                             "width": 1080,
                             "height": 1920,
-                            "url_list": [
-                                "https://v11-web.douyinvod.com/live-b.mp4"
-                            ],
+                            "url_list": ["https://v11-web.douyinvod.com/live-b.mp4"],
                         },
                     },
                 }
@@ -1485,10 +1774,13 @@ def test_douyin_live_photo_rejects_multiple_highest_media_identities() -> None:
         profile_id,
     )
 
-    assert result is None
+    assert result is not None
+    assert result[1]["media_kind"] == "image"
+    assert result[1]["live_photo_static_fallback_indexes"] == [1]
+    assert "live_photo_assets" not in result[1]
 
 
-def test_douyin_live_photo_rejects_different_lower_rendition_identity() -> None:
+def test_douyin_live_photo_uses_static_when_rendition_identity_conflicts() -> None:
     profile_id = "MS4wLjABAAAAexpected"
     media_id = "7676078420824775161"
     result = _minimal_aweme_metadata(
@@ -1500,17 +1792,13 @@ def test_douyin_live_photo_rejects_different_lower_rendition_identity() -> None:
                 {
                     "width": 1080,
                     "height": 1920,
-                    "url_list": [
-                        "https://p3-pc-sign.douyinpic.com/photo.webp"
-                    ],
+                    "url_list": ["https://p3-pc-sign.douyinpic.com/photo.webp"],
                     "video": {
                         "play_addr": {
                             "uri": "v0200fg10000liveidentityA",
                             "width": 720,
                             "height": 1280,
-                            "url_list": [
-                                "https://v26-web.douyinvod.com/live-a.mp4"
-                            ],
+                            "url_list": ["https://v26-web.douyinvod.com/live-a.mp4"],
                         },
                         "bit_rate": [
                             {
@@ -1532,7 +1820,10 @@ def test_douyin_live_photo_rejects_different_lower_rendition_identity() -> None:
         profile_id,
     )
 
-    assert result is None
+    assert result is not None
+    assert result[1]["media_kind"] == "image"
+    assert result[1]["live_photo_static_fallback_indexes"] == [1]
+    assert "live_photo_assets" not in result[1]
 
 
 def test_douyin_profile_video_rejects_multiple_media_identities() -> None:
@@ -1546,9 +1837,7 @@ def test_douyin_profile_video_rejects_multiple_media_identities() -> None:
                     "uri": "v0200fg10000profileidentityA",
                     "width": 720,
                     "height": 1280,
-                    "url_list": [
-                        "https://v26-web.douyinvod.com/profile-a.mp4"
-                    ],
+                    "url_list": ["https://v26-web.douyinvod.com/profile-a.mp4"],
                 },
                 "bit_rate": [
                     {
@@ -1557,9 +1846,7 @@ def test_douyin_profile_video_rejects_multiple_media_identities() -> None:
                             "uri": "v0200fg10000profileidentityB",
                             "width": 1080,
                             "height": 1920,
-                            "url_list": [
-                                "https://v11-web.douyinvod.com/profile-b.mp4"
-                            ],
+                            "url_list": ["https://v11-web.douyinvod.com/profile-b.mp4"],
                         },
                     }
                 ],
@@ -1583,9 +1870,7 @@ def test_douyin_missing_description_gets_non_numeric_display_title() -> None:
                 {
                     "width": 1080,
                     "height": 1920,
-                    "url_list": [
-                        "https://p3-pc-sign.douyinpic.com/photo.webp"
-                    ],
+                    "url_list": ["https://p3-pc-sign.douyinpic.com/photo.webp"],
                 }
             ],
         },
@@ -1668,9 +1953,7 @@ def test_douyin_minimal_metadata_preserves_verified_quality_floor() -> None:
         {
             "width": 2560,
             "height": 1440,
-            "urls": [
-                "https://v11-weba.douyinvod.com/verified-1440-landscape.mp4"
-            ],
+            "urls": ["https://v11-weba.douyinvod.com/verified-1440-landscape.mp4"],
             "video_uri": video_uri,
             "bit_rate": 3_000_000,
             "codec_hint": "h264",
@@ -1929,9 +2212,7 @@ def test_douyin_discovery_waits_for_scrolled_api_page_before_stability_stop(
         def wait_for_timeout(self, timeout: int) -> None:
             if self.scrolled and not self.sent_second_page:
                 self.sent_second_page = True
-                self.callback(
-                    FakeRequest(response_data("2222222222222222222", False))
-                )
+                self.callback(FakeRequest(response_data("2222222222222222222", False)))
 
         def locator(self, selector: str) -> FakeLocator:
             return FakeLocator(selector)

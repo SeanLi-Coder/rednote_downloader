@@ -113,6 +113,8 @@
     unknown: "失败"
   };
 
+  const douyinLivePhotoStaticFallbackWarning = "Some Douyin image positions reported Live Photo data, but no complete trusted motion rendition was available. The highest-pixel static images will be saved for those positions. Create a new task from the original link later to retry the dynamic versions.";
+
   const issueDescriptions = {
     rate_limited: "网站明确返回了限流信号。程序已经停止继续请求，避免整批作品连续失败。",
     verification_required: "网站明确显示了验证码或安全验证页面。",
@@ -256,7 +258,7 @@
     if (/different (?:video|author|note)|cross-wired|identity or integrity|integrity validation|incomplete verified|missing aweme|no verified media identity|response changed|did not match the verified|did not return (?:video data|an mp4 file|a verified)|returned (?:text or metadata|an empty file|no verified)|blank browser response|no trusted notes/i.test(text)) return "site_response_changed";
     if (/media endpoint returned http 425|http(?: error)?\s*403|forbidden|access denied|request rejected|temporarily rejected|风控|网络环境存在风险|(?:your )?ip (?:address )?is blocked/i.test(text)) return "request_rejected";
     if (/http(?: error)?\s*5\d\d|service unavailable|server unavailable|server error|bad gateway/i.test(text)) return "site_unavailable";
-    if (/media endpoint returned http 408|secure media connection failed|incomplete media response|network error|network request failed|connection (?:failed|reset|refused)|timed out|timeout|no media progress/i.test(text)) return "network_error";
+    if (/media endpoint returned http 408|secure media connection failed|incomplete media response|network error|network request failed|connection (?:failed|reset|refused)|timed out|timeout|no media progress|local dns or web filter blocked|blocked[.]dnsfilter[.]com/i.test(text)) return "network_error";
     if (/ffprobe was not found|ffprobe was found but could not be started|ffmpeg was not found/i.test(text)) return "local_configuration";
     if (canonicalStatus(entity) === "needs_auth") {
       if (!explicitlyNotAuth && /captcha|verification challenge|verify you are human|验证码|安全验证/i.test(text)) return "verification_required";
@@ -352,6 +354,13 @@
       };
     }
     if (job?.warning) {
+      if (asText(job.warning).trim() === douyinLivePhotoStaticFallbackWarning) {
+        return {
+          title: "部分 Live Photo 已保存为静态图",
+          message: "发生了什么：作品的部分图片位标记了 Live Photo，但程序没有取得完整可信且明确无水印的动态图，因此没有把低清或来源不明的视频冒充原始动态图。\n解决办法：这些位置已保存最高像素静态图；若之后仍想取得动态图，请稍后从原链接新建任务重试。",
+          isAlert: false
+        };
+      }
       const warningEntity = { status: "failed", issue_message: job.warning };
       let code = issueCode(warningEntity) || "unknown";
       const explicitCode = String(firstDefined(job?.issue_code, job?.issueCode, "")).trim().toLowerCase();
@@ -783,6 +792,13 @@
   }
 
   function itemType(item) {
+    const outputPaths = itemOutputPaths(item);
+    const hasVideoOutput = outputPaths.some((value) => /\.(?:m4v|mov|mp4|webm)$/i.test(value));
+    const hasImageOutput = outputPaths.some((value) => /\.(?:avif|gif|jpe?g|png|webp)$/i.test(value));
+    const selectedFormat = String(firstDefined(item?.selected_format, item?.format, "")).toLowerCase();
+    if (selectedFormat.includes("live-photo") && hasVideoOutput) {
+      return hasImageOutput ? "动态图 + 图片" : "动态图";
+    }
     const type = String(firstDefined(item?.type, item?.media_type, item?.kind, item?.extension, "文件")).toLowerCase();
     if (["image", "photo", "picture", "jpg", "jpeg", "png", "webp"].some((value) => type.includes(value))) return "图片";
     if (["video", "mp4", "webm", "mov"].some((value) => type.includes(value))) return "视频";
@@ -956,6 +972,22 @@
 
   function localizeRuntimeMessage(value, job = null) {
     let text = asText(value);
+    if (text.includes("Some Douyin image positions reported Live Photo data")) {
+      const localizedWarning = "部分抖音图片位带有 Live Photo 数据，但程序没有取得完整可信且明确无水印的动态图版本；这些位置会保存最高像素静态图。若之后仍想重试动态图，请稍后从原链接新建任务。";
+      const withoutCurrentWarning = text.replace(douyinLivePhotoStaticFallbackWarning, "");
+      const markerIndex = text.indexOf("Some Douyin image positions reported Live Photo data");
+      const remaining = (
+        withoutCurrentWarning === text
+          ? text.slice(0, markerIndex)
+          : withoutCurrentWarning
+      ).trim();
+      return remaining
+        ? `${localizeRuntimeMessage(remaining, job)}\n${localizedWarning}`
+        : localizedWarning;
+    }
+    if (text.includes("A local DNS or web filter blocked Douyin before the site loaded")) {
+      return "本机的 DNS 或网页过滤器在抖音页面加载前拦截了访问。请在过滤器中放行抖音，或关闭 DNS 过滤、切换网络，然后从原链接重试；这不是抖音验证码，不需要打开 Chrome 验证。";
+    }
     if (text.includes("Douyin quality verification made no media progress for 120 seconds")) {
       return "抖音最高画质校验已在连续 120 秒没有收到新的媒体字节或有效探测结果后自动停止。任务没有假死，也没有改下低清版本；此前已完成的文件会保留，请稍等后点击继续任务。";
     }
