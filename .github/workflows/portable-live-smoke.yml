@@ -54,6 +54,27 @@ jobs:
         run: |
           python -m pip install -r requirements.txt
           python -m pip check
+      - name: Verify production Chrome channel
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            chrome_binary="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+          else
+            chrome_binary="$(command -v google-chrome || command -v google-chrome-stable || true)"
+          fi
+          if [[ -z "$chrome_binary" || ! -x "$chrome_binary" ]]; then
+            echo "Google Chrome is not available at the runner's standard installation path." >&2
+            exit 1
+          fi
+          "$chrome_binary" --version
+          python - <<'PY'
+          from playwright.sync_api import sync_playwright
+
+          with sync_playwright() as playwright:
+              browser = playwright.chromium.launch(channel="chrome", headless=True)
+              print(f"Playwright production Chrome channel: {browser.version}")
+              browser.close()
+          PY
       - name: Run no-cookie production download smoke
         shell: bash
         run: |

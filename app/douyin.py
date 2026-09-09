@@ -989,13 +989,14 @@ def discover_item_metadata_from_profile(
     if not media_id.isdigit():
         return None
     profile_url = f"https://www.douyin.com/user/{profile_id}"
+    item_url = f"https://www.douyin.com/video/{media_id}"
     progress_budget = progress_budget or new_signed_discovery_budget()
     detail_error: Exception | None = None
     if prefer_exact_detail:
         try:
             detail = fetch_signed_aweme_detail(
                 media_id,
-                verification_url=profile_url,
+                verification_url=item_url,
                 expected_sec_uid=profile_id,
                 cookie_profile=cookie_profile,
                 should_cancel=should_cancel,
@@ -1004,7 +1005,7 @@ def discover_item_metadata_from_profile(
             )
         except (AuthenticationRequiredError, DownloadCancelledError):
             raise
-        except (DiscoveryError, TemporaryAccessError) as exc:
+        except TemporaryAccessError as exc:
             detail_error = exc
         else:
             metadata = verified_aweme_metadata(
@@ -1014,7 +1015,7 @@ def discover_item_metadata_from_profile(
             )
             if metadata:
                 return metadata
-            detail_error = TemporaryAccessError(
+            raise DiscoveryError(
                 "Douyin returned the requested item detail without complete, "
                 "verified media metadata.",
                 issue_code=SiteIssueCode.SITE_RESPONSE_CHANGED,

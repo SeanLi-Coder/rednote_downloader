@@ -211,9 +211,9 @@ def test_item_metadata_profile_lookup_uses_exact_detail_when_preferred(
             "video": {
                 "play_addr": {
                     "uri": video_uri,
-                    "width": 1080,
-                    "height": 1920,
-                    "url_list": ["https://v26-web.douyinvod.com/item-target.mp4"],
+                    "width": 1440,
+                    "height": 2560,
+                    "url_list": ["https://v26-web.douyinvod.com/item-target-1440.mp4"],
                 }
             },
         }
@@ -236,11 +236,18 @@ def test_item_metadata_profile_lookup_uses_exact_detail_when_preferred(
     )
 
     assert result and result["media_id"] == media_id
+    assert result["owner_id"] == profile_id
+    assert result["video_uri"] == video_uri
+    assert result["minimum_width"] == 1440
+    assert result["minimum_height"] == 2560
+    assert result["direct_candidates"][0]["urls"] == [
+        "https://v26-web.douyinvod.com/item-target-1440.mp4"
+    ]
     assert len(calls) == 1
     assert calls[0][0] == media_id
     assert calls[0][1]["expected_sec_uid"] == profile_id
     assert calls[0][1]["verification_url"] == (
-        f"https://www.douyin.com/user/{profile_id}"
+        f"https://www.douyin.com/video/{media_id}"
     )
     assert calls[0][1]["status_callback"] == statuses.append
     assert calls[0][1]["progress_budget"] is not None
@@ -341,6 +348,87 @@ def test_item_metadata_preferred_detail_falls_back_to_targeted_feed(
     assert len(feed_calls) == 1
     assert feed_calls[0][2]["target_aweme_id"] == media_id
     assert feed_calls[0][2]["progress_budget"] is detail_budgets[0]
+
+
+@pytest.mark.parametrize(
+    ("response_media_id", "response_profile_id"),
+    [
+        ("2222222222222222222", "MS4wLjABAAAAexpected"),
+        ("1111111111111111111", "MS4wLjABAAAAdifferent"),
+    ],
+)
+def test_item_metadata_preferred_detail_rejects_crosswired_identity_without_feed(
+    monkeypatch,
+    response_media_id: str,
+    response_profile_id: str,
+) -> None:
+    profile_id = "MS4wLjABAAAAexpected"
+    media_id = "1111111111111111111"
+
+    monkeypatch.setattr(
+        "app.douyin.fetch_signed_aweme_detail",
+        lambda *args, **kwargs: {
+            "aweme_id": response_media_id,
+            "author": {
+                "sec_uid": response_profile_id,
+                "nickname": "Cross-wired Author",
+            },
+            "video": {
+                "play_addr": {
+                    "uri": "v0200fg10000crosswiredvideoid",
+                    "width": 1440,
+                    "height": 2560,
+                    "url_list": ["https://v26-web.douyinvod.com/cross-wired.mp4"],
+                }
+            },
+        },
+    )
+    monkeypatch.setattr(
+        "app.douyin.fetch_signed_profile_awemes",
+        lambda *args, **kwargs: pytest.fail(
+            "Cross-wired exact detail must fail closed without a feed fallback"
+        ),
+    )
+
+    with pytest.raises(DiscoveryError, match="without complete, verified") as error:
+        discover_item_metadata_from_profile(
+            profile_id,
+            media_id,
+            prefer_exact_detail=True,
+        )
+
+    assert error.value.issue_code == SiteIssueCode.SITE_RESPONSE_CHANGED
+
+
+def test_item_metadata_preferred_detail_integrity_failure_does_not_use_feed(
+    monkeypatch,
+) -> None:
+    profile_id = "MS4wLjABAAAAexpected"
+    media_id = "1111111111111111111"
+    expected_error = DiscoveryError(
+        "Douyin detail API returned a different aweme",
+        issue_code=SiteIssueCode.SITE_RESPONSE_CHANGED,
+    )
+
+    monkeypatch.setattr(
+        "app.douyin.fetch_signed_aweme_detail",
+        lambda *args, **kwargs: (_ for _ in ()).throw(expected_error),
+    )
+    monkeypatch.setattr(
+        "app.douyin.fetch_signed_profile_awemes",
+        lambda *args, **kwargs: pytest.fail(
+            "An exact-detail integrity failure must not use the profile feed"
+        ),
+    )
+
+    with pytest.raises(DiscoveryError) as captured:
+        discover_item_metadata_from_profile(
+            profile_id,
+            media_id,
+            prefer_exact_detail=True,
+        )
+
+    assert captured.value is expected_error
 
 
 def test_douyin_signed_profile_discovery_returns_verified_complete_metadata(

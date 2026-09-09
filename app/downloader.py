@@ -1066,7 +1066,7 @@ class MediaDownloader:
                         owner_id,
                         expected_id,
                         cookie_profile=self.config.cookie_profile,
-                        prefer_exact_detail=video_uri is None,
+                        prefer_exact_detail=True,
                         should_cancel=should_cancel,
                         status_callback=self._report_discovery,
                     )

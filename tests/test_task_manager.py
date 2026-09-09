@@ -4590,6 +4590,237 @@ def test_fresh_douyin_live_photo_item_cache_is_validated_and_preserved(
     assert item.metadata["douyin_item_media"]["media_kind"] == "image"
 
 
+def test_douyin_item_discovery_response_change_retry_recovers_live_photo(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    media_id = "7683074221437746170"
+    submitted_url = (
+        "https://www.douyin.com/user/self?from_tab_name=main"
+        f"&modal_id={media_id}&showTab=favorite_collection"
+    )
+    canonical_url = f"https://www.douyin.com/video/{media_id}"
+
+    class RecoveringLivePhotoEngine:
+        def __init__(self) -> None:
+            self.discovery_calls: list[tuple[str, Platform, SourceKind]] = []
+            self.download_calls: list[DownloadItem] = []
+
+        def discover(self, url, platform, kind, *, should_cancel):
+            self.discovery_calls.append((url, platform, kind))
+            if len(self.discovery_calls) == 1:
+                raise DiscoveryError(
+                    "Douyin signed data failed identity or integrity validation",
+                    issue_code=SiteIssueCode.SITE_RESPONSE_CHANGED,
+                )
+            return DiscoveryResult(
+                author="Verified Author",
+                items=[
+                    DownloadItem(
+                        id="fresh-live-photo",
+                        media_id=media_id,
+                        source_url=canonical_url,
+                        title="Verified Live Photo",
+                        media_type=MediaType.IMAGE,
+                        metadata=complete_douyin_live_photo_item_metadata(
+                            canonical_url,
+                            media_id,
+                        ),
+                    )
+                ],
+            )
+
+        def download_item(
+            self,
+            item,
+            platform,
+            output_dir,
+            *,
+            callback,
+            should_cancel,
+        ):
+            self.download_calls.append(item.model_copy(deep=True))
+            assert platform == Platform.DOUYIN
+            assert item.media_type == MediaType.IMAGE
+            assert item.metadata["douyin_item_media"]["media_kind"] == "image"
+            return DownloadOutcome(
+                output_paths=[str(Path(output_dir) / "live-photo.mp4")],
+                title=item.title,
+                author="Verified Author",
+                media_type=MediaType.IMAGE,
+                selected_format="douyin-highest-live-photos-or-images",
+                resolution="1440x2560",
+            )
+
+    manager = DownloadManager(
+        state_dir=tmp_path / "state",
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    engine = RecoveringLivePhotoEngine()
+    monkeypatch.setattr(manager, "_engine_for_job", lambda job: engine)
+    try:
+        created = manager.create_job(submitted_url, auto_start=True)
+        failed = wait_for_job(manager, created.id)
+
+        assert failed.source_url == canonical_url
+        assert failed.source_kind == SourceKind.ITEM
+        assert failed.status == JobStatus.FAILED
+        assert failed.issue_code == SiteIssueCode.SITE_RESPONSE_CHANGED
+        assert failed.items == []
+        assert failed.discovery_complete is False
+        assert failed.retryable is True
+
+        manager.retry_failed(created.id)
+        completed = wait_for_job(manager, created.id)
+
+        assert completed.status == JobStatus.COMPLETED
+        assert completed.discovery_complete is True
+        assert completed.total_items == 1
+        assert completed.items[0].media_type == MediaType.IMAGE
+        assert completed.items[0].metadata["douyin_item_media"]["media_kind"] == (
+            "image"
+        )
+        assert completed.items[0].output_paths == [
+            str(Path(completed.output_dir) / "live-photo.mp4")
+        ]
+        assert engine.discovery_calls == [
+            (canonical_url, Platform.DOUYIN, SourceKind.ITEM),
+            (canonical_url, Platform.DOUYIN, SourceKind.ITEM),
+        ]
+        assert len(engine.download_calls) == 1
+    finally:
+        manager.shutdown()
+
+
+def test_persisted_failed_douyin_video_retry_refreshes_as_live_photo(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    media_id = "7683074221437746170"
+    canonical_url = f"https://www.douyin.com/video/{media_id}"
+    state_dir = tmp_path / "state"
+    output_root = tmp_path / "downloads"
+    stale_video_uri = "v0200fg10000stalevideoclassification"
+    failure_message = (
+        "Douyin signed data failed identity or integrity validation. "
+        "Retry the original link."
+    )
+    legacy_item = DownloadItem(
+        id="legacy-video-item",
+        media_id=media_id,
+        source_url=canonical_url,
+        title="Legacy video classification",
+        media_type=MediaType.VIDEO,
+        status=ItemStatus.FAILED,
+        error=failure_message,
+        issue_code=SiteIssueCode.SITE_RESPONSE_CHANGED,
+        retryable=True,
+        metadata=complete_douyin_item_metadata(
+            canonical_url,
+            media_id,
+            video_uri=stale_video_uri,
+        ),
+    )
+    job = DownloadJob(
+        id="persisted-failed-live-photo",
+        source_url=canonical_url,
+        platform=Platform.DOUYIN,
+        source_kind=SourceKind.ITEM,
+        output_root=str(output_root),
+        status=JobStatus.FAILED,
+        error=failure_message,
+        issue_code=SiteIssueCode.SITE_RESPONSE_CHANGED,
+        issue_message=failure_message,
+        retryable=True,
+        discovery_complete=True,
+        items=[legacy_item],
+    )
+    job.refresh_counts()
+    JsonJobStore(state_dir).save(job)
+
+    class ReclassifyingLivePhotoEngine:
+        def __init__(self) -> None:
+            self.discovery_calls: list[tuple[str, Platform, SourceKind]] = []
+            self.download_calls: list[DownloadItem] = []
+
+        def discover(self, url, platform, kind, *, should_cancel):
+            self.discovery_calls.append((url, platform, kind))
+            return DiscoveryResult(
+                author="Verified Author",
+                items=[
+                    DownloadItem(
+                        id="fresh-live-photo",
+                        media_id=media_id,
+                        source_url=canonical_url,
+                        title="Verified Live Photo",
+                        media_type=MediaType.IMAGE,
+                        metadata=complete_douyin_live_photo_item_metadata(
+                            canonical_url,
+                            media_id,
+                        ),
+                    )
+                ],
+            )
+
+        def download_item(
+            self,
+            item,
+            platform,
+            output_dir,
+            *,
+            callback,
+            should_cancel,
+        ):
+            self.download_calls.append(item.model_copy(deep=True))
+            cached = item.metadata["douyin_item_media"]
+            assert platform == Platform.DOUYIN
+            assert item.media_type == MediaType.IMAGE
+            assert cached["media_kind"] == "image"
+            assert cached.get("video_uri") != stale_video_uri
+            return DownloadOutcome(
+                output_paths=[str(Path(output_dir) / "fresh-live-photo.mp4")],
+                title=item.title,
+                author="Verified Author",
+                media_type=MediaType.IMAGE,
+                selected_format="douyin-highest-live-photos-or-images",
+                resolution="1440x2560",
+            )
+
+    manager = DownloadManager(
+        state_dir=state_dir,
+        default_output_root=output_root,
+        max_workers=1,
+    )
+    engine = ReclassifyingLivePhotoEngine()
+    monkeypatch.setattr(manager, "_engine_for_job", lambda restored_job: engine)
+    try:
+        restored = manager.get_job(job.id)
+        assert restored.status == JobStatus.FAILED
+        assert restored.discovery_complete is True
+        assert restored.items[0].media_type == MediaType.VIDEO
+        assert (
+            restored.items[0].metadata["douyin_item_media"]["video_uri"]
+            == stale_video_uri
+        )
+
+        manager.retry_failed(job.id)
+        completed = wait_for_job(manager, job.id)
+
+        assert completed.status == JobStatus.COMPLETED
+        assert completed.discovery_complete is True
+        assert completed.items[0].media_type == MediaType.IMAGE
+        refreshed_cache = completed.items[0].metadata["douyin_item_media"]
+        assert refreshed_cache["media_kind"] == "image"
+        assert refreshed_cache.get("video_uri") != stale_video_uri
+        assert engine.discovery_calls == [
+            (canonical_url, Platform.DOUYIN, SourceKind.ITEM)
+        ]
+        assert len(engine.download_calls) == 1
+    finally:
+        manager.shutdown()
+
+
 def test_restore_preserves_completed_live_photo_item_with_only_mp4_output(
     tmp_path,
 ) -> None:

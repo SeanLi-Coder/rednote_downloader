@@ -205,6 +205,13 @@ def test_douyin_redirect_messages_execute_with_safe_legacy_and_reason_parsing(
             "空终页没有绑定当前作者",
         ),
         (
+            "Douyin returned incomplete or changed signed response data after "
+            "automatic retries. The response could not be verified, so the task "
+            "was paused without downloading a fallback. Reason category: "
+            "api-filtered-images-base.",
+            "没有把背景音频误当成视频",
+        ),
+        (
             "Douyin quality verification made no media progress for 120 seconds. "
             "The task was paused; completed files were preserved.",
             "连续 120 秒没有收到新的媒体字节或有效探测结果后自动停止",
@@ -888,6 +895,8 @@ def test_discovery_activity_and_active_item_progress_are_visible(
         "freshSession: window.__localizeDiscoveryActivity("
         "'Retrying Douyin signed profile with a fresh signing session "
         "(reason: api-status-nonzero)', __discoveryJob), "
+        "itemPage: window.__localizeDiscoveryActivity("
+        "'Opening the original Douyin item page', __discoveryJob), "
         "resume: window.__localizeDiscoveryActivity("
         "'Resuming Douyin signed profile at page 2/300 (44 verified items)', "
         "__discoveryJob), "
@@ -931,6 +940,7 @@ def test_discovery_activity_and_active_item_progress_are_visible(
             "（2/3）（已等待 1 分 5 秒）"
         ),
         "freshSession": ("抖音主页签名会话暂时失败（接口业务状态异常），正在重新建立"),
+        "itemPage": "正在打开原抖音作品页，读取完整图文/Live Photo 详情",
         "resume": "正在从抖音主页第 2 页续跑（已验证 44 个作品）",
         "browserStart": (
             "正在切换到有时限的抖音主页浏览器解析"

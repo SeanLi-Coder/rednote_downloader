@@ -1248,6 +1248,97 @@ def test_douyin_item_discovery_accepts_bound_live_photo_signed_detail(
     ]
 
 
+def test_douyin_item_exact_detail_overrides_ytdlp_live_photo_video_guess(
+    monkeypatch,
+) -> None:
+    media_id = "7683074221437746170"
+    owner_id = "MS4wLjABAAAAvLgZS-O6Oc9diWWZ-jctzlhanUBoN7a5oJLdsTkx6F9"
+    source_url = f"https://www.douyin.com/video/{media_id}"
+    guessed_video_uri = "v0200fg10000ytdlpwrongvideoguess"
+    live_uri = "v0200fg10000exactlivephotoitem"
+    detail_calls = []
+
+    class MisclassifiedLivePhotoYoutubeDL(FakeYoutubeDL):
+        def extract_info(self, url: str, download: bool, process: bool = True):
+            assert url == source_url
+            assert download is False
+            assert process is False
+            return {
+                "id": media_id,
+                "title": "Misclassified video",
+                "channel": "Verified Author",
+                "channel_id": owner_id,
+                "extractor_key": "Douyin",
+                "formats": [
+                    {
+                        "url": (
+                            "https://api-play.amemv.com/aweme/v1/play/"
+                            f"?video_id={guessed_video_uri}&ratio=1080p"
+                        ),
+                        "width": 1080,
+                        "height": 1920,
+                    }
+                ],
+            }
+
+    def fetch_detail(requested_id: str, **kwargs):
+        detail_calls.append((requested_id, kwargs))
+        return {
+            "aweme_id": media_id,
+            "aweme_type": 68,
+            "desc": "Exact Live Photo",
+            "create_time": 1_756_656_000,
+            "author": {"sec_uid": owner_id, "nickname": "Verified Author"},
+            "images": [
+                {
+                    "width": 1440,
+                    "height": 2560,
+                    "url_list": ["https://p3-pc-sign.douyinpic.com/exact-cover.webp"],
+                    "video": {
+                        "duration": 2_400,
+                        "play_addr": {
+                            "uri": live_uri,
+                            "width": 1440,
+                            "height": 2560,
+                            "url_list": [
+                                "https://v26-web.douyinvod.com/exact-live.mp4"
+                            ],
+                        },
+                    },
+                }
+            ],
+        }
+
+    monkeypatch.setattr("app.downloader.YoutubeDL", MisclassifiedLivePhotoYoutubeDL)
+    monkeypatch.setattr("app.douyin.fetch_signed_aweme_detail", fetch_detail)
+    monkeypatch.setattr(
+        "app.douyin.fetch_signed_profile_awemes",
+        lambda *args, **kwargs: pytest.fail(
+            "Complete exact Live Photo detail must not scan the author feed"
+        ),
+    )
+    engine = MediaDownloader(DownloaderConfig(cookie_browser="chrome"))
+
+    result = engine.discover(source_url, Platform.DOUYIN, SourceKind.ITEM)
+
+    assert len(detail_calls) == 1
+    assert detail_calls[0][0] == media_id
+    assert detail_calls[0][1]["verification_url"] == source_url
+    assert detail_calls[0][1]["expected_sec_uid"] == owner_id
+    item = result.items[0]
+    assert item.media_type == MediaType.IMAGE
+    assert item.title == "Exact Live Photo"
+    assert item.author == "Verified Author"
+    cached = item.metadata["douyin_item_media"]
+    assert cached["media_kind"] == "image"
+    assert cached["media_id"] == media_id
+    assert cached["owner_id"] == owner_id
+    assert cached["live_photo_assets"][0]["video_uri"] == live_uri
+    assert cached["live_photo_assets"][0]["direct_candidates"][0]["urls"] == [
+        "https://v26-web.douyinvod.com/exact-live.mp4"
+    ]
+
+
 def test_douyin_item_without_video_uses_bound_static_image_detail(
     monkeypatch,
 ) -> None:
@@ -1478,7 +1569,7 @@ def test_douyin_item_discovery_enriches_quality_from_bound_author_profile(
     calls = []
 
     def enrich(profile_id, target_id, **kwargs):
-        calls.append((profile_id, target_id))
+        calls.append((profile_id, target_id, kwargs))
         kwargs["status_callback"]("Checking bound Douyin author feed")
         return {
             "video_uri": video_uri,
@@ -1509,7 +1600,9 @@ def test_douyin_item_discovery_enriches_quality_from_bound_author_profile(
 
     result = engine.discover(source_url, Platform.DOUYIN, SourceKind.ITEM)
 
-    assert calls == [(owner_id, media_id)]
+    assert len(calls) == 1
+    assert calls[0][:2] == (owner_id, media_id)
+    assert calls[0][2]["prefer_exact_detail"] is True
     assert [(event.event, event.message) for event in discovery_events] == [
         ("probing", "Reading Douyin item metadata with bounded retries"),
         ("probing", "Checking bound Douyin author feed"),

@@ -1068,6 +1068,9 @@
     if (text.includes("Douyin requires current Chrome cookies or an explicit verification")) {
       return `抖音明确要求最新 Chrome Cookie、登录或验证码。请在 Chrome 打开${verificationTarget(job)}完成验证后再重试。`;
     }
+    if (text.includes("Reason category: api-filtered-images-base")) {
+      return "抖音的简化详情接口只返回了图文/Live Photo 过滤结果。程序已经尝试从原作品页读取完整详情，但本次仍未取得可验证的动态图与图片数据，因此没有把背景音频误当成视频，也没有下载串号或低清替代文件。请等待一两分钟后点击“继续任务”或“重试”，让程序从原作品链接重新解析；没有明确验证码或登录页面时，不需要打开 Chrome 验证。";
+    }
     if (text.includes("Douyin signed discovery stopped after 120 seconds without verified progress")) {
       const reason = text.match(/Reason category:\s*([a-z0-9-]+)/i)?.[1];
       const detail = douyinSignedReasonLabel(reason);
@@ -1666,6 +1669,9 @@
     if (detailSession) {
       return `正在准备抖音作品签名会话（${detailSession[1]}/${detailSession[2]}）`;
     }
+    if (message === "Opening the original Douyin item page") {
+      return "正在打开原抖音作品页，读取完整图文/Live Photo 详情";
+    }
     if (message === "Fetching Douyin signed detail") return "正在读取抖音作品详情";
     if (message === "Fetching Douyin signing HTML") return "正在读取抖音签名页面";
     if (message === "Waiting for the Douyin signed request slot") return "正在等待抖音签名请求通道";
@@ -1712,6 +1718,7 @@
       "api-missing-aweme-list": "接口没有返回作品列表",
       "api-unbound-empty-page": "空终页没有绑定当前作者",
       "api-incomplete-media": "接口返回的作品媒体信息不完整",
+      "api-filtered-images-base": "简化接口过滤了图文/Live Photo 详情",
       "network-timeout": "网络超时",
       "network-error": "网络连接异常",
       "signer-timeout": "签名组件超时",

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from email.message import Message
 from io import BytesIO
 from types import SimpleNamespace
@@ -8,6 +9,7 @@ from urllib.error import HTTPError as UrllibHTTPError
 import pytest
 
 import app.douyin_signing as douyin_signing
+from app.douyin import verified_aweme_metadata
 from app.douyin_signing import (
     _AuthenticationSigningFailure,
     _SigningFailure,
@@ -41,6 +43,7 @@ from app.errors import (
 AWEME_ID = "7671259887394052209"
 SEC_UID = "MS4wLjABAAAAexpected"
 VIDEO_URL = f"https://www.douyin.com/video/{AWEME_ID}"
+NOTE_URL = f"https://www.douyin.com/note/{AWEME_ID}"
 PROFILE_URL = f"https://www.douyin.com/user/{SEC_UID}"
 GLUE_HTML = """
 <!doctype html>
@@ -327,6 +330,7 @@ def test_build_signing_document_adds_only_required_fixed_runtimes() -> None:
     "url",
     [
         VIDEO_URL,
+        f"https://www.douyin.com/note/{AWEME_ID}",
         PROFILE_URL,
         f"https://douyin.com/video/{AWEME_ID}",
         f"https://www.douyin.com:443/user/{SEC_UID}/",
@@ -447,6 +451,26 @@ def test_validate_detail_response_returns_only_verified_aweme_detail() -> None:
 
     assert detail["aweme_id"] == AWEME_ID
     assert detail["author"]["sec_uid"] == SEC_UID
+
+
+def test_validate_detail_response_classifies_images_base_filter_without_identity() -> (
+    None
+):
+    response = {
+        "state": "done",
+        "httpStatus": 200,
+        "payload": {
+            "status_code": 0,
+            "aweme_detail": None,
+            "filter_detail": {"filter_reason": "images_base"},
+        },
+    }
+
+    with pytest.raises(_TransientSigningFailure) as captured:
+        _validate_detail_response(response, AWEME_ID, SEC_UID)
+
+    assert captured.value.category == "api-filtered-images-base"
+    assert "different aweme" not in str(captured.value).lower()
 
 
 def test_validate_detail_response_marks_http_429_as_transient() -> None:
@@ -860,15 +884,67 @@ class FakeRequest:
         return FakeApiResponse()
 
 
+class FakePageRequest:
+    def __init__(self, url: str, method: str = "GET") -> None:
+        self.url = url
+        self.method = method
+        self._response = None
+
+    def response(self):
+        return self._response
+
+
+class FakePageResponse:
+    def __init__(
+        self,
+        payload: dict,
+        *,
+        url: str | None = None,
+        request_url: str | None = None,
+        method: str = "GET",
+        status: int = 200,
+        body: bytes | None = None,
+    ) -> None:
+        self._payload = payload
+        self.url = url or (
+            "https://www.douyin.com/aweme/v1/web/aweme/detail/" f"?aweme_id={AWEME_ID}"
+        )
+        self.request = FakePageRequest(request_url or self.url, method)
+        self.request._response = self
+        self.status = status
+        self._body = body if body is not None else json.dumps(payload).encode("utf-8")
+
+    def json(self) -> dict:
+        return self._payload
+
+    def body(self) -> bytes:
+        return self._body
+
+
 class FakePage:
-    def __init__(self, result: dict | list[dict] | None = None) -> None:
+    def __init__(
+        self,
+        result: dict | list[dict] | None = None,
+        *,
+        page_responses: list[FakePageResponse] | None = None,
+        page_final_url: str | None = None,
+        page_html: str = "<html><body>Douyin item</body></html>",
+        pace_snapshot: dict | None = None,
+    ) -> None:
         self.closed = False
         self.route_handler = None
         self.routed_url: str | None = None
         self.goto_url: str | None = None
+        self.goto_urls: list[str] = []
+        self.url = "about:blank"
         self.fulfilled_route = FakeRoute()
         self.started = False
         self.waited = False
+        self.page_responses = page_responses or []
+        self.page_final_url = page_final_url
+        self.page_html = page_html
+        self.pace_snapshot = pace_snapshot or {"state": "missing"}
+        self.response_handlers = []
         if isinstance(result, list):
             self.results = result
         else:
@@ -879,13 +955,35 @@ class FakePage:
         self.routed_url = url
         self.route_handler = handler
 
+    def on(self, event: str, handler) -> None:
+        assert event == "requestfinished"
+        self.response_handlers.append(handler)
+
+    def remove_listener(self, event: str, handler) -> None:
+        assert event == "requestfinished"
+        if handler in self.response_handlers:
+            self.response_handlers.remove(handler)
+
     def goto(self, url: str, wait_until: str, timeout: int) -> None:
+        self.goto_urls.append(url)
         self.goto_url = url
-        self.route_handler(self.fulfilled_route)
+        if url == douyin_signing._SIGNING_PAGE_URL:
+            self.url = url
+            self.route_handler(self.fulfilled_route)
+            return
+        self.url = self.page_final_url or url
+        for response in self.page_responses:
+            for handler in list(self.response_handlers):
+                handler(response.request)
+
+    def content(self) -> str:
+        return self.page_html
 
     def evaluate(self, script: str, argument=None):
         if "typeof window.useWebSecsdkApi" in script:
             return True
+        if "const source = self.__pace_f" in script:
+            return self.pace_snapshot
         if argument is not None:
             self.started = True
             self.signed_requests.append(argument)
@@ -958,8 +1056,19 @@ class FakePlaywrightManager:
 def _install_fake_playwright(
     monkeypatch,
     result: dict | list[dict] | None = None,
+    *,
+    page_responses: list[FakePageResponse] | None = None,
+    page_final_url: str | None = None,
+    page_html: str = "<html><body>Douyin item</body></html>",
+    pace_snapshot: dict | None = None,
 ):
-    page = FakePage(result)
+    page = FakePage(
+        result,
+        page_responses=page_responses,
+        page_final_url=page_final_url,
+        page_html=page_html,
+        pace_snapshot=pace_snapshot,
+    )
     context = FakeContext(page)
     browser = FakeBrowser(context)
     manager = FakePlaywrightManager(browser)
@@ -988,6 +1097,903 @@ def _install_fake_playwright(
         lambda: manager,
     )
     return page, context, browser, manager
+
+
+def _ssr_live_photo_detail(
+    *,
+    aweme_id: str = AWEME_ID,
+    sec_uid: str = SEC_UID,
+    image_url: str = "https://p3-pc-sign.douyinpic.com/media/original.webp",
+) -> dict:
+    video_uri = "v1e00fgi0000testlivephoto00001"
+    video_urls = [
+        {"src": "https://v11-weba.douyinvod.com/media/live-photo.mp4"},
+        {"src": "https://v26-web.douyinvod.com/media/live-photo.mp4"},
+    ]
+    return {
+        "awemeId": aweme_id,
+        "groupId": aweme_id,
+        "awemeType": 68,
+        "mediaType": 2,
+        "createTime": 1_788_855_117,
+        "desc": "Test Live Photo",
+        "authorInfo": {"secUid": sec_uid, "nickname": "Test Author"},
+        "images": [
+            {
+                "uri": "test-image-uri",
+                "width": 2160,
+                "height": 2880,
+                "urlList": [image_url],
+                "downloadUrlList": [image_url],
+                "livePhotoType": 1,
+                "video": {
+                    "uri": video_uri,
+                    "width": 720,
+                    "height": 960,
+                    "duration": 2942,
+                    "dataSize": 292_561,
+                    "playAddrSize": 292_561,
+                    "playAddr": video_urls,
+                    "playAddrH265": [],
+                    "bitRateList": [
+                        {
+                            "uri": video_uri,
+                            "width": 720,
+                            "height": 960,
+                            "dataSize": 292_561,
+                            "bitRate": 795_543,
+                            "realBitrate": 795_543,
+                            "isH265": 0,
+                            "format": "mp4",
+                            "playAddr": video_urls,
+                        }
+                    ],
+                },
+            }
+        ],
+    }
+
+
+def _ssr_wrapper(
+    detail: dict | None = None,
+    *,
+    aweme_id: str = AWEME_ID,
+) -> dict:
+    return {
+        "awemeId": aweme_id,
+        "statusCode": 0,
+        "redirect": False,
+        "isSpider": False,
+        "aweme": {
+            "statusCode": 0,
+            "isUnknownAweme": False,
+            "detail": detail or _ssr_live_photo_detail(),
+            "filterDetail": {},
+        },
+    }
+
+
+def _ssr_flight_fragments(wrapper: dict | None = None) -> list[str]:
+    text_value = "前置🙂Flight 文本"
+    text_bytes = text_value.encode("utf-8")
+    root = ["$", "div", None, wrapper or _ssr_wrapper()]
+    stream = (
+        f"8:T{len(text_bytes):x},"
+        + text_value
+        + "\n7:"
+        + json.dumps(root, ensure_ascii=False, separators=(",", ":"))
+        + "\n"
+    )
+    # Deliberately split inside the T header/payload boundary and JSON frame.
+    return [stream[:5], stream[5:12], stream[12:37], stream[37:]]
+
+
+def _pace_snapshot(wrapper: dict | None = None) -> dict:
+    fragments = _ssr_flight_fragments(wrapper)
+    return {
+        "state": "done",
+        "fragments": fragments,
+        "totalBytes": len("".join(fragments).encode("utf-8")),
+    }
+
+
+def test_flight_parser_handles_segmented_utf8_text_frame_before_json() -> None:
+    values = douyin_signing._parse_flight_json_records(_ssr_flight_fragments())
+
+    assert len(values) == 1
+    assert values[0][3]["awemeId"] == AWEME_ID
+    assert values[0][3]["aweme"]["detail"]["desc"] == "Test Live Photo"
+
+
+def test_direct_item_uses_identity_bound_live_photo_ssr_without_detail_api(
+    monkeypatch,
+) -> None:
+    page, context, browser, manager = _install_fake_playwright(
+        monkeypatch,
+        _detail_response(aweme_id="7000000000000000000"),
+        pace_snapshot=_pace_snapshot(),
+    )
+
+    def fail_if_glue_is_extracted(*args, **kwargs):
+        raise AssertionError("SecSDK glue must not be extracted after SSR capture")
+
+    monkeypatch.setattr(
+        douyin_signing,
+        "_extract_glue_with_context_fallback",
+        fail_if_glue_is_extracted,
+    )
+
+    detail = fetch_signed_aweme_detail(
+        AWEME_ID,
+        verification_url=VIDEO_URL,
+        expected_sec_uid=SEC_UID,
+        signer_settle_ms=0,
+    )
+    metadata = verified_aweme_metadata(
+        detail,
+        AWEME_ID,
+        expected_profile_id=SEC_UID,
+    )
+
+    assert detail["aweme_id"] == AWEME_ID
+    assert detail["author"] == {
+        "sec_uid": SEC_UID,
+        "nickname": "Test Author",
+    }
+    assert metadata is not None
+    assert metadata["media_kind"] == "image"
+    assert [
+        (asset["width"], asset["height"]) for asset in metadata["image_assets"]
+    ] == [(2160, 2880)]
+    assert [
+        (asset["width"], asset["height"], asset["duration_ms"])
+        for asset in metadata["live_photo_assets"]
+    ] == [(720, 960, 2942)]
+    assert metadata.get("live_photo_static_fallback_indexes") is None
+    assert page.goto_urls == [NOTE_URL]
+    assert page.started is False
+    assert page.signed_requests == []
+    assert page.response_handlers == []
+    assert page.closed and context.closed and browser.closed
+    assert manager.resources_closed_on_exit is True
+
+
+@pytest.mark.parametrize(
+    ("detail_aweme_id", "detail_sec_uid", "failure_pattern"),
+    [
+        ("7000000000000000000", SEC_UID, "different aweme"),
+        (AWEME_ID, "MS4wLjABAAAAwrongowner", "different author"),
+    ],
+)
+def test_ssr_detail_fails_closed_on_item_or_author_mismatch(
+    detail_aweme_id: str,
+    detail_sec_uid: str,
+    failure_pattern: str,
+) -> None:
+    detail = _ssr_live_photo_detail(
+        aweme_id=detail_aweme_id,
+        sec_uid=detail_sec_uid,
+    )
+    wrapper = _ssr_wrapper(detail)
+
+    with pytest.raises(
+        douyin_signing._IdentitySigningFailure,
+        match=failure_pattern,
+    ):
+        douyin_signing._extract_ssr_aweme_detail(
+            _ssr_flight_fragments(wrapper),
+            AWEME_ID,
+            SEC_UID,
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "failure_type", "failure_pattern"),
+    [
+        ("redirect", douyin_signing._IdentitySigningFailure, "redirect"),
+        ("unknown", douyin_signing._IdentitySigningFailure, "unknown aweme"),
+        ("page-status", _TransientSigningFailure, "nonzero status"),
+        ("item-status", _TransientSigningFailure, "nonzero status"),
+    ],
+)
+def test_ssr_wrapper_rejects_redirect_unknown_and_nonzero_status(
+    mutation: str,
+    failure_type: type[Exception],
+    failure_pattern: str,
+) -> None:
+    wrapper = _ssr_wrapper()
+    if mutation == "redirect":
+        wrapper["redirect"] = True
+    elif mutation == "unknown":
+        wrapper["aweme"]["isUnknownAweme"] = True
+    elif mutation == "page-status":
+        wrapper["statusCode"] = 1
+    else:
+        wrapper["aweme"]["statusCode"] = 1
+
+    with pytest.raises(failure_type, match=failure_pattern):
+        douyin_signing._extract_ssr_aweme_detail(
+            _ssr_flight_fragments(wrapper),
+            AWEME_ID,
+            SEC_UID,
+        )
+
+
+@pytest.mark.parametrize(
+    ("layer", "field"),
+    [
+        ("page", "statusMsg"),
+        ("item", "statusMessage"),
+    ],
+)
+def test_ssr_camelcase_status_fields_classify_explicit_rate_limit(
+    layer: str,
+    field: str,
+) -> None:
+    wrapper = _ssr_wrapper()
+    payload = wrapper if layer == "page" else wrapper["aweme"]
+    payload["statusCode"] = 4
+    payload[field] = "请求频繁，请稍后再试"
+
+    with pytest.raises(_TransientSigningFailure) as captured:
+        douyin_signing._extract_ssr_aweme_detail(
+            _ssr_flight_fragments(wrapper),
+            AWEME_ID,
+            SEC_UID,
+        )
+
+    assert captured.value.category == "api-rate-limit"
+
+
+@pytest.mark.parametrize(
+    ("layer", "field"),
+    [
+        ("page", "statusMessage"),
+        ("item", "statusMsg"),
+    ],
+)
+def test_ssr_camelcase_status_fields_classify_explicit_auth(
+    layer: str,
+    field: str,
+) -> None:
+    wrapper = _ssr_wrapper()
+    payload = wrapper if layer == "page" else wrapper["aweme"]
+    payload["statusCode"] = 1
+    payload[field] = "请登录后继续"
+
+    with pytest.raises(_AuthenticationSigningFailure) as captured:
+        douyin_signing._extract_ssr_aweme_detail(
+            _ssr_flight_fragments(wrapper),
+            AWEME_ID,
+            SEC_UID,
+        )
+
+    assert captured.value.issue_code == SiteIssueCode.LOGIN_REQUIRED
+
+
+def test_ssr_flight_capture_limits_fail_closed(monkeypatch) -> None:
+    monkeypatch.setattr(douyin_signing, "_MAX_PACE_FRAGMENT_BYTES", 8)
+
+    with pytest.raises(_SigningFailure, match="unexpectedly large"):
+        douyin_signing._parse_flight_json_records(['0:["too long"]\n'])
+
+    page = SimpleNamespace(
+        evaluate=lambda script, argument: {"state": "stream_too_large"}
+    )
+    with pytest.raises(_SigningFailure, match="bounded Flight capture limits"):
+        douyin_signing._read_ssr_aweme_detail_from_page(page, AWEME_ID, SEC_UID)
+
+
+@pytest.mark.parametrize(
+    "pace_snapshot",
+    [
+        {"state": "too_many_entries"},
+        {"state": "done", "fragments": ["not-a-flight-frame"]},
+    ],
+)
+def test_optional_ssr_structure_miss_falls_back_to_exact_signed_api(
+    monkeypatch,
+    pace_snapshot: dict,
+) -> None:
+    page, context, browser, manager = _install_fake_playwright(
+        monkeypatch,
+        pace_snapshot=pace_snapshot,
+    )
+
+    detail = fetch_signed_aweme_detail(
+        AWEME_ID,
+        verification_url=VIDEO_URL,
+        expected_sec_uid=SEC_UID,
+        signer_settle_ms=0,
+    )
+
+    assert detail["aweme_id"] == AWEME_ID
+    assert page.goto_urls == [NOTE_URL, douyin_signing._SIGNING_PAGE_URL]
+    assert page.started is True
+    assert len(page.signed_requests) == 1
+    assert page.closed and context.closed and browser.closed
+    assert manager.resources_closed_on_exit is True
+
+
+def test_ssr_author_identity_mismatch_does_not_fall_back_to_signed_api(
+    monkeypatch,
+) -> None:
+    wrapper = _ssr_wrapper(_ssr_live_photo_detail(sec_uid="MS4wLjABAAAAwrongowner"))
+    page, context, browser, manager = _install_fake_playwright(
+        monkeypatch,
+        pace_snapshot=_pace_snapshot(wrapper),
+    )
+
+    with pytest.raises(DiscoveryError) as captured:
+        fetch_signed_aweme_detail(
+            AWEME_ID,
+            verification_url=VIDEO_URL,
+            expected_sec_uid=SEC_UID,
+            signer_settle_ms=0,
+        )
+
+    assert isinstance(captured.value.__cause__, douyin_signing._IdentitySigningFailure)
+    assert page.goto_urls == [NOTE_URL]
+    assert page.started is False
+    assert page.signed_requests == []
+    assert page.closed and context.closed and browser.closed
+    assert manager.resources_closed_on_exit is True
+
+
+def test_ssr_explicit_auth_status_does_not_fall_back_to_signed_api(
+    monkeypatch,
+) -> None:
+    wrapper = _ssr_wrapper()
+    wrapper["statusCode"] = 1
+    wrapper["statusMessage"] = "请登录后继续"
+    page, context, browser, manager = _install_fake_playwright(
+        monkeypatch,
+        pace_snapshot=_pace_snapshot(wrapper),
+    )
+
+    with pytest.raises(AuthenticationRequiredError) as captured:
+        fetch_signed_aweme_detail(
+            AWEME_ID,
+            verification_url=VIDEO_URL,
+            expected_sec_uid=SEC_UID,
+            signer_settle_ms=0,
+        )
+
+    assert captured.value.issue_code == SiteIssueCode.LOGIN_REQUIRED
+    assert page.goto_urls == [NOTE_URL]
+    assert page.started is False
+    assert page.signed_requests == []
+    assert page.closed and context.closed and browser.closed
+    assert manager.resources_closed_on_exit is True
+
+
+def test_ssr_flight_parser_enforces_all_collection_limits(monkeypatch) -> None:
+    monkeypatch.setattr(douyin_signing, "_MAX_PACE_ENTRIES", 1)
+    with pytest.raises(_SigningFailure, match="fragment list"):
+        douyin_signing._parse_flight_json_records(["0:{}\n", "1:{}\n"])
+
+    monkeypatch.setattr(douyin_signing, "_MAX_PACE_ENTRIES", 64)
+    monkeypatch.setattr(douyin_signing, "_MAX_PACE_TOTAL_BYTES", 8)
+    with pytest.raises(_SigningFailure, match="stream was unexpectedly large"):
+        douyin_signing._parse_flight_json_records(["0:{}\n", "1:{}\n"])
+
+    monkeypatch.setattr(douyin_signing, "_MAX_PACE_TOTAL_BYTES", 2_000_000)
+    monkeypatch.setattr(douyin_signing, "_MAX_FLIGHT_FRAMES", 1)
+    with pytest.raises(_SigningFailure, match="too many Flight frames"):
+        douyin_signing._parse_flight_json_records(["0:{}\n1:{}\n"])
+
+    monkeypatch.setattr(douyin_signing, "_MAX_FLIGHT_FRAMES", 256)
+    monkeypatch.setattr(douyin_signing, "_MAX_FLIGHT_FRAME_BYTES", 3)
+    with pytest.raises(_SigningFailure, match="text frame was unexpectedly large"):
+        douyin_signing._parse_flight_json_records(["0:T4,test\n"])
+
+    monkeypatch.setattr(douyin_signing, "_MAX_FLIGHT_FRAME_BYTES", 1_000_000)
+    monkeypatch.setattr(douyin_signing, "_MAX_FLIGHT_JSON_RECORDS", 1)
+    with pytest.raises(_SigningFailure, match="too many JSON Flight frames"):
+        douyin_signing._parse_flight_json_records(["0:{}\n1:{}\n"])
+
+
+def test_ssr_keeps_untrusted_media_url_for_existing_media_validator() -> None:
+    evil_url = "https://evil.example/not-douyin-media.bin"
+    wrapper = _ssr_wrapper(_ssr_live_photo_detail(image_url=evil_url))
+
+    detail = douyin_signing._extract_ssr_aweme_detail(
+        _ssr_flight_fragments(wrapper),
+        AWEME_ID,
+        SEC_UID,
+    )
+
+    assert detail is not None
+    assert detail["images"][0]["url_list"] == [evil_url]
+    assert (
+        verified_aweme_metadata(
+            detail,
+            AWEME_ID,
+            expected_profile_id=SEC_UID,
+        )
+        is None
+    )
+
+
+def test_direct_item_prefers_complete_detail_captured_from_its_page(
+    monkeypatch,
+) -> None:
+    captured_payload = _detail_response()["payload"]
+    page, context, browser, manager = _install_fake_playwright(
+        monkeypatch,
+        _detail_response(aweme_id="7000000000000000000"),
+        page_responses=[FakePageResponse(captured_payload)],
+    )
+
+    def fail_if_glue_is_extracted(*args, **kwargs):
+        raise AssertionError("SecSDK glue must not be extracted after page capture")
+
+    monkeypatch.setattr(
+        douyin_signing,
+        "_extract_glue_with_context_fallback",
+        fail_if_glue_is_extracted,
+    )
+
+    detail = fetch_signed_aweme_detail(
+        AWEME_ID,
+        verification_url=VIDEO_URL,
+        expected_sec_uid=SEC_UID,
+        signer_settle_ms=0,
+    )
+
+    assert detail["aweme_id"] == AWEME_ID
+    assert page.goto_urls == [NOTE_URL]
+    assert page.started is False
+    assert page.signed_requests == []
+    assert page.response_handlers == []
+    assert page.closed and context.closed and browser.closed
+    assert manager.resources_closed_on_exit is True
+
+
+def test_page_detail_capture_reads_completed_request_body_not_response_json(
+    monkeypatch,
+) -> None:
+    complete_payload = _detail_response()["payload"]
+    misleading_payload = _detail_response(aweme_id="7000000000000000000")["payload"]
+    page, context, browser, manager = _install_fake_playwright(
+        monkeypatch,
+        page_responses=[
+            FakePageResponse(
+                misleading_payload,
+                body=json.dumps(complete_payload).encode("utf-8"),
+            )
+        ],
+    )
+
+    detail = fetch_signed_aweme_detail(
+        AWEME_ID,
+        verification_url=VIDEO_URL,
+        expected_sec_uid=SEC_UID,
+        signer_settle_ms=0,
+    )
+
+    assert detail["aweme_id"] == AWEME_ID
+    assert page.goto_urls == [NOTE_URL]
+    assert page.started is False
+    assert page.closed and context.closed and browser.closed
+    assert manager.resources_closed_on_exit is True
+
+
+@pytest.mark.parametrize(
+    ("body", "error_type", "issue_code"),
+    [
+        (
+            b"<html><body>Please complete the verification</body></html>",
+            AuthenticationRequiredError,
+            SiteIssueCode.VERIFICATION_REQUIRED,
+        ),
+        (
+            DNS_FILTER_HTML.encode("utf-8"),
+            TemporaryAccessError,
+            SiteIssueCode.NETWORK_ERROR,
+        ),
+    ],
+)
+def test_completed_page_detail_body_preserves_auth_and_dns_classification(
+    monkeypatch,
+    body: bytes,
+    error_type: type[Exception],
+    issue_code: SiteIssueCode,
+) -> None:
+    page, context, browser, manager = _install_fake_playwright(
+        monkeypatch,
+        page_responses=[FakePageResponse({}, body=body)],
+    )
+
+    with pytest.raises(error_type) as captured:
+        fetch_signed_aweme_detail(
+            AWEME_ID,
+            verification_url=VIDEO_URL,
+            expected_sec_uid=SEC_UID,
+            signer_settle_ms=0,
+        )
+
+    assert captured.value.issue_code == issue_code
+    assert page.goto_urls == [NOTE_URL]
+    assert page.started is False
+    assert page.closed and context.closed and browser.closed
+    assert manager.resources_closed_on_exit is True
+
+
+def test_page_detail_capture_rejects_response_redirect_outside_bound_endpoint(
+    monkeypatch,
+) -> None:
+    exact_request_url = (
+        "https://www.douyin.com/aweme/v1/web/aweme/detail/" f"?aweme_id={AWEME_ID}"
+    )
+    page, context, browser, manager = _install_fake_playwright(
+        monkeypatch,
+        page_responses=[
+            FakePageResponse(
+                _detail_response()["payload"],
+                url="https://evil.example/redirected-detail",
+                request_url=exact_request_url,
+            )
+        ],
+    )
+
+    with pytest.raises(DiscoveryError) as captured:
+        fetch_signed_aweme_detail(
+            AWEME_ID,
+            verification_url=VIDEO_URL,
+            expected_sec_uid=SEC_UID,
+            signer_settle_ms=0,
+        )
+
+    assert isinstance(captured.value.__cause__, douyin_signing._IdentitySigningFailure)
+    assert "bound endpoint" in str(captured.value.__cause__)
+    assert page.goto_urls == [NOTE_URL]
+    assert page.started is False
+    assert page.closed and context.closed and browser.closed
+    assert manager.resources_closed_on_exit is True
+
+
+def test_page_detail_capture_accepts_trusted_douyin_subdomain(monkeypatch) -> None:
+    detail_url = (
+        "https://www-hj.douyin.com/aweme/v1/web/aweme/detail/" f"?aweme_id={AWEME_ID}"
+    )
+    page, context, browser, manager = _install_fake_playwright(
+        monkeypatch,
+        _detail_response(aweme_id="7000000000000000000"),
+        page_responses=[
+            FakePageResponse(_detail_response()["payload"], url=detail_url)
+        ],
+    )
+
+    detail = fetch_signed_aweme_detail(
+        AWEME_ID,
+        verification_url=VIDEO_URL,
+        expected_sec_uid=SEC_UID,
+        signer_settle_ms=0,
+    )
+
+    assert detail["aweme_id"] == AWEME_ID
+    assert page.goto_urls == [NOTE_URL]
+    assert page.started is False
+    assert page.closed and context.closed and browser.closed
+    assert manager.resources_closed_on_exit is True
+
+
+@pytest.mark.parametrize(
+    ("candidate_url", "method"),
+    [
+        (
+            "https://www.douyin.com/aweme/v1/web/aweme/detail/"
+            "?aweme_id=7000000000000000000",
+            "GET",
+        ),
+        (
+            "https://evil.example/aweme/v1/web/aweme/detail/" f"?aweme_id={AWEME_ID}",
+            "GET",
+        ),
+        (
+            "https://www.douyin.com/aweme/v1/web/aweme/detail/" f"?aweme_id={AWEME_ID}",
+            "POST",
+        ),
+        (
+            "https://www.douyin.com:33443/aweme/v1/web/aweme/detail/"
+            f"?aweme_id={AWEME_ID}",
+            "GET",
+        ),
+        (
+            "https://www.douyin.com/aweme/v1/web/aweme/detail/extra"
+            f"?aweme_id={AWEME_ID}",
+            "GET",
+        ),
+        (
+            "https://www.douyin.com/aweme/v1/web/aweme/detail/"
+            f"?aweme_id={AWEME_ID}&aweme_id={AWEME_ID}",
+            "GET",
+        ),
+    ],
+)
+def test_page_detail_capture_rejects_unbound_request_candidates(
+    monkeypatch,
+    candidate_url: str,
+    method: str,
+) -> None:
+    page, context, browser, manager = _install_fake_playwright(
+        monkeypatch,
+        page_responses=[
+            FakePageResponse(
+                _detail_response()["payload"],
+                url=candidate_url,
+                method=method,
+            )
+        ],
+    )
+
+    detail = fetch_signed_aweme_detail(
+        AWEME_ID,
+        verification_url=VIDEO_URL,
+        expected_sec_uid=SEC_UID,
+        signer_settle_ms=0,
+    )
+
+    assert detail["aweme_id"] == AWEME_ID
+    assert page.goto_urls == [NOTE_URL, douyin_signing._SIGNING_PAGE_URL]
+    assert page.started is True
+    assert len(page.signed_requests) == 1
+    assert page.closed and context.closed and browser.closed
+    assert manager.resources_closed_on_exit is True
+
+
+def test_page_detail_capture_allows_same_item_note_redirect(monkeypatch) -> None:
+    note_url = f"https://www.douyin.com/note/{AWEME_ID}"
+    page, context, browser, manager = _install_fake_playwright(
+        monkeypatch,
+        _detail_response(aweme_id="7000000000000000000"),
+        page_responses=[FakePageResponse(_detail_response()["payload"])],
+        page_final_url=note_url,
+    )
+
+    detail = fetch_signed_aweme_detail(
+        AWEME_ID,
+        verification_url=VIDEO_URL,
+        expected_sec_uid=SEC_UID,
+        signer_settle_ms=0,
+    )
+
+    assert detail["aweme_id"] == AWEME_ID
+    assert page.goto_urls == [NOTE_URL]
+    assert page.url == note_url
+    assert page.started is False
+    assert page.closed and context.closed and browser.closed
+    assert manager.resources_closed_on_exit is True
+
+
+@pytest.mark.parametrize(
+    ("page_aweme_id", "page_sec_uid", "failure_pattern"),
+    [
+        ("7000000000000000000", SEC_UID, "different aweme"),
+        (AWEME_ID, "wrong-owner", "different author"),
+    ],
+)
+def test_bound_page_detail_fails_closed_on_explicit_identity_mismatch(
+    monkeypatch, page_aweme_id: str, page_sec_uid: str, failure_pattern: str
+) -> None:
+    mismatched_payload = _detail_response(
+        aweme_id=page_aweme_id,
+        sec_uid=page_sec_uid,
+    )["payload"]
+    page, context, browser, manager = _install_fake_playwright(
+        monkeypatch,
+        page_responses=[FakePageResponse(mismatched_payload)],
+    )
+
+    with pytest.raises(DiscoveryError) as captured:
+        fetch_signed_aweme_detail(
+            AWEME_ID,
+            verification_url=VIDEO_URL,
+            expected_sec_uid=SEC_UID,
+            signer_settle_ms=0,
+        )
+
+    assert isinstance(captured.value.__cause__, douyin_signing._IdentitySigningFailure)
+    assert failure_pattern in str(captured.value.__cause__)
+    assert page.goto_urls == [NOTE_URL]
+    assert page.started is False
+    assert page.signed_requests == []
+    assert page.closed and context.closed and browser.closed
+    assert manager.resources_closed_on_exit is True
+
+
+def test_direct_note_url_enables_bound_page_detail_capture(monkeypatch) -> None:
+    note_url = f"https://www.douyin.com/note/{AWEME_ID}"
+    page, context, browser, manager = _install_fake_playwright(
+        monkeypatch,
+        page_responses=[FakePageResponse(_detail_response()["payload"])],
+    )
+
+    detail = fetch_signed_aweme_detail(
+        AWEME_ID,
+        verification_url=note_url,
+        expected_sec_uid=SEC_UID,
+        signer_settle_ms=0,
+    )
+
+    assert detail["aweme_id"] == AWEME_ID
+    assert page.goto_urls == [NOTE_URL]
+    assert page.started is False
+    assert page.closed and context.closed and browser.closed
+    assert manager.resources_closed_on_exit is True
+
+
+def test_page_capture_miss_falls_back_to_synthetic_fetch(monkeypatch) -> None:
+    page, context, browser, manager = _install_fake_playwright(monkeypatch)
+
+    detail = fetch_signed_aweme_detail(
+        AWEME_ID,
+        verification_url=VIDEO_URL,
+        expected_sec_uid=SEC_UID,
+        signer_settle_ms=0,
+    )
+
+    assert detail["aweme_id"] == AWEME_ID
+    assert page.goto_urls == [NOTE_URL, douyin_signing._SIGNING_PAGE_URL]
+    assert page.started is True
+    assert page.response_handlers == []
+    assert page.closed and context.closed and browser.closed
+    assert manager.resources_closed_on_exit is True
+
+
+def test_images_base_page_candidate_falls_back_and_keeps_stable_reason(
+    monkeypatch,
+) -> None:
+    filtered_payload = {
+        "status_code": 0,
+        "aweme_detail": None,
+        "filter_detail": {"filter_reason": "images_base"},
+    }
+    page, context, browser, manager = _install_fake_playwright(
+        monkeypatch,
+        {
+            "state": "done",
+            "httpStatus": 200,
+            "payload": filtered_payload,
+        },
+        page_responses=[FakePageResponse(filtered_payload)],
+    )
+    monkeypatch.setattr(douyin_signing, "_DETAIL_REQUEST_ATTEMPTS", 1)
+    monkeypatch.setattr(douyin_signing, "_DETAIL_SIGNING_SESSION_ATTEMPTS", 1)
+
+    with pytest.raises(TemporaryAccessError) as captured:
+        fetch_signed_aweme_detail(
+            AWEME_ID,
+            verification_url=VIDEO_URL,
+            expected_sec_uid=SEC_UID,
+            signer_settle_ms=0,
+        )
+
+    assert captured.value.issue_code == SiteIssueCode.SITE_RESPONSE_CHANGED
+    assert "Reason category: api-filtered-images-base" in str(captured.value)
+    assert isinstance(captured.value.__cause__, _TransientSigningFailure)
+    assert "different aweme" not in str(captured.value).lower()
+    assert page.goto_urls == [NOTE_URL, douyin_signing._SIGNING_PAGE_URL]
+    assert page.started is True
+    assert page.closed and context.closed and browser.closed
+    assert manager.resources_closed_on_exit is True
+
+
+@pytest.mark.parametrize(
+    ("page_final_url", "page_html", "expected_issue"),
+    [
+        (
+            "https://www.douyin.com/login",
+            "<html><body>Normal page</body></html>",
+            SiteIssueCode.LOGIN_REQUIRED,
+        ),
+        (
+            f"https://www.douyin.com/video/{AWEME_ID}",
+            "<html><body>请完成验证</body></html>",
+            SiteIssueCode.VERIFICATION_REQUIRED,
+        ),
+    ],
+)
+def test_item_page_capture_preserves_explicit_auth_classification(
+    monkeypatch,
+    page_final_url: str,
+    page_html: str,
+    expected_issue: SiteIssueCode,
+) -> None:
+    page, context, browser, manager = _install_fake_playwright(
+        monkeypatch,
+        page_final_url=page_final_url,
+        page_html=page_html,
+    )
+
+    with pytest.raises(AuthenticationRequiredError) as captured:
+        fetch_signed_aweme_detail(
+            AWEME_ID,
+            verification_url=VIDEO_URL,
+            expected_sec_uid=SEC_UID,
+            signer_settle_ms=0,
+        )
+
+    assert captured.value.issue_code == expected_issue
+    assert captured.value.verification_url == VIDEO_URL
+    assert page.started is False
+    assert page.closed and context.closed and browser.closed
+    assert manager.resources_closed_on_exit is True
+
+
+def test_off_origin_page_body_cannot_manufacture_chrome_verification(
+    monkeypatch,
+) -> None:
+    page, context, browser, manager = _install_fake_playwright(
+        monkeypatch,
+        page_final_url="https://evil.example/login",
+        page_html="<html><body>请完成验证</body></html>",
+    )
+
+    detail = fetch_signed_aweme_detail(
+        AWEME_ID,
+        verification_url=VIDEO_URL,
+        expected_sec_uid=SEC_UID,
+        signer_settle_ms=0,
+    )
+
+    assert detail["aweme_id"] == AWEME_ID
+    assert page.goto_urls == [NOTE_URL, douyin_signing._SIGNING_PAGE_URL]
+    assert page.started is True
+    assert page.closed and context.closed and browser.closed
+    assert manager.resources_closed_on_exit is True
+
+
+def test_item_page_detail_response_preserves_explicit_login_classification(
+    monkeypatch,
+) -> None:
+    page, context, browser, manager = _install_fake_playwright(
+        monkeypatch,
+        page_responses=[
+            FakePageResponse(
+                {"status_code": 0, "aweme_detail": None},
+                status=401,
+            )
+        ],
+    )
+
+    with pytest.raises(AuthenticationRequiredError) as captured:
+        fetch_signed_aweme_detail(
+            AWEME_ID,
+            verification_url=VIDEO_URL,
+            expected_sec_uid=SEC_UID,
+            signer_settle_ms=0,
+        )
+
+    assert captured.value.issue_code == SiteIssueCode.LOGIN_REQUIRED
+    assert captured.value.verification_url == VIDEO_URL
+    assert page.goto_urls == [NOTE_URL]
+    assert page.started is False
+    assert page.closed and context.closed and browser.closed
+    assert manager.resources_closed_on_exit is True
+
+
+def test_profile_verification_url_does_not_enable_item_page_capture(
+    monkeypatch,
+) -> None:
+    page, context, browser, manager = _install_fake_playwright(
+        monkeypatch,
+        page_responses=[FakePageResponse(_detail_response()["payload"])],
+    )
+
+    detail = fetch_signed_aweme_detail(
+        AWEME_ID,
+        verification_url=PROFILE_URL,
+        expected_sec_uid=SEC_UID,
+        signer_settle_ms=0,
+    )
+
+    assert detail["aweme_id"] == AWEME_ID
+    assert page.goto_urls == [douyin_signing._SIGNING_PAGE_URL]
+    assert page.started is True
+    assert page.closed and context.closed and browser.closed
+    assert manager.resources_closed_on_exit is True
 
 
 def test_dnsfilter_replacement_page_maps_to_actionable_network_error(
@@ -1023,7 +2029,7 @@ def test_dnsfilter_replacement_page_maps_to_actionable_network_error(
     assert "Chrome verification is not required" in message
     assert source_fetches == 1
     assert context.request.requested_url is None
-    assert context.new_page_calls == 0
+    assert context.new_page_calls == 1
     assert page.started is False
     assert context.closed is True
     assert browser.closed is True

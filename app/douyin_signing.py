@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import html
+import json
 import re
 import threading
 import time
@@ -9,7 +10,7 @@ from html.parser import HTMLParser
 from http.cookiejar import CookieJar
 from typing import Any, Callable
 from urllib.error import HTTPError as UrllibHTTPError
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 from urllib.request import HTTPCookieProcessor, Request, build_opener
 
 from yt_dlp.cookies import extract_cookies_from_browser
@@ -49,6 +50,16 @@ _SIGNED_NO_PROGRESS_TIMEOUT_SECONDS = 120.0
 _MAX_GLUE_TAGS = 16
 _MAX_GLUE_BYTES = 1_000_000
 _MAX_SOURCE_HTML_BYTES = 5_000_000
+_MAX_PAGE_DETAIL_BODY_BYTES = 2_000_000
+_MAX_PACE_ENTRIES = 64
+_MAX_PACE_FRAGMENT_BYTES = 1_000_000
+_MAX_PACE_TOTAL_BYTES = 2_000_000
+_MAX_FLIGHT_FRAMES = 256
+_MAX_FLIGHT_FRAME_BYTES = 1_000_000
+_MAX_FLIGHT_JSON_RECORDS = 128
+_MAX_SSR_IMAGES = 100
+_MAX_SSR_MEDIA_URLS = 5
+_MAX_SSR_MEDIA_URL_BYTES = 8_192
 _SIGNED_FETCH_LOCK = threading.Lock()
 _TRANSIENT_HTTP_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
 _TRUSTED_DOUYIN_AUTH_HOSTS = frozenset(
@@ -224,6 +235,10 @@ class _SigningFailure(RuntimeError):
     pass
 
 
+class _IdentitySigningFailure(_SigningFailure):
+    pass
+
+
 class _TransientSigningFailure(_SigningFailure):
     def __init__(self, message: str, *, category: str = "transient") -> None:
         super().__init__(message)
@@ -381,6 +396,9 @@ def _douyin_target(value: str) -> tuple[str, str] | None:
     video_match = re.fullmatch(r"/video/([0-9]+)/?", path)
     if video_match:
         return "video", video_match.group(1)
+    note_match = re.fullmatch(r"/note/([0-9]+)/?", path)
+    if note_match:
+        return "video", note_match.group(1)
     return None
 
 
@@ -533,6 +551,8 @@ def _has_explicit_rate_limit_api_message(payload: Any) -> bool:
     message = str(
         payload.get("status_msg")
         or payload.get("status_message")
+        or payload.get("statusMsg")
+        or payload.get("statusMessage")
         or payload.get("message")
         or ""
     ).lower()
@@ -545,6 +565,8 @@ def _explicit_auth_api_issue_code(payload: Any) -> SiteIssueCode | None:
     message = str(
         payload.get("status_msg")
         or payload.get("status_message")
+        or payload.get("statusMsg")
+        or payload.get("statusMessage")
         or payload.get("message")
         or ""
     ).lower()
@@ -1262,11 +1284,23 @@ def _validate_detail_response(
 ) -> dict[str, Any]:
     payload = _validated_payload(response, "detail")
     detail = payload.get("aweme_detail")
+    filter_details = [payload.get("filter_detail")]
+    if isinstance(detail, dict):
+        filter_details.append(detail.get("filter_detail"))
+    if any(
+        isinstance(value, dict)
+        and str(value.get("filter_reason") or "").strip().lower() == "images_base"
+        for value in filter_details
+    ):
+        raise _TransientSigningFailure(
+            "Douyin detail API returned an images_base-filtered minimal detail",
+            category="api-filtered-images-base",
+        )
     if not isinstance(detail, dict):
         raise _SigningFailure("Douyin detail API returned no aweme detail")
     actual_aweme_id = str(detail.get("aweme_id") or "").strip()
     if actual_aweme_id != aweme_id:
-        raise _SigningFailure("Douyin detail API returned a different aweme")
+        raise _IdentitySigningFailure("Douyin detail API returned a different aweme")
     author = detail.get("author")
     if not isinstance(author, dict):
         raise _SigningFailure("Douyin detail API returned no author")
@@ -1274,7 +1308,7 @@ def _validate_detail_response(
     if not actual_sec_uid:
         raise _SigningFailure("Douyin detail API returned no author identity")
     if expected_sec_uid and actual_sec_uid != expected_sec_uid:
-        raise _SigningFailure("Douyin detail API returned a different author")
+        raise _IdentitySigningFailure("Douyin detail API returned a different author")
     return detail
 
 
@@ -1348,6 +1382,628 @@ def _close_resources(*resources: Any | None) -> None:
                 resource.close()
 
 
+def _is_target_page_detail_url(value: Any, aweme_id: str) -> bool:
+    try:
+        parsed = urlsplit(str(value))
+        hostname = (parsed.hostname or "").lower().rstrip(".")
+        if (
+            parsed.scheme != "https"
+            or not hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or not (hostname == "douyin.com" or hostname.endswith(".douyin.com"))
+            or parsed.port not in {None, 443}
+            or parsed.path != _DETAIL_API_PATH
+        ):
+            return False
+        return parse_qs(parsed.query, keep_blank_values=True).get("aweme_id") == [
+            aweme_id
+        ]
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_target_page_detail_request(request: Any, aweme_id: str) -> bool:
+    return str(getattr(request, "method", "")) == "GET" and (
+        _is_target_page_detail_url(getattr(request, "url", ""), aweme_id)
+    )
+
+
+_READ_PACE_FLIGHT_SCRIPT = r"""
+({ maxEntries, maxFragmentBytes, maxTotalBytes }) => {
+  const source = self.__pace_f;
+  if (!Array.isArray(source)) return { state: "missing" };
+  if (source.length > maxEntries) return { state: "too_many_entries" };
+  const encoder = new TextEncoder();
+  const fragments = [];
+  let totalBytes = 0;
+  for (const entry of source) {
+    if (!Array.isArray(entry) || entry[0] !== 1) continue;
+    const value = entry[1];
+    if (typeof value !== "string") return { state: "invalid_fragment" };
+    // Reject huge UTF-16 strings before asking TextEncoder to allocate a second
+    // equally large buffer. The byte check below remains authoritative.
+    if (value.length > maxFragmentBytes) return { state: "fragment_too_large" };
+    const byteLength = encoder.encode(value).byteLength;
+    if (byteLength > maxFragmentBytes) return { state: "fragment_too_large" };
+    totalBytes += byteLength;
+    if (totalBytes > maxTotalBytes) return { state: "stream_too_large" };
+    fragments.push(value);
+  }
+  return { state: "done", fragments, totalBytes };
+}
+"""
+
+
+def _parse_flight_json_records(fragments: Any) -> list[Any]:
+    if not isinstance(fragments, list) or len(fragments) > _MAX_PACE_ENTRIES:
+        raise _SigningFailure("Douyin SSR returned an invalid Flight fragment list")
+    encoded_fragments: list[bytes] = []
+    total_bytes = 0
+    for fragment in fragments:
+        if not isinstance(fragment, str):
+            raise _SigningFailure("Douyin SSR returned a non-text Flight fragment")
+        encoded = fragment.encode("utf-8")
+        if len(encoded) > _MAX_PACE_FRAGMENT_BYTES:
+            raise _SigningFailure("Douyin SSR Flight fragment was unexpectedly large")
+        total_bytes += len(encoded)
+        if total_bytes > _MAX_PACE_TOTAL_BYTES:
+            raise _SigningFailure("Douyin SSR Flight stream was unexpectedly large")
+        encoded_fragments.append(encoded)
+
+    stream = b"".join(encoded_fragments)
+    offset = 0
+    frame_count = 0
+    json_values: list[Any] = []
+    while offset < len(stream):
+        frame_count += 1
+        if frame_count > _MAX_FLIGHT_FRAMES:
+            raise _SigningFailure("Douyin SSR returned too many Flight frames")
+        colon = stream.find(b":", offset, min(len(stream), offset + 18))
+        if colon < 0 or not re.fullmatch(rb"[0-9A-Fa-f]+", stream[offset:colon]):
+            raise _SigningFailure("Douyin SSR returned an invalid Flight frame header")
+        payload_offset = colon + 1
+        if stream[payload_offset : payload_offset + 1] == b"T":
+            comma = stream.find(
+                b",",
+                payload_offset + 1,
+                min(len(stream), payload_offset + 18),
+            )
+            length_text = stream[payload_offset + 1 : comma] if comma >= 0 else b""
+            if comma < 0 or not re.fullmatch(rb"[0-9A-Fa-f]+", length_text):
+                raise _SigningFailure(
+                    "Douyin SSR returned an invalid Flight text frame length"
+                )
+            byte_length = int(length_text, 16)
+            if byte_length > _MAX_FLIGHT_FRAME_BYTES:
+                raise _SigningFailure(
+                    "Douyin SSR Flight text frame was unexpectedly large"
+                )
+            frame_end = comma + 1 + byte_length
+            if frame_end > len(stream):
+                raise _SigningFailure(
+                    "Douyin SSR returned a truncated Flight text frame"
+                )
+            offset = frame_end
+            if stream[offset : offset + 1] == b"\n":
+                offset += 1
+            continue
+
+        newline = stream.find(b"\n", payload_offset)
+        if newline < 0:
+            newline = len(stream)
+        payload = stream[payload_offset:newline]
+        if len(payload) > _MAX_FLIGHT_FRAME_BYTES:
+            raise _SigningFailure("Douyin SSR Flight frame was unexpectedly large")
+        offset = newline + 1 if newline < len(stream) else newline
+        if not payload or payload[:1] not in b'[{"-0123456789tfn':
+            continue
+        if len(json_values) >= _MAX_FLIGHT_JSON_RECORDS:
+            raise _SigningFailure("Douyin SSR returned too many JSON Flight frames")
+        try:
+            json_values.append(json.loads(payload.decode("utf-8")))
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+            # React Flight also has non-JSON record kinds. A record that merely
+            # begins like JSON is not authoritative unless it fully decodes.
+            continue
+    return json_values
+
+
+def _ssr_media_urls(value: Any, *, nested_src: bool) -> list[str]:
+    if not isinstance(value, list) or not value:
+        return []
+    if len(value) > _MAX_SSR_MEDIA_URLS:
+        raise _SigningFailure("Douyin SSR returned too many media URL candidates")
+    result: list[str] = []
+    for candidate in value:
+        candidate = (
+            candidate.get("src")
+            if nested_src and isinstance(candidate, dict)
+            else candidate
+        )
+        if (
+            not isinstance(candidate, str)
+            or not candidate
+            or len(candidate.encode("utf-8")) > _MAX_SSR_MEDIA_URL_BYTES
+        ):
+            return []
+        if candidate not in result:
+            result.append(candidate)
+    return result
+
+
+def _ssr_video_address(
+    source: dict[str, Any],
+    address_key: str,
+    *,
+    data_size_key: str,
+) -> dict[str, Any] | None:
+    urls = _ssr_media_urls(source.get(address_key), nested_src=True)
+    if not urls:
+        return None
+    return {
+        "uri": source.get("uri"),
+        "url_list": urls,
+        "width": source.get("width"),
+        "height": source.get("height"),
+        "data_size": source.get(data_size_key) or source.get("dataSize"),
+    }
+
+
+def _adapt_ssr_video(source: Any) -> dict[str, Any] | None:
+    if not isinstance(source, dict) or not source:
+        return None
+    result: dict[str, Any] = {
+        "uri": source.get("uri"),
+        "width": source.get("width"),
+        "height": source.get("height"),
+        "duration": source.get("duration"),
+        "data_size": source.get("dataSize"),
+    }
+    address_fields = (
+        ("playAddr", "play_addr", "playAddrSize"),
+        ("playAddrH264", "play_addr_h264", "playAddrH264Size"),
+        ("playAddrH265", "play_addr_265", "playAddrH265Size"),
+        ("playAddrBytevc1", "play_addr_bytevc1", "playAddrBytevc1Size"),
+    )
+    for source_key, result_key, size_key in address_fields:
+        address = _ssr_video_address(source, source_key, data_size_key=size_key)
+        if address is not None:
+            result[result_key] = address
+
+    raw_bit_rates = source.get("bitRateList")
+    if raw_bit_rates is not None:
+        if not isinstance(raw_bit_rates, list) or len(raw_bit_rates) > 64:
+            raise _SigningFailure("Douyin SSR returned invalid video bitrates")
+        bit_rates: list[dict[str, Any]] = []
+        for value in raw_bit_rates:
+            if not isinstance(value, dict):
+                raise _SigningFailure("Douyin SSR returned an invalid video bitrate")
+            address = _ssr_video_address(
+                value,
+                "playAddr",
+                data_size_key="dataSize",
+            )
+            if address is None:
+                continue
+            bit_rates.append(
+                {
+                    "bit_rate": value.get("bitRate"),
+                    "real_bit_rate": value.get("realBitrate"),
+                    "is_h265": value.get("isH265"),
+                    "is_bytevc1": value.get("isBytevc1"),
+                    "width": value.get("width"),
+                    "height": value.get("height"),
+                    "format": value.get("format"),
+                    "play_addr": address,
+                }
+            )
+        if bit_rates:
+            result["bit_rate"] = bit_rates
+    return result
+
+
+def _adapt_ssr_aweme_detail(detail: dict[str, Any]) -> dict[str, Any]:
+    author_info = detail.get("authorInfo")
+    if not isinstance(author_info, dict):
+        raise _SigningFailure("Douyin SSR item returned no author")
+    author = {
+        "sec_uid": author_info.get("secUid"),
+        "nickname": author_info.get("nickname"),
+    }
+    result: dict[str, Any] = {
+        "aweme_id": detail.get("awemeId"),
+        "aweme_type": detail.get("awemeType"),
+        "media_type": detail.get("mediaType"),
+        "create_time": detail.get("createTime"),
+        "desc": detail.get("desc"),
+        "item_title": detail.get("itemTitle"),
+        "author": author,
+    }
+    raw_images = detail.get("images")
+    if raw_images is not None:
+        if not isinstance(raw_images, list) or len(raw_images) > _MAX_SSR_IMAGES:
+            raise _SigningFailure("Douyin SSR returned an invalid image list")
+        images: list[dict[str, Any]] = []
+        for value in raw_images:
+            if not isinstance(value, dict):
+                raise _SigningFailure("Douyin SSR returned an invalid image")
+            image: dict[str, Any] = {
+                "uri": value.get("uri"),
+                "width": value.get("width"),
+                "height": value.get("height"),
+                "url_list": _ssr_media_urls(
+                    value.get("urlList"),
+                    nested_src=False,
+                ),
+                "download_url_list": _ssr_media_urls(
+                    value.get("downloadUrlList"),
+                    nested_src=False,
+                ),
+            }
+            video = _adapt_ssr_video(value.get("video"))
+            if video is not None:
+                image["video"] = video
+            images.append(image)
+        result["images"] = images
+    video = _adapt_ssr_video(detail.get("video"))
+    if video is not None:
+        result["video"] = video
+    return result
+
+
+def _validated_ssr_wrapper_detail(
+    wrapper: dict[str, Any],
+    aweme_id: str,
+    expected_sec_uid: str | None,
+) -> dict[str, Any]:
+    for payload, label in ((wrapper, "page"), (wrapper.get("aweme"), "item")):
+        if not isinstance(payload, dict):
+            raise _SigningFailure(f"Douyin SSR returned no {label} data")
+        status_code = payload.get("statusCode")
+        if type(status_code) is not int or status_code != 0:
+            auth_issue = _explicit_auth_api_issue_code(payload)
+            if auth_issue is not None:
+                raise _AuthenticationSigningFailure(
+                    f"Douyin SSR {label} requires authentication",
+                    issue_code=auth_issue,
+                )
+            if _has_explicit_rate_limit_api_message(payload):
+                raise _TransientSigningFailure(
+                    f"Douyin SSR {label} was explicitly rate-limited",
+                    category="api-rate-limit",
+                )
+            raise _TransientSigningFailure(
+                f"Douyin SSR {label} returned a nonzero status",
+                category="ssr-status-nonzero",
+            )
+    if wrapper.get("redirect") is not False:
+        raise _IdentitySigningFailure("Douyin SSR item requested a redirect")
+    if wrapper.get("isSpider") is not False:
+        raise _TransientSigningFailure(
+            "Douyin SSR returned a spider response",
+            category="ssr-spider-response",
+        )
+    aweme = wrapper["aweme"]
+    if aweme.get("isUnknownAweme") is not False:
+        raise _IdentitySigningFailure("Douyin SSR returned an unknown aweme")
+    detail = aweme.get("detail")
+    if not isinstance(detail, dict):
+        raise _SigningFailure("Douyin SSR returned no aweme detail")
+    actual_aweme_id = str(detail.get("awemeId") or "").strip()
+    group_id = str(detail.get("groupId") or "").strip()
+    if actual_aweme_id != aweme_id or group_id != aweme_id:
+        raise _IdentitySigningFailure("Douyin SSR returned a different aweme")
+    author = detail.get("authorInfo")
+    if not isinstance(author, dict):
+        raise _SigningFailure("Douyin SSR item returned no author")
+    actual_sec_uid = str(author.get("secUid") or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{10,200}", actual_sec_uid):
+        raise _SigningFailure("Douyin SSR returned no valid author identity")
+    if expected_sec_uid and actual_sec_uid != expected_sec_uid:
+        raise _IdentitySigningFailure("Douyin SSR returned a different author")
+    return _adapt_ssr_aweme_detail(detail)
+
+
+def _extract_ssr_aweme_detail(
+    fragments: Any,
+    aweme_id: str,
+    expected_sec_uid: str | None,
+) -> dict[str, Any] | None:
+    candidates: list[dict[str, Any]] = []
+    for value in _parse_flight_json_records(fragments):
+        if not isinstance(value, list) or len(value) < 4:
+            continue
+        wrapper = value[3]
+        if not isinstance(wrapper, dict) or "awemeId" not in wrapper:
+            continue
+        if str(wrapper.get("awemeId") or "").strip() != aweme_id:
+            continue
+        candidates.append(
+            _validated_ssr_wrapper_detail(wrapper, aweme_id, expected_sec_uid)
+        )
+    if not candidates:
+        return None
+    first = candidates[0]
+    if any(value != first for value in candidates[1:]):
+        raise _IdentitySigningFailure(
+            "Douyin SSR returned conflicting copies of the requested aweme"
+        )
+    return first
+
+
+def _read_ssr_aweme_detail_from_page(
+    page: Any,
+    aweme_id: str,
+    expected_sec_uid: str | None,
+) -> dict[str, Any] | None:
+    try:
+        snapshot = page.evaluate(
+            _READ_PACE_FLIGHT_SCRIPT,
+            {
+                "maxEntries": _MAX_PACE_ENTRIES,
+                "maxFragmentBytes": _MAX_PACE_FRAGMENT_BYTES,
+                "maxTotalBytes": _MAX_PACE_TOTAL_BYTES,
+            },
+        )
+    except Exception:
+        # A normal-video redirect can briefly destroy the note execution context.
+        # The completed response capture or existing signed-request path remains
+        # authoritative, and page authentication/DNS state is checked separately.
+        return None
+    if snapshot is None or (
+        isinstance(snapshot, dict) and snapshot.get("state") == "missing"
+    ):
+        return None
+    if not isinstance(snapshot, dict):
+        raise _SigningFailure("Douyin SSR returned an invalid Flight capture")
+    if snapshot.get("state") != "done":
+        raise _SigningFailure("Douyin SSR exceeded its bounded Flight capture limits")
+    return _extract_ssr_aweme_detail(
+        snapshot.get("fragments"),
+        aweme_id,
+        expected_sec_uid,
+    )
+
+
+class _PageDetailCapture:
+    def __init__(self, aweme_id: str, expected_sec_uid: str | None) -> None:
+        self.aweme_id = aweme_id
+        self.expected_sec_uid = expected_sec_uid
+        self.detail: dict[str, Any] | None = None
+        self.authentication_failure: _AuthenticationSigningFailure | None = None
+        self.identity_failure: _IdentitySigningFailure | None = None
+        self.terminal_failure: _SigningFailure | None = None
+
+    def handle_request_finished(self, request: Any) -> None:
+        if (
+            self.detail is not None
+            or self.authentication_failure is not None
+            or self.identity_failure is not None
+            or self.terminal_failure is not None
+            or not _is_target_page_detail_request(request, self.aweme_id)
+        ):
+            return
+        try:
+            response = request.response()
+            if response is None:
+                return
+            response_url = str(getattr(response, "url", "") or "")
+            if _is_dns_filter_block_url(response_url):
+                raise _NetworkFilterSigningFailure(
+                    "A local DNS or web filter redirected the Douyin detail response"
+                )
+            auth_issue = _explicit_auth_url_issue_code(response_url)
+            if auth_issue is not None:
+                raise _AuthenticationSigningFailure(
+                    "Douyin detail response redirected to authentication",
+                    issue_code=auth_issue,
+                )
+            if not _is_target_page_detail_url(response_url, self.aweme_id):
+                raise _IdentitySigningFailure(
+                    "Douyin detail response redirected outside its bound endpoint"
+                )
+            body = response.body()
+            if not isinstance(body, (bytes, bytearray)):
+                raise _SigningFailure(
+                    "Douyin detail response returned no complete body"
+                )
+            if len(body) > _MAX_PAGE_DETAIL_BODY_BYTES:
+                raise _SigningFailure(
+                    "Douyin detail response body was unexpectedly large"
+                )
+            try:
+                body_text = bytes(body).decode("utf-8")
+                payload = json.loads(body_text)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                body_text = bytes(body).decode("utf-8", errors="replace")
+                _raise_if_dns_filter_block_page(body_text)
+                html_auth_issue = _explicit_auth_html_issue_code(body_text)
+                if html_auth_issue is not None:
+                    raise _AuthenticationSigningFailure(
+                        "Douyin detail response displayed authentication",
+                        issue_code=html_auth_issue,
+                    )
+                return
+            detail = _validate_detail_response(
+                {
+                    "httpStatus": getattr(response, "status", None),
+                    "payload": payload,
+                },
+                self.aweme_id,
+                self.expected_sec_uid,
+            )
+        except _AuthenticationSigningFailure as exc:
+            self.authentication_failure = exc
+            return
+        except _IdentitySigningFailure as exc:
+            self.identity_failure = exc
+            return
+        except _NetworkFilterSigningFailure as exc:
+            self.terminal_failure = exc
+            return
+        except _SigningFailure as exc:
+            if "unexpectedly large" in str(exc):
+                self.terminal_failure = exc
+            return
+        except Exception:
+            # Page startup can issue incomplete detail requests before the complete
+            # item response. Only a fully validated response is authoritative; all
+            # other candidates safely fall back to the synthetic signed request.
+            return
+        self.detail = detail
+
+
+def _wait_for_page_detail_capture(
+    page: Any,
+    capture: _PageDetailCapture,
+    timeout_ms: int,
+    should_cancel: CancelCallback | None,
+    *,
+    budget: _NoProgressBudget,
+) -> None:
+    effective_timeout_ms = budget.clamp_timeout_ms(max(1, timeout_ms))
+    deadline = time.monotonic() + effective_timeout_ms / 1_000
+    while (
+        capture.detail is None
+        and capture.authentication_failure is None
+        and capture.identity_failure is None
+        and capture.terminal_failure is None
+        and time.monotonic() < deadline
+    ):
+        _raise_if_cancelled(should_cancel)
+        budget.remaining_seconds()
+        interval = min(
+            _POLL_INTERVAL_MS,
+            max(1, int((deadline - time.monotonic()) * 1_000)),
+        )
+        page.wait_for_timeout(min(interval, budget.clamp_timeout_ms(interval)))
+
+
+def _capture_detail_from_item_page(
+    page: Any,
+    verification_url: str,
+    aweme_id: str,
+    expected_sec_uid: str | None,
+    navigation_timeout_ms: int,
+    settle_timeout_ms: int,
+    should_cancel: CancelCallback | None,
+    *,
+    budget: _NoProgressBudget,
+    status_callback: StatusCallback | None,
+) -> dict[str, Any] | None:
+    del verification_url
+    capture = _PageDetailCapture(aweme_id, expected_sec_uid)
+    handler_registered = False
+    navigation_url = f"https://www.douyin.com/note/{aweme_id}"
+
+    def validate_page_state() -> str:
+        final_url = str(getattr(page, "url", "") or "")
+        if _is_dns_filter_block_url(final_url):
+            raise _NetworkFilterSigningFailure(
+                "A local DNS or web filter redirected the Douyin item page"
+            )
+        redirect_issue = _explicit_auth_url_issue_code(final_url)
+        if redirect_issue is not None:
+            raise _AuthenticationSigningFailure(
+                "Douyin item page redirected to an explicit authentication page",
+                issue_code=redirect_issue,
+            )
+        if _douyin_target(final_url) != ("video", aweme_id):
+            # Off-origin and unrelated pages are never allowed to manufacture an
+            # authentication prompt from arbitrary body text. Trusted explicit
+            # auth URLs were handled above; inline auth text is authoritative only
+            # on the exact bound item page.
+            return final_url
+        try:
+            source_html = page.content()
+        except Exception:
+            source_html = ""
+        if source_html:
+            _raise_if_dns_filter_block_page(source_html)
+            html_auth_issue = _explicit_auth_html_issue_code(source_html)
+            if html_auth_issue is not None:
+                raise _AuthenticationSigningFailure(
+                    "Douyin item page displayed an explicit authentication request",
+                    issue_code=html_auth_issue,
+                )
+        return final_url
+
+    def captured_or_ssr_detail(final_url: str) -> dict[str, Any] | None:
+        if capture.authentication_failure is not None:
+            raise capture.authentication_failure
+        if capture.identity_failure is not None:
+            raise capture.identity_failure
+        if capture.terminal_failure is not None:
+            raise capture.terminal_failure
+        if _douyin_target(final_url) != ("video", aweme_id):
+            return None
+        if capture.detail is not None:
+            return capture.detail
+        try:
+            return _read_ssr_aweme_detail_from_page(
+                page,
+                aweme_id,
+                expected_sec_uid,
+            )
+        except (
+            _AuthenticationSigningFailure,
+            _IdentitySigningFailure,
+            _NetworkFilterSigningFailure,
+            _TransientSigningFailure,
+        ):
+            raise
+        except _SigningFailure:
+            # SSR is an optional exact-item candidate. A bounded parser miss or a
+            # future Flight layout must not prevent the existing exact signed API
+            # from producing independently verified metadata.
+            return None
+
+    try:
+        page.on("requestfinished", capture.handle_request_finished)
+        handler_registered = True
+        _emit_status(status_callback, "Opening the original Douyin item page")
+        try:
+            page.goto(
+                navigation_url,
+                wait_until="domcontentloaded",
+                timeout=budget.clamp_timeout_ms(navigation_timeout_ms),
+            )
+        except (DownloadCancelledError, _SigningNoProgressTimeout):
+            raise
+        except Exception:
+            # A committed item page can emit the complete detail response before
+            # Playwright reports a later navigation timeout. The final page binding
+            # and the validated response remain authoritative in that case.
+            pass
+
+        _raise_if_cancelled(should_cancel)
+        budget.remaining_seconds()
+        final_url = validate_page_state()
+        detail = captured_or_ssr_detail(final_url)
+        if detail is not None:
+            return detail
+
+        if settle_timeout_ms > 0:
+            _wait_for_page_detail_capture(
+                page,
+                capture,
+                settle_timeout_ms,
+                should_cancel,
+                budget=budget,
+            )
+        _raise_if_cancelled(should_cancel)
+        budget.remaining_seconds()
+        final_url = validate_page_state()
+        return captured_or_ssr_detail(final_url)
+    finally:
+        if handler_registered:
+            remover = getattr(page, "remove_listener", None)
+            if callable(remover):
+                with contextlib.suppress(Exception):
+                    remover("requestfinished", capture.handle_request_finished)
+
+
 def _run_with_signing_page(
     verification_url: str,
     *,
@@ -1359,6 +2015,8 @@ def _run_with_signing_page(
     budget: _NoProgressBudget,
     status_callback: StatusCallback | None,
     operation: Callable[[Any], Any],
+    page_detail_aweme_id: str | None = None,
+    page_detail_expected_sec_uid: str | None = None,
 ) -> Any:
     browser: Any | None = None
     context: Any | None = None
@@ -1399,6 +2057,24 @@ def _run_with_signing_page(
                 context.add_cookies(browser_cookies)
                 _raise_if_cancelled(should_cancel)
                 budget.remaining_seconds()
+
+                page = context.new_page()
+
+                if page_detail_aweme_id is not None:
+                    captured_detail = _capture_detail_from_item_page(
+                        page,
+                        verification_url,
+                        page_detail_aweme_id,
+                        page_detail_expected_sec_uid,
+                        navigation_timeout_ms,
+                        signer_settle_ms,
+                        should_cancel,
+                        budget=budget,
+                        status_callback=status_callback,
+                    )
+                    if captured_detail is not None:
+                        return captured_detail
+
                 user_agent = chrome_user_agent(browser.version)
                 glue_tags, cookie_jar_updated = _extract_glue_with_context_fallback(
                     context,
@@ -1415,8 +2091,6 @@ def _run_with_signing_page(
                 signing_document = _build_signing_document(glue_tags)
                 _raise_if_cancelled(should_cancel)
                 budget.remaining_seconds()
-
-                page = context.new_page()
 
                 def serve_signing_page(route: Any) -> None:
                     route.fulfill(
@@ -1684,6 +2358,10 @@ def fetch_signed_aweme_detail(
                         budget=budget,
                         status_callback=status_callback,
                         operation=fetch_detail,
+                        page_detail_aweme_id=(
+                            aweme_id if verification_kind == "video" else None
+                        ),
+                        page_detail_expected_sec_uid=expected_sec_uid,
                     )
                 except _SigningNoProgressTimeout:
                     raise
