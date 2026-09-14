@@ -249,6 +249,18 @@ def test_douyin_redirect_messages_execute_with_safe_legacy_and_reason_parsing(
             "are still in use.",
             "程序仍在使用之前的设置。请检查磁盘剩余空间",
         ),
+        (
+            "Douyin media was discovered, but its highest quality could not be "
+            "verified. Probe details: author-feed-3: verified media was below "
+            "the author-feed 1080x1920 rendition (measured 720x1280)",
+            "该地址声明 1080×1920，实际文件只有 720×1280",
+        ),
+        (
+            "Douyin Live Photo author-feed quality source could not be verified. "
+            "Probe details: author-feed-2: verified media was below the "
+            "author-feed 1440x2560 rendition (measured 1080x1920)",
+            "该地址声明 1440×2560，实际文件只有 1080×1920",
+        ),
     ]
     harness = (
         "globalThis.window = {};\n"
@@ -290,11 +302,13 @@ def test_douyin_redirect_messages_execute_with_safe_legacy_and_reason_parsing(
     assert "无法判断" in messages[9]
     assert "代理或 VPN" in messages[9]
     assert "不需要打开 Chrome 验证" in messages[9]
-    assert "稍后从原链接新建任务" in messages[-4]
-    assert "明确无水印的动态图版本" in messages[-3]
-    assert "Some Douyin image positions" not in messages[-3]
-    assert "关闭 DNS 过滤、切换网络" in messages[-2]
+    assert "稍后从原链接新建任务" in messages[-6]
+    assert "明确无水印的动态图版本" in messages[-5]
+    assert "Some Douyin image positions" not in messages[-5]
+    assert "关闭 DNS 过滤、切换网络" in messages[-4]
+    assert "不需要打开 Chrome 验证" in messages[-4]
     assert "不需要打开 Chrome 验证" in messages[-2]
+    assert "检查备用源" in messages[-2]
 
 
 def test_interrupted_job_labels_queued_items_as_waiting_to_continue(

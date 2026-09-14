@@ -116,6 +116,138 @@ def exception_chain(exc: BaseException) -> list[dict[str, Any]]:
     return result
 
 
+def quality_metrics(value: Any) -> dict[str, int | None]:
+    """Copy bounded numeric fields only; never serialize media response payloads."""
+    value = value if isinstance(value, dict) else {}
+    bounds = {
+        "width": 16_384,
+        "height": 16_384,
+        "bit_rate": 10**12,
+        "filesize": 10**15,
+    }
+    return {
+        field: (
+            raw if type(raw := value.get(field)) is int and 0 <= raw <= bound else None
+        )
+        for field, bound in bounds.items()
+    }
+
+
+@contextlib.contextmanager
+def observe_quality_probes(engine: MediaDownloader, reports: list[dict[str, Any]]):
+    """Observe real selectors and probes without replacing their decisions."""
+    original_video = engine._add_douyin_probe_formats_scoped
+    original_live_photo = engine._select_highest_douyin_live_photo_asset_scoped
+    original_probe = engine._probe_douyin_ratio_with_retry
+    original_unresolved = engine._unresolved_douyin_direct_failures
+    active_scopes: list[dict[str, Any] | None] = []
+
+    @contextlib.contextmanager
+    def observed_scope(kind, candidates):
+        record = None
+        if len(reports) < 32:
+            candidates = candidates if isinstance(candidates, (list, tuple)) else []
+            record = {
+                "kind": kind,
+                "status": "running",
+                "declared_candidates": [
+                    quality_metrics(value) for value in candidates[:16]
+                ],
+                "probes": [],
+            }
+            reports.append(record)
+        active_scopes.append(record)
+        try:
+            yield
+        except BaseException:
+            if record is not None:
+                record["status"] = "raised"
+            raise
+        else:
+            if record is not None:
+                record["status"] = "returned"
+        finally:
+            active_scopes.pop()
+
+    def observed_video(ydl, info, *args, **kwargs):
+        candidates = (
+            info.get("_douyin_direct_candidates") if isinstance(info, dict) else []
+        )
+        with observed_scope("video", candidates):
+            return original_video(ydl, info, *args, **kwargs)
+
+    def observed_live_photo(ydl, asset, *args, **kwargs):
+        with observed_scope("live_photo", getattr(asset, "quality_candidates", None)):
+            return original_live_photo(ydl, asset, *args, **kwargs)
+
+    def observed_probe(ydl, candidate_url, *args, **kwargs):
+        scope = active_scopes[-1] if active_scopes else None
+        record = None
+        if scope is not None and len(scope["probes"]) < 120:
+            raw_label = kwargs.get("ratio")
+            label = (
+                raw_label
+                if isinstance(raw_label, str)
+                and re.fullmatch(r"default|author-feed-[1-9][0-9]{0,2}", raw_label)
+                else "other"
+            )
+            record = {
+                "label": label,
+                "endpoint_attempt": 1
+                + sum(probe["label"] == label for probe in scope["probes"]),
+                "status": "running",
+            }
+            scope["probes"].append(record)
+        try:
+            result = original_probe(ydl, candidate_url, *args, **kwargs)
+        except BaseException:
+            if record is not None:
+                record["status"] = "raised"
+            raise
+        if record is not None:
+            record["status"] = "returned" if result else "empty"
+            record["measured"] = quality_metrics(result)
+            if record["label"].startswith("author-feed-"):
+                index = int(record["label"].rsplit("-", 1)[1]) - 1
+                if index < len(scope["declared_candidates"]):
+                    declared = scope["declared_candidates"][index]
+                    measured = record["measured"]
+                    dimensions = [
+                        declared["width"],
+                        declared["height"],
+                        measured["width"],
+                        measured["height"],
+                    ]
+                    if all(value is not None and value > 0 for value in dimensions):
+                        record["meets_declared_dimensions"] = min(
+                            dimensions[2:]
+                        ) >= min(dimensions[:2]) and max(dimensions[2:]) >= max(
+                            dimensions[:2]
+                        )
+        return result
+
+    def observed_unresolved(*args, **kwargs):
+        result = original_unresolved(*args, **kwargs)
+        scope = active_scopes[-1] if active_scopes else None
+        if scope is not None and isinstance(result, list):
+            scope["unresolved_candidate_count"] = len(result)
+        return result
+
+    with (
+        mock.patch.object(engine, "_add_douyin_probe_formats_scoped", observed_video),
+        mock.patch.object(
+            engine,
+            "_select_highest_douyin_live_photo_asset_scoped",
+            observed_live_photo,
+        ),
+        mock.patch.object(engine, "_probe_douyin_ratio_with_retry", observed_probe),
+        mock.patch.object(
+            engine, "_unresolved_douyin_direct_failures", observed_unresolved
+        ),
+    ):
+        yield
+
+
 @contextlib.contextmanager
 def anonymous_browser_adapter(shapes: list[dict[str, Any]]):
     """Adapt only cookie access; preserve actual responses and validators."""
@@ -220,6 +352,7 @@ def _worker(url: str, media_id: str, output_dir: str, ffprobe: str, connection) 
         os.dup2(sink.fileno(), 2)
     stage = "identify"
     shapes: list[dict[str, Any]] = []
+    quality_reports: list[dict[str, Any]] = []
     last_event = ""
 
     def event_callback(event):
@@ -241,7 +374,10 @@ def _worker(url: str, media_id: str, output_dir: str, ffprobe: str, connection) 
             DownloaderConfig(cookie_browser="chrome", allow_cookie_fallback=False),
             discovery_callback=event_callback,
         )
-        with anonymous_browser_adapter(shapes):
+        with (
+            anonymous_browser_adapter(shapes),
+            observe_quality_probes(engine, quality_reports),
+        ):
             stage = "discover"
             connection.send({"stage": stage})
             discovery = engine.discover(info.url, info.platform, info.kind)
@@ -273,7 +409,7 @@ def _worker(url: str, media_id: str, output_dir: str, ffprobe: str, connection) 
         result["status"] = "passed"
     except Exception as exc:
         result["exception_chain"] = exception_chain(exc)
-    result.update(stage=stage, ssr_shapes=shapes)
+    result.update(stage=stage, ssr_shapes=shapes, quality_probes=quality_reports)
     connection.send({"result": result})
     connection.close()
 

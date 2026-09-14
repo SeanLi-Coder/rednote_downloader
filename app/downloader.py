@@ -558,6 +558,15 @@ class DownloadOutcome:
 
 
 @dataclass(slots=True)
+class _DouyinDirectProbeFailure:
+    rendition: dict[str, Any]
+    label: str
+    reason: str
+    transient: bool
+    all_sources_verified_lower: bool = False
+
+
+@dataclass(slots=True)
 class _DouyinProbeReuseContext:
     directory: Path
     files: dict[tuple[Any, ...], list[Path]] = field(default_factory=dict)
@@ -2734,7 +2743,7 @@ class MediaDownloader:
                 if isinstance(candidate, dict)
             ) + len(self._douyin_default_probe_urls(video_uri))
         direct_count = len(direct_candidates)
-        direct_failures: list[tuple[dict[str, Any], str, str, bool]] = []
+        direct_failures: list[_DouyinDirectProbeFailure] = []
         for index, candidate in enumerate(direct_candidates, start=1):
             if should_cancel():
                 raise DownloadCancelled("Task cancelled")
@@ -2752,83 +2761,18 @@ class MediaDownloader:
                         ),
                     )
                 )
-            direct_probe: dict[str, Any] | None = None
-            errors: list[tuple[str, bool]] = []
-            for candidate_url in candidate.get("urls") or []:
-                try:
-                    direct_probe = self._probe_douyin_ratio_with_retry(
-                        ydl,
-                        candidate_url,
-                        ratio=label,
-                        expected_duration=expected_duration,
-                        callback=callback,
-                        should_cancel=should_cancel,
-                    )
-                except _DouyinNoProgressTimeout:
-                    raise
-                except DownloadCancelled:
-                    raise
-                except MediaDownloadError:
-                    raise
-                except Exception as exc:
-                    errors.append(
-                        (
-                            self._safe_douyin_probe_failure(exc),
-                            self._should_pause_douyin_probe_error(exc),
-                        )
-                    )
-                    continue
-                if direct_probe:
-                    break
-                errors.append(("media metadata could not be parsed", False))
-            if direct_probe:
-                direct_probe["source_candidates"] = list(
-                    dict.fromkeys(
-                        [
-                            str(direct_probe.get("source_url") or ""),
-                            *(candidate.get("urls") or []),
-                        ]
-                    )
-                )
-                direct_probe["source_candidates"] = [
-                    value
-                    for value in direct_probe["source_candidates"]
-                    if value
-                    and self._is_trusted_douyin_asset_url(
-                        value,
-                        MediaType.VIDEO,
-                    )
-                ]
-                actual_width = int(direct_probe.get("width") or 0)
-                actual_height = int(direct_probe.get("height") or 0)
-                if min(actual_width, actual_height) < min(
-                    declared_width, declared_height
-                ) or max(actual_width, actual_height) < max(
-                    declared_width, declared_height
-                ):
-                    direct_failures.append(
-                        (
-                            candidate,
-                            label,
-                            (
-                                "verified media was below the author-feed "
-                                f"{declared_width}x{declared_height} rendition"
-                            ),
-                            False,
-                        )
-                    )
-                else:
-                    direct_probe["requested_ratio"] = label
-                    probes.append(direct_probe)
-                continue
-            direct_failures.append(
-                (
-                    candidate,
-                    label,
-                    self._preferred_douyin_probe_failure(errors),
-                    any(transient for _, transient in errors),
-                )
+            direct_probe, failure = self._probe_douyin_direct_rendition(
+                ydl,
+                candidate,
+                label=label,
+                expected_duration=expected_duration,
+                callback=callback,
+                should_cancel=should_cancel,
             )
+            if direct_probe:
+                probes.append(direct_probe)
+            elif failure:
+                direct_failures.append(failure)
 
         if should_cancel():
             raise DownloadCancelled("Task cancelled")
@@ -4646,7 +4590,7 @@ class MediaDownloader:
                 if isinstance(rendition, dict)
             ) + len(self._douyin_default_probe_urls(video_uri))
         direct_probes: list[dict[str, Any]] = []
-        direct_failures: list[tuple[dict[str, Any], str, str, bool]] = []
+        direct_failures: list[_DouyinDirectProbeFailure] = []
         probe_count = len(renditions) + 1
         for rendition_index, rendition in enumerate(renditions, start=1):
             if should_cancel():
@@ -4662,93 +4606,21 @@ class MediaDownloader:
                         ),
                     )
                 )
-            errors: list[tuple[str, bool]] = []
-            direct_probe: dict[str, Any] | None = None
-            for candidate_url in rendition.get("urls") or []:
-                try:
-                    direct_probe = self._probe_douyin_ratio_with_retry(
-                        ydl,
-                        candidate_url,
-                        ratio=label,
-                        expected_duration=asset.duration,
-                        callback=callback,
-                        should_cancel=should_cancel,
-                    )
-                except _DouyinNoProgressTimeout:
-                    raise
-                except DownloadCancelled as exc:
-                    raise DownloadCancelledError("Task cancelled") from exc
-                except MediaDownloadError:
-                    raise
-                except Exception as exc:
-                    errors.append(
-                        (
-                            self._safe_douyin_probe_failure(exc),
-                            self._should_pause_douyin_probe_error(exc),
-                        )
-                    )
-                    continue
-                if direct_probe:
-                    break
-                errors.append(("media metadata could not be parsed", False))
-
-            declared_width = int(rendition.get("width") or 0)
-            declared_height = int(rendition.get("height") or 0)
-            if direct_probe:
-                direct_probe["source_candidates"] = list(
-                    dict.fromkeys(
-                        [
-                            str(direct_probe.get("source_url") or ""),
-                            *(rendition.get("urls") or []),
-                        ]
-                    )
-                )
-                direct_probe["source_candidates"] = [
-                    value
-                    for value in direct_probe["source_candidates"]
-                    if value
-                    and self._is_trusted_douyin_asset_url(
-                        value,
-                        MediaType.VIDEO,
-                    )
-                ]
-                actual_width = int(direct_probe.get("width") or 0)
-                actual_height = int(direct_probe.get("height") or 0)
-                declared_too_high = bool(
-                    declared_width
-                    and declared_height
-                    and (
-                        min(actual_width, actual_height)
-                        < min(declared_width, declared_height)
-                        or max(actual_width, actual_height)
-                        < max(declared_width, declared_height)
-                    )
-                )
-                if actual_width <= 0 or actual_height <= 0 or declared_too_high:
-                    direct_failures.append(
-                        (
-                            rendition,
-                            label,
-                            (
-                                "verified media was below the author-feed "
-                                f"{declared_width}x{declared_height} rendition"
-                            ),
-                            False,
-                        )
-                    )
-                    continue
-                direct_probe["requested_ratio"] = label
-                direct_probes.append(direct_probe)
-                continue
-
-            direct_failures.append(
-                (
+            try:
+                direct_probe, failure = self._probe_douyin_direct_rendition(
+                    ydl,
                     rendition,
-                    label,
-                    self._preferred_douyin_probe_failure(errors),
-                    any(transient for _, transient in errors),
+                    label=label,
+                    expected_duration=asset.duration,
+                    callback=callback,
+                    should_cancel=should_cancel,
                 )
-            )
+            except DownloadCancelled as exc:
+                raise DownloadCancelledError("Task cancelled") from exc
+            if direct_probe:
+                direct_probes.append(direct_probe)
+            elif failure:
+                direct_failures.append(failure)
 
         if callback:
             callback(
@@ -4905,10 +4777,6 @@ class MediaDownloader:
                 best_urls.extend(self._douyin_default_probe_urls(video_uri))
             else:
                 best_urls.append(self._douyin_ratio_url(video_uri, requested_ratio))
-        elif requested_ratio.startswith("author-feed-"):
-            with contextlib.suppress(ValueError, IndexError):
-                rendition_index = int(requested_ratio.rsplit("-", 1)[1]) - 1
-                best_urls.extend(renditions[rendition_index].get("urls") or [])
         best_urls = self._bounded_douyin_transfer_candidates(best_urls)
         return RemoteAsset(
             candidates=best_urls,
@@ -5074,10 +4942,95 @@ class MediaDownloader:
                 break
         return result
 
+    def _probe_douyin_direct_rendition(
+        self,
+        ydl: YoutubeDL,
+        rendition: dict[str, Any],
+        *,
+        label: str,
+        expected_duration: float | None,
+        callback: EventCallback | None,
+        should_cancel: CancelCallback,
+    ) -> tuple[dict[str, Any] | None, _DouyinDirectProbeFailure | None]:
+        """Try same-rendition mirrors until one meets the declared dimensions."""
+        urls = list(dict.fromkeys(rendition.get("urls") or []))
+        declared_width = int(rendition.get("width") or 0)
+        declared_height = int(rendition.get("height") or 0)
+        errors: list[tuple[str, bool]] = []
+        lower_errors: list[tuple[str, bool]] = []
+        lower_urls: set[str] = set()
+        for candidate_url in urls:
+            if should_cancel():
+                raise DownloadCancelled("Task cancelled")
+            try:
+                probe = self._probe_douyin_ratio_with_retry(
+                    ydl,
+                    candidate_url,
+                    ratio=label,
+                    expected_duration=expected_duration,
+                    callback=callback,
+                    should_cancel=should_cancel,
+                )
+            except (_DouyinNoProgressTimeout, DownloadCancelled, MediaDownloadError):
+                raise
+            except Exception as exc:
+                errors.append(
+                    (
+                        self._safe_douyin_probe_failure(exc),
+                        self._should_pause_douyin_probe_error(exc),
+                    )
+                )
+                continue
+            if should_cancel():
+                raise DownloadCancelled("Task cancelled")
+            actual_width = int(probe.get("width") or 0) if probe else 0
+            actual_height = int(probe.get("height") or 0) if probe else 0
+            if actual_width <= 0 or actual_height <= 0:
+                errors.append(("media metadata could not be parsed", False))
+                continue
+            if min(actual_width, actual_height) < min(
+                declared_width, declared_height
+            ) or max(actual_width, actual_height) < max(
+                declared_width, declared_height
+            ):
+                lower_urls.add(candidate_url)
+                lower_errors.append(
+                    (
+                        "verified media was below the author-feed "
+                        f"{declared_width}x{declared_height} rendition "
+                        f"(measured {actual_width}x{actual_height})",
+                        False,
+                    )
+                )
+                continue
+            probe["requested_ratio"] = label
+            # Keep untried/temporarily unavailable mirrors for the fully checked
+            # transfer, but never re-add a mirror already measured as too small.
+            probe["source_candidates"] = [
+                value
+                for value in dict.fromkeys(
+                    [str(probe.get("source_url") or ""), candidate_url, *urls]
+                )
+                if value
+                and value not in lower_urls
+                and self._is_trusted_douyin_asset_url(value, MediaType.VIDEO)
+            ]
+            return probe, None
+
+        # A failed/empty mirror is unknown, not evidence of a lower rendition.
+        # This distinction must survive aggregation across author-feed entries.
+        return None, _DouyinDirectProbeFailure(
+            rendition=rendition,
+            label=label,
+            reason=self._preferred_douyin_probe_failure(errors or lower_errors),
+            transient=any(transient for _, transient in errors),
+            all_sources_verified_lower=bool(urls) and len(lower_urls) == len(urls),
+        )
+
     @classmethod
     def _unresolved_douyin_direct_failures(
         cls,
-        failures: list[tuple[dict[str, Any], str, str, bool]],
+        failures: list[_DouyinDirectProbeFailure],
         verified_probes: list[dict[str, Any]],
     ) -> list[tuple[str, str, bool]]:
         best = max(
@@ -5090,18 +5043,36 @@ class MediaDownloader:
         )
         best_bit_rate = int(best.get("bit_rate") or 0) if best else 0
         unresolved: list[tuple[str, str, bool]] = []
-        for rendition, label, reason, transient in failures:
+        for failure in failures:
+            rendition = failure.rendition
             declared_pixels = int(rendition.get("width") or 0) * int(
                 rendition.get("height") or 0
             )
             declared_bit_rate = int(rendition.get("bit_rate") or 0)
             dominated = best_pixels > declared_pixels or (
                 best_pixels == declared_pixels
-                and declared_bit_rate > 0
-                and best_bit_rate >= declared_bit_rate
+                and (
+                    (declared_bit_rate > 0 and best_bit_rate >= declared_bit_rate)
+                    or (declared_bit_rate == 0 and failure.all_sources_verified_lower)
+                )
             )
+            # Pixel count alone cannot cover a missing short or long edge.
+            if best:
+                actual_edges = sorted(
+                    (int(best.get("width") or 0), int(best.get("height") or 0))
+                )
+                declared_edges = sorted(
+                    (
+                        int(rendition.get("width") or 0),
+                        int(rendition.get("height") or 0),
+                    )
+                )
+                dominated = dominated and all(
+                    actual >= declared
+                    for actual, declared in zip(actual_edges, declared_edges)
+                )
             if not dominated:
-                unresolved.append((label, reason, transient))
+                unresolved.append((failure.label, failure.reason, failure.transient))
         return unresolved
 
     def _existing_douyin_image_asset(

@@ -844,10 +844,19 @@
     return localizedIssueMessage(errorEntity, job);
   }
 
+  function localizedRenditionMismatch(text) {
+    return text.replace(
+      /verified media was below the author-feed (\d+)x(\d+) rendition(?: \(measured (\d+)x(\d+)\))?/g,
+      (_, width, height, actualWidth, actualHeight) => actualWidth
+        ? `该地址声明 ${width}×${height}，实际文件只有 ${actualWidth}×${actualHeight}`
+        : `该地址实际文件低于声明的 ${width}×${height}`
+    );
+  }
+
   function localizedProbeDetails(text) {
     const marker = "Probe details:";
     if (!text.includes(marker)) return "";
-    return text
+    return localizedRenditionMismatch(text)
       .split(marker, 2)[1]
       .trim()
       .replace(/[.。]+$/, "")
@@ -1272,7 +1281,8 @@
     }
     if (!text.includes("Douyin media was discovered") && !text.includes("Douyin profile media was discovered")) return text;
 
-    text = text
+    const renditionMismatch = text.includes("verified media was below the author-feed");
+    text = localizedRenditionMismatch(text)
       .replace(
         /Douyin (?:profile )?media was discovered, but its highest quality could not be verified\.[\s\S]*?Probe details:\s*/,
         "已发现该抖音作品，但无法验证其最高画质；为避免下错低清版本，本次没有下载。探测详情："
@@ -1295,7 +1305,9 @@
       .replaceAll("below the discovered minimum", "低于解析阶段确认的最低画质")
       .replaceAll("highest candidate uses unsupported video codec", "最高画质使用当前不支持的视频编码")
       .replaceAll("default", "原始档");
-    return text;
+    return renditionMismatch
+      ? `${text}。请更新程序后重试，让程序刷新同一作品的媒体地址并检查备用源；若仍失败，请反馈以上声明尺寸与实际尺寸。不需要打开 Chrome 验证。`
+      : text;
   }
 
   function authRequired(job) {

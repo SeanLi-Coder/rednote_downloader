@@ -98,7 +98,7 @@ jobs:
           retention-days: 7
 
   baseline:
-    name: Baseline v1.2.18 / ubuntu-24.04 (diagnostic)
+    name: Baseline v1.2.19 / ubuntu-24.04 (diagnostic)
     runs-on: ubuntu-24.04
     timeout-minutes: 85
     continue-on-error: true
@@ -109,7 +109,7 @@ jobs:
       - name: Check out previous production version
         uses: actions/checkout@v7
         with:
-          ref: 56149a79078a39e218738069944b6bfb050069e8
+          ref: 2098023f83f05a26a1d4466486e827c8f8641e01
           path: baseline
           persist-credentials: false
       - uses: actions/setup-python@v7
