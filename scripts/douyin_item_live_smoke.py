@@ -20,6 +20,7 @@ from http.cookiejar import CookieJar
 from pathlib import Path
 from typing import Any, Sequence
 from unittest import mock
+from urllib.parse import parse_qs, urlsplit
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
@@ -43,6 +44,283 @@ def target_url(value: str) -> tuple[str, str]:
     if not match:
         raise ValueError("The normalized URL did not contain a safe item ID")
     return info.url, match.group(1)
+
+
+def profile_observer_target(value: str) -> dict[str, str]:
+    """Accept only an official profile URL with two explicit numeric item IDs."""
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme != "https"
+        or parsed.netloc != "www.douyin.com"
+        or not re.fullmatch(r"/user/(?:self|MS4w[A-Za-z0-9_-]{1,180})", parsed.path)
+        or parsed.fragment
+        or len(value) > 2048
+        or any(ord(character) < 33 for character in value)
+    ):
+        raise ValueError("The observer requires a standard official Douyin profile URL")
+    query = parse_qs(parsed.query, keep_blank_values=True, max_num_fields=12)
+    if set(query) - {"modal_id", "vid", "from_tab_name", "showTab"}:
+        raise ValueError("The observer URL contains unsupported query fields")
+    ids = {}
+    for key in ("modal_id", "vid"):
+        values = query.get(key, [])
+        if len(values) != 1 or not re.fullmatch(r"[0-9]{1,30}", values[0]):
+            raise ValueError(
+                "The observer requires exactly one numeric modal_id and vid"
+            )
+        ids[key] = values[0]
+    return ids
+
+
+def observed_page_route(value: str) -> dict[str, Any]:
+    """Retain route shape and numeric IDs, not account names or arbitrary queries."""
+    try:
+        parsed = urlsplit(value)
+        if parsed.scheme != "https" or parsed.netloc != "www.douyin.com":
+            return {"path": "other"}
+        path = "other"
+        if re.fullmatch(r"/video/[0-9]{1,30}", parsed.path):
+            path = parsed.path
+        elif parsed.path == "/user/self":
+            path = parsed.path
+        elif re.fullmatch(r"/user/MS4w[A-Za-z0-9_-]{1,180}", parsed.path):
+            path = "/user/<profile>"
+        query = parse_qs(parsed.query, max_num_fields=32)
+        ids = {
+            key: [
+                value
+                for value in query.get(key, [])
+                if re.fullmatch(r"[0-9]{1,30}", value)
+            ][:4]
+            for key in ("modal_id", "vid", "aweme_id")
+            if any(re.fullmatch(r"[0-9]{1,30}", value) for value in query.get(key, []))
+        }
+        return {"path": path, "numeric_query_ids": ids}
+    except ValueError:
+        return {"path": "other"}
+
+
+def observed_detail_request_id(value: str) -> str | None:
+    """Observe request IDs only; recommendation response lists are not inspected."""
+    try:
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme != "https"
+            or parsed.netloc != "www.douyin.com"
+            or parsed.path != "/aweme/v1/web/aweme/detail/"
+        ):
+            return None
+        values = parse_qs(parsed.query, max_num_fields=150).get("aweme_id", [])
+        if len(values) == 1 and re.fullmatch(r"[0-9]{1,30}", values[0]):
+            return values[0]
+    except ValueError:
+        pass
+    return None
+
+
+def observer_request_allowed(resource_type: str, value: str) -> bool:
+    """Permit page code and official JSON APIs, never media or image requests."""
+    try:
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme != "https"
+            or parsed.username
+            or parsed.password
+            or parsed.port not in (None, 443)
+        ):
+            return False
+        if resource_type == "document":
+            return parsed.netloc == "www.douyin.com" and bool(
+                re.fullmatch(
+                    r"/|/user/[A-Za-z0-9_-]{1,184}|/video/[0-9]{1,30}", parsed.path
+                )
+            )
+        if resource_type in {"script", "stylesheet"}:
+            return True
+        return (
+            resource_type in {"xhr", "fetch"}
+            and parsed.netloc == "www.douyin.com"
+            and parsed.path.startswith(("/aweme/v1/web/", "/api/"))
+            and not re.search(r"(?:play|download|media)(?:/|$)", parsed.path)
+        )
+    except ValueError:
+        return False
+
+
+_PAGE_ID_OBSERVER = r"""() => {
+    const numeric = value => typeof value === 'string' && /^[0-9]{1,30}$/.test(value);
+    const dom = [];
+    const attributes = ['data-e2e-vid', 'data-aweme-id', 'data-video-id'];
+    const videos = [...document.querySelectorAll('video')].slice(0, 24);
+    for (const video of videos) {
+        let node = video;
+        for (let depth = 0; node && depth < 8 && dom.length < 96; depth++, node = node.parentElement) {
+            for (const attribute of attributes) {
+                const value = node.getAttribute(attribute);
+                if (numeric(value)) dom.push({source: depth === 0 ? 'video' : 'ancestor', attribute, id: value});
+            }
+        }
+    }
+    const state = [];
+    const fields = new Set(['modal_id', 'modalId', 'vid', 'aweme_id', 'awemeId']);
+    const seen = new WeakSet();
+    let budget = 6000;
+    const walk = (value, source, depth) => {
+        if (!value || typeof value !== 'object' || depth > 14 || budget-- <= 0 || state.length >= 96 || seen.has(value)) return;
+        seen.add(value);
+        for (const [key, entry] of Object.entries(value).slice(0, 100)) {
+            if (fields.has(key) && numeric(entry)) state.push({source, field: key, id: entry});
+            if (state.length >= 96) return;
+            walk(entry, source, depth + 1);
+        }
+    };
+    for (const source of ['_ROUTER_DATA', '__ROUTER_DATA__', '__INITIAL_STATE__', '__NEXT_DATA__']) {
+        try { walk(window[source], source, 0); } catch (_) {}
+    }
+    const render = document.getElementById('RENDER_DATA');
+    if (render && render.textContent.length < 2000000) {
+        try { walk(JSON.parse(decodeURIComponent(render.textContent)), 'RENDER_DATA', 0); } catch (_) {}
+    }
+    return {video_node_count: videos.length, video_node_ids: dom, script_state_ids: state};
+}"""
+
+
+def sanitized_page_ids(value: Any) -> dict[str, Any]:
+    """Validate browser-returned fields again before writing the report."""
+    value = value if isinstance(value, dict) else {}
+    count = value.get("video_node_count")
+    result = {
+        "video_node_count": count if type(count) is int and 0 <= count <= 24 else 0
+    }
+    for collection, valid_fields in (
+        (
+            "video_node_ids",
+            {
+                "source": {"video", "ancestor"},
+                "attribute": {"data-e2e-vid", "data-aweme-id", "data-video-id"},
+            },
+        ),
+        (
+            "script_state_ids",
+            {
+                "source": {
+                    "_ROUTER_DATA",
+                    "__ROUTER_DATA__",
+                    "__INITIAL_STATE__",
+                    "__NEXT_DATA__",
+                    "RENDER_DATA",
+                },
+                "field": {"modal_id", "modalId", "vid", "aweme_id", "awemeId"},
+            },
+        ),
+    ):
+        entries = value.get(collection)
+        result[collection] = []
+        for entry in entries[:96] if isinstance(entries, list) else []:
+            if (
+                isinstance(entry, dict)
+                and isinstance(entry.get("id"), str)
+                and re.fullmatch(r"[0-9]{1,30}", entry["id"])
+                and all(
+                    isinstance(entry.get(key), str) and entry[key] in allowed
+                    for key, allowed in valid_fields.items()
+                )
+            ):
+                safe = {key: entry[key] for key in (*valid_fields, "id")}
+                if safe not in result[collection]:
+                    result[collection].append(safe)
+    return result
+
+
+def _profile_observer_worker(url: str, connection) -> None:
+    if hasattr(os, "setsid"):
+        os.setsid()
+    with open(os.devnull, "w") as sink:
+        os.dup2(sink.fileno(), 1)
+        os.dup2(sink.fileno(), 2)
+    result: dict[str, Any] = {"status": "failed", "detail_request_ids": []}
+    try:
+        from playwright.sync_api import sync_playwright
+
+        result["expected_ids"] = profile_observer_target(url)
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                channel="chrome", headless=True, timeout=15_000
+            )
+            try:
+                context = browser.new_context(
+                    service_workers="block", accept_downloads=False
+                )
+                context.set_default_timeout(5_000)
+                context.route(
+                    "**/*",
+                    lambda route: (
+                        route.continue_()
+                        if observer_request_allowed(
+                            route.request.resource_type, route.request.url
+                        )
+                        else route.abort()
+                    ),
+                )
+                page = context.new_page()
+
+                def request_seen(request):
+                    media_id = observed_detail_request_id(request.url)
+                    if (
+                        media_id
+                        and media_id not in result["detail_request_ids"]
+                        and len(result["detail_request_ids"]) < 96
+                    ):
+                        result["detail_request_ids"].append(media_id)
+
+                page.on("request", request_seen)
+                try:
+                    page.goto(url, wait_until="domcontentloaded", timeout=20_000)
+                except Exception as exc:
+                    result["navigation_error_type"] = type(exc).__name__
+                page.wait_for_timeout(8_000)
+                result["final_route"] = observed_page_route(page.url)
+                result.update(sanitized_page_ids(page.evaluate(_PAGE_ID_OBSERVER)))
+                result["status"] = "observed"
+            finally:
+                browser.close()
+    except Exception as exc:
+        result["error_type"] = type(exc).__name__
+    connection.send({"result": result})
+    connection.close()
+
+
+def run_profile_observer(url: str) -> dict[str, Any]:
+    ids = profile_observer_target(url)
+    context = multiprocessing.get_context("spawn")
+    receiver, sender = context.Pipe(duplex=False)
+    process = context.Process(target=_profile_observer_worker, args=(url, sender))
+    started = time.monotonic()
+    result = None
+    process.start()
+    sender.close()
+    try:
+        # Reserve six seconds for the existing bounded process-group cleanup.
+        while time.monotonic() - started < 54:
+            if receiver.poll(min(1, max(0, 54 - (time.monotonic() - started)))):
+                try:
+                    result = receiver.recv().get("result")
+                except EOFError:
+                    pass
+                break
+            if not process.is_alive():
+                break
+    finally:
+        _stop_worker(process)
+        receiver.close()
+    if result is None:
+        result = {
+            "status": "failed",
+            "expected_ids": ids,
+            "error_type": "ObserverWorkerDidNotFinish",
+        }
+    result["elapsed_seconds"] = round(time.monotonic() - started, 3)
+    return result
 
 
 def _safe_scalar(value: Any) -> Any:
@@ -506,10 +784,25 @@ def run_item(url: str, media_id: str, ffprobe: str, timeout: int) -> dict[str, A
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--url", action="append", required=True)
+    modes = parser.add_mutually_exclusive_group(required=True)
+    modes.add_argument("--url", action="append")
+    modes.add_argument("--observe-profile-item-url")
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--item-timeout", type=int, default=600)
     args = parser.parse_args(argv)
+    if args.observe_profile_item_url:
+        try:
+            result = run_profile_observer(args.observe_profile_item_url)
+        except Exception as exc:
+            result = {"status": "failed", "error_type": type(exc).__name__}
+        result["description"] = (
+            "Anonymous official profile-page observation only; no user cookies or media downloads. "
+            "Numeric IDs are observations, not proof of the selected item's identity."
+        )
+        args.report.parent.mkdir(parents=True, exist_ok=True)
+        args.report.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+        print(f"Anonymous profile observation: {result['status']}", flush=True)
+        return 0 if result["status"] == "observed" else 1
     if not 30 <= args.item_timeout <= 900 or not 1 <= len(args.url) <= 8:
         parser.error("Use 1-8 item URLs and a 30-900 second per-item timeout")
     report: dict[str, Any] = {

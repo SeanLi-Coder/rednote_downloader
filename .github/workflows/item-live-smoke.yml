@@ -17,6 +17,11 @@ on:
         default: >-
           https://www.douyin.com/user/self?modal_id=7684132989608949594
           https://www.douyin.com/user/self?modal_id=7677863372330774922
+      observe_profile_item_url:
+        description: Optional official profile URL with modal_id and vid for anonymous page-route observation
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -73,6 +78,25 @@ jobs:
               print(f"Production Chrome channel: {browser.version}")
               browser.close()
           PY
+      - name: Observe original profile item page without downloading media
+        if: ${{ inputs.observe_profile_item_url }}
+        continue-on-error: true
+        shell: bash
+        env:
+          OBSERVE_PROFILE_ITEM_URL: ${{ inputs.observe_profile_item_url }}
+        run: |
+          python scripts/douyin_item_live_smoke.py \
+            --observe-profile-item-url "$OBSERVE_PROFILE_ITEM_URL" \
+            --report "$RUNNER_TEMP/douyin-profile-observation.json"
+      - name: Upload sanitized page observations separately
+        if: ${{ always() && inputs.observe_profile_item_url }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: douyin-profile-observation-${{ matrix.os }}
+          path: ${{ runner.temp }}/douyin-profile-observation.json
+          if-no-files-found: warn
+          retention-days: 7
       - name: Run anonymous production discovery and download
         shell: bash
         env:

@@ -364,3 +364,163 @@ def test_quality_duration_rejects_invalid_or_unbounded_values(value):
 
 def test_quality_metrics_preserves_ffprobe_numeric_string_duration():
     assert smoke.quality_metrics({"duration": "12.000000"})["duration_seconds"] == 12.0
+
+
+PROFILE_OBSERVER_URL = "https://www.douyin.com/user/MS4wExample?from_tab_name=main&modal_id=7650852719788025187&vid=7683316000586315369"
+
+
+def test_profile_observer_preserves_conflicting_ids_without_using_production_parser():
+    assert smoke.profile_observer_target(PROFILE_OBSERVER_URL) == {
+        "modal_id": "7650852719788025187",
+        "vid": "7683316000586315369",
+    }
+    assert smoke.observed_page_route(PROFILE_OBSERVER_URL) == {
+        "path": "/user/<profile>",
+        "numeric_query_ids": {
+            "modal_id": ["7650852719788025187"],
+            "vid": ["7683316000586315369"],
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        PROFILE_OBSERVER_URL.replace("https://", "http://"),
+        PROFILE_OBSERVER_URL.replace("www.douyin.com", "www.douyin.com.evil.test"),
+        PROFILE_OBSERVER_URL.replace("www.douyin.com", "user@www.douyin.com"),
+        PROFILE_OBSERVER_URL.replace("www.douyin.com", "www.douyin.com:444"),
+        PROFILE_OBSERVER_URL + "&modal_id=123",
+        PROFILE_OBSERVER_URL + "&signature=secret",
+        PROFILE_OBSERVER_URL + "#private",
+        "https://www.douyin.com/user/self?modal_id=123&vid=private",
+        "https://www.douyin.com/user/self?modal_id=123",
+    ],
+)
+def test_profile_observer_rejects_unsafe_or_ambiguous_observation_input(url):
+    with pytest.raises(ValueError):
+        smoke.profile_observer_target(url)
+
+
+def test_profile_observer_records_only_detail_request_id_not_recommendations():
+    assert (
+        smoke.observed_detail_request_id(
+            "https://www.douyin.com/aweme/v1/web/aweme/detail/?aweme_id=123&signature=private"
+        )
+        == "123"
+    )
+    for value in (
+        "https://www.douyin.com/aweme/v1/web/aweme/post/?aweme_id=123",
+        "https://evil.test/aweme/v1/web/aweme/detail/?aweme_id=123",
+        "https://www.douyin.com/aweme/v1/web/aweme/detail/?aweme_id=123&aweme_id=456",
+        "https://www.douyin.com/aweme/v1/web/aweme/detail/?aweme_id=private",
+    ):
+        assert smoke.observed_detail_request_id(value) is None
+
+
+@pytest.mark.parametrize("resource_type", ["media", "image", "font", "websocket"])
+def test_profile_observer_never_allows_media_resource_types(resource_type):
+    assert not smoke.observer_request_allowed(resource_type, PROFILE_OBSERVER_URL)
+
+
+def test_profile_observer_blocks_media_fetches_and_preserves_official_page_requests():
+    assert smoke.observer_request_allowed("document", PROFILE_OBSERVER_URL)
+    assert smoke.observer_request_allowed("script", "https://static.douyin.com/app.js")
+    assert smoke.observer_request_allowed(
+        "fetch", "https://www.douyin.com/aweme/v1/web/aweme/detail/?aweme_id=123"
+    )
+    assert not smoke.observer_request_allowed(
+        "fetch", "https://media.example.test/video.mp4"
+    )
+    assert not smoke.observer_request_allowed(
+        "fetch", "https://www.douyin.com/aweme/v1/web/play/?video_id=123"
+    )
+    assert not smoke.observer_request_allowed("document", "https://evil.test/private")
+
+
+def test_profile_observer_sanitizes_browser_result_again():
+    result = smoke.sanitized_page_ids(
+        {
+            "video_node_count": 2,
+            "video_node_ids": [
+                {
+                    "source": "ancestor",
+                    "attribute": "data-e2e-vid",
+                    "id": "123",
+                    "cookie": "private",
+                },
+                {"source": "video", "attribute": "private", "id": "456"},
+            ],
+            "script_state_ids": [
+                {
+                    "source": "_ROUTER_DATA",
+                    "field": "modal_id",
+                    "id": "123",
+                    "url": "private",
+                },
+                {"source": "__INITIAL_STATE__", "field": "vid", "id": "private"},
+            ],
+            "html": "private",
+        }
+    )
+    assert result["video_node_ids"] == [
+        {"source": "ancestor", "attribute": "data-e2e-vid", "id": "123"}
+    ]
+    assert result["script_state_ids"] == [
+        {"source": "_ROUTER_DATA", "field": "modal_id", "id": "123"}
+    ]
+    assert "private" not in json.dumps(result)
+
+
+def test_profile_observer_cli_is_independent_of_downloads_and_ffprobe(
+    tmp_path, monkeypatch
+):
+    calls = []
+
+    def observer(url):
+        calls.append(url)
+        return {
+            "status": "observed",
+            "expected_ids": smoke.profile_observer_target(url),
+        }
+
+    monkeypatch.setattr(smoke, "run_profile_observer", observer)
+    monkeypatch.setattr(
+        smoke.shutil,
+        "which",
+        lambda name: pytest.fail("The observer must not require FFprobe"),
+    )
+    report = tmp_path / "observation.json"
+    assert (
+        smoke.main(
+            [
+                "--observe-profile-item-url",
+                PROFILE_OBSERVER_URL,
+                "--report",
+                str(report),
+            ]
+        )
+        == 0
+    )
+    assert calls == [PROFILE_OBSERVER_URL]
+    assert json.loads(report.read_text())["status"] == "observed"
+    assert "MS4wExample" not in report.read_text()
+
+
+def test_profile_observer_invalid_input_writes_only_sanitized_failure(tmp_path):
+    report = tmp_path / "observation.json"
+    assert (
+        smoke.main(
+            [
+                "--observe-profile-item-url",
+                "https://private.test/?cookie=secret",
+                "--report",
+                str(report),
+            ]
+        )
+        == 1
+    )
+    payload = json.loads(report.read_text())
+    assert payload["status"] == "failed"
+    assert payload["error_type"] == "ValueError"
+    assert "private" not in report.read_text() and "secret" not in report.read_text()
