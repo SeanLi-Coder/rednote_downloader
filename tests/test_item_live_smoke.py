@@ -20,11 +20,25 @@ def test_smoke_normalizes_user_modal_to_exact_single_item(media_id):
     )
 
 
+def test_smoke_normalizes_reported_mixed_profile_link_to_active_modal():
+    url = (
+        "https://www.douyin.com/user/MS4wLjABAAAAUbSbP1q7W3AILSzSn3AsSsvgm3vmw"
+        "PTdsgPyJXwZPg6vl51ORWgOUYrQ4HLw6YWb?from_tab_name=main"
+        "&modal_id=7650852719788025187&vid=7683316000586315369"
+    )
+
+    assert smoke.target_url(url) == (
+        "https://www.douyin.com/video/7650852719788025187",
+        "7650852719788025187",
+    )
+
+
 @pytest.mark.parametrize(
     "url",
     [
         "https://www.douyin.com/user/self",
-        "https://www.douyin.com/user/self?modal_id=1&vid=2",
+        "https://www.douyin.com/user/self?modal_id=1&modal_id=2&vid=2",
+        "https://www.douyin.com/user/self?modal_id=1&vid=2&vid=3",
         "https://www.youtube.com/watch?v=123",
     ],
 )

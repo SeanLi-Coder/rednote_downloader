@@ -132,6 +132,44 @@ def test_douyin_modal_video_url_is_canonicalized_as_single_item() -> None:
     assert info.url == "https://www.douyin.com/video/7664225419386607205"
 
 
+def test_douyin_reported_profile_link_targets_the_active_modal_item() -> None:
+    info = identify_url(
+        "https://www.douyin.com/user/MS4wLjABAAAAUbSbP1q7W3AILSzSn3AsSsvgm3vmw"
+        "PTdsgPyJXwZPg6vl51ORWgOUYrQ4HLw6YWb?from_tab_name=main"
+        "&modal_id=7650852719788025187&vid=7683316000586315369"
+    )
+
+    assert info.platform == Platform.DOUYIN
+    assert info.kind == SourceKind.ITEM
+    assert info.url == "https://www.douyin.com/video/7650852719788025187"
+
+
+@pytest.mark.parametrize("profile", ["self", "MS4wLjABAAAATEST"])
+@pytest.mark.parametrize(
+    "query",
+    [
+        "modal_id=7650852719788025187&vid=7683316000586315369",
+        "vid=7683316000586315369&modal_id=7650852719788025187",
+        "modal_id=7650852719788025187&vid=7650852719788025187",
+        "modal_id=7650852719788025187",
+        "vid=7650852719788025187",
+        "modal_id=7650852719788025187&modal_id=7650852719788025187"
+        "&vid=7683316000586315369",
+        "modal_id=7650852719788025187&vid=7683316000586315369"
+        "&vid=7683316000586315369",
+        "vid=7650852719788025187&vid=7650852719788025187",
+    ],
+)
+def test_douyin_profile_item_query_uses_valid_modal_before_vid(
+    profile: str, query: str
+) -> None:
+    info = identify_url(f"https://www.douyin.com/user/{profile}?{query}")
+
+    assert info.platform == Platform.DOUYIN
+    assert info.kind == SourceKind.ITEM
+    assert info.url == "https://www.douyin.com/video/7650852719788025187"
+
+
 @pytest.mark.parametrize(
     "value",
     [
@@ -188,10 +226,22 @@ def test_douyin_note_url_uses_the_bound_single_item_pipeline() -> None:
     assert info.url == "https://www.douyin.com/video/7683074221437746170"
 
 
-def test_douyin_video_url_drops_tracking_and_ignores_conflicting_modal_id() -> None:
+@pytest.mark.parametrize("item_path", ["video", "note"])
+@pytest.mark.parametrize(
+    "query",
+    [
+        "modal_id=9999999999999999999&previous_page=app_code_link",
+        "modal_id=7650852719788025187&vid=7683316000586315369",
+        "vid=7683316000586315369&modal_id=7650852719788025187",
+        "modal_id=invalid&vid=",
+        "modal_id=7650852719788025187&modal_id=7683316000586315369",
+    ],
+)
+def test_douyin_item_path_drops_tracking_and_remains_authoritative(
+    item_path: str, query: str
+) -> None:
     info = identify_url(
-        "https://www.douyin.com/video/7664225419386607205"
-        "?modal_id=9999999999999999999&previous_page=app_code_link"
+        f"https://www.douyin.com/{item_path}/7664225419386607205?{query}"
     )
 
     assert info.kind == SourceKind.ITEM
@@ -203,12 +253,29 @@ def test_douyin_video_url_drops_tracking_and_ignores_conflicting_modal_id() -> N
     [
         "modal_id=",
         "modal_id=invalid",
+        "modal_id=７６５０８５２７１９７８８０２５１８７",
+        "modal_id=765085271978802518٧",
         "modal_id=7664225419386607205&modal_id=invalid",
         "modal_id=7664225419386607205&modal_id=7677923079457231738",
         "vid=",
         "vid=invalid",
+        "vid=７６５０８５２７１９７８８０２５１８７",
+        "vid=765085271978802518٧",
         "vid=7664225419386607205&vid=7677923079457231738",
-        "modal_id=7664225419386607205&vid=7677923079457231738",
+        "modal_id=&vid=7677923079457231738",
+        "modal_id=invalid&vid=7677923079457231738",
+        "modal_id=７６５０８５２７１９７８８０２５１８７&vid=7677923079457231738",
+        "modal_id=7664225419386607205&vid=",
+        "modal_id=7664225419386607205&vid=invalid",
+        "modal_id=7664225419386607205&vid=７６５０８５２７１９７８８０２５１８７",
+        "modal_id=7664225419386607205&modal_id=&vid=7677923079457231738",
+        "modal_id=7664225419386607205&modal_id=invalid&vid=7677923079457231738",
+        "modal_id=7664225419386607205&modal_id=7677923079457231738"
+        "&vid=7664225419386607205",
+        "modal_id=7664225419386607205&vid=7677923079457231738&vid=",
+        "modal_id=7664225419386607205&vid=7677923079457231738&vid=invalid",
+        "modal_id=7664225419386607205&vid=7677923079457231738"
+        "&vid=7664225419386607205",
     ],
 )
 def test_douyin_rejects_invalid_or_ambiguous_profile_modal_id(query: str) -> None:

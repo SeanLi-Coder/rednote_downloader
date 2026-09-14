@@ -76,25 +76,26 @@ def identify_url(value: str) -> UrlInfo:
         item_query_present = (
             "modal_id" in query_with_blanks or "vid" in query_with_blanks
         )
-        item_query_values = [*modal_values, *vid_values]
-        item_query_ids = set(item_query_values)
         video_match = re.fullmatch(r"/video/(\d+)", path)
         note_match = re.fullmatch(r"/note/(\d+)", path)
         if video_match or note_match:
             media_id = (video_match or note_match).group(1)
             url = f"https://www.douyin.com/video/{media_id}"
             kind = SourceKind.ITEM
-        elif (
-            user_match
-            and item_query_present
-            and len(item_query_ids) == 1
-            and all(re.fullmatch(r"\d+", value) for value in item_query_values)
-        ):
-            media_id = next(iter(item_query_ids))
+        elif user_match and item_query_present:
+            for values in (modal_values, vid_values):
+                if values and (
+                    len(set(values)) != 1
+                    or not all(re.fullmatch(r"[0-9]+", value) for value in values)
+                ):
+                    raise UnsupportedUrlError(
+                        "Invalid or ambiguous Douyin modal/vid video URL"
+                    )
+            # The open profile modal can differ from the contextual vid.
+            # Bind all later discovery, verification and retries to this item.
+            media_id = (modal_values or vid_values)[0]
             url = f"https://www.douyin.com/video/{media_id}"
             kind = SourceKind.ITEM
-        elif user_match and item_query_present:
-            raise UnsupportedUrlError("Invalid or ambiguous Douyin modal/vid video URL")
         elif user_match:
             kind = SourceKind.PROFILE
         else:

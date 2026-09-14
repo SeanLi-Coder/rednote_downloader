@@ -895,6 +895,28 @@ def test_douyin_target_job_is_created_as_canonical_item(
         manager.shutdown()
 
 
+def test_douyin_profile_modal_job_binds_target_before_queue_creation(tmp_path) -> None:
+    source_url = (
+        "https://www.douyin.com/user/"
+        "MS4wLjABAAAAUbSbP1q7W3AILSzSn3AsSsvgm3vmwPTdsgPyJXwZPg6vl51ORWgOUYrQ4HLw6YWb"
+        "?from_tab_name=main&modal_id=7650852719788025187&vid=7683316000586315369"
+    )
+    manager = DownloadManager(
+        state_dir=tmp_path / "state",
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    try:
+        created = manager.create_job(source_url, auto_start=False)
+
+        assert created.platform == Platform.DOUYIN
+        assert created.source_kind == SourceKind.ITEM
+        assert created.source_url == "https://www.douyin.com/video/7650852719788025187"
+        assert not created.items
+    finally:
+        manager.shutdown()
+
+
 def test_douyin_item_discovery_blocks_unexpected_profile_expansion(
     monkeypatch, tmp_path
 ) -> None:
@@ -2348,6 +2370,11 @@ def test_retry_repairs_persisted_douyin_item_profile_expansion(
             "https://www.douyin.com/user/"
             "MS4wLjABAAAAvLgZS-O6Oc9diWWZ-jctzlhanUBoN7a5oJLdsTkx6F9TVD9kehAqFqdrpG3uPlmz"
             "?from_tab_name=main&modal_id={media_id}&vid={media_id}"
+        ),
+        (
+            "https://www.douyin.com/user/"
+            "MS4wLjABAAAAUbSbP1q7W3AILSzSn3AsSsvgm3vmwPTdsgPyJXwZPg6vl51ORWgOUYrQ4HLw6YWb"
+            "?from_tab_name=main&modal_id={media_id}&vid=7683316000586315369"
         ),
     ],
 )
