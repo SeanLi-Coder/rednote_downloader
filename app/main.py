@@ -107,20 +107,22 @@ def _load_config() -> AppConfig:
 
 
 def _save_config(config: AppConfig) -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    descriptor, name = tempfile.mkstemp(
-        prefix=".config-", suffix=".tmp", dir=CONFIG_PATH.parent
-    )
-    temporary = Path(name)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            json.dump(config.model_dump(), handle, ensure_ascii=False, indent=2)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        temporary.replace(CONFIG_PATH)
-    finally:
-        temporary.unlink(missing_ok=True)
+    # Windows can reject concurrent replacements even with distinct source files.
+    with _CONFIG_LOCK:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        descriptor, name = tempfile.mkstemp(
+            prefix=".config-", suffix=".tmp", dir=CONFIG_PATH.parent
+        )
+        temporary = Path(name)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump(config.model_dump(), handle, ensure_ascii=False, indent=2)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            temporary.replace(CONFIG_PATH)
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 config = _load_config()

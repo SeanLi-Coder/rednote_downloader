@@ -65,21 +65,29 @@ def test_concurrent_config_writes_use_independent_temporary_files(
     config_environment, monkeypatch, tmp_path
 ):
     barrier = threading.Barrier(2)
+    replacing = threading.Lock()
     replace = Path.replace
     temporary_paths = []
 
-    def synchronized_replace(self, target):
-        temporary_paths.append(self)
-        barrier.wait(timeout=5)
-        return replace(self, target)
+    def recorded_replace(self, target):
+        assert replacing.acquire(blocking=False), "Configuration replacements overlapped"
+        try:
+            temporary_paths.append(self)
+            return replace(self, target)
+        finally:
+            replacing.release()
 
-    monkeypatch.setattr(Path, "replace", synchronized_replace)
+    def concurrent_save(candidate):
+        barrier.wait(timeout=5)
+        main._save_config(candidate)
+
+    monkeypatch.setattr(Path, "replace", recorded_replace)
     candidates = [
         main.AppConfig(download_dir=str(tmp_path / name), use_chrome_cookies=value)
         for name, value in [("one", True), ("two", False)]
     ]
     with ThreadPoolExecutor(max_workers=2) as executor:
-        futures = [executor.submit(main._save_config, value) for value in candidates]
+        futures = [executor.submit(concurrent_save, value) for value in candidates]
         for future in futures:
             future.result(timeout=10)
 
