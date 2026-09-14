@@ -120,13 +120,14 @@ def exception_chain(exc: BaseException) -> list[dict[str, Any]]:
 def anonymous_browser_adapter(shapes: list[dict[str, Any]]):
     """Adapt only cookie access; preserve actual responses and validators."""
     empty_jar = CookieJar()
+    original_cookie_converter = douyin_signing._cookie_jar_to_playwright
     original_options = MediaDownloader._douyin_ytdlp_options
     original_validator = douyin_signing._validated_ssr_wrapper_detail
 
     def empty_cookies(jar: CookieJar) -> list[dict[str, Any]]:
-        if jar is not empty_jar or list(jar):
+        if jar is not empty_jar:
             raise RuntimeError("The anonymous smoke received an unexpected cookie jar")
-        return []
+        return original_cookie_converter(jar) if list(jar) else []
 
     def anonymous_options(self, *args, **kwargs):
         options = original_options(self, *args, **kwargs)
@@ -151,8 +152,6 @@ def anonymous_browser_adapter(shapes: list[dict[str, Any]]):
         ),
     ):
         yield
-    if list(empty_jar):
-        raise RuntimeError("The anonymous smoke retained browser cookies")
 
 
 def inspect_media(path: Path, output_root: Path, ffprobe: str) -> dict[str, Any]:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from http.cookiejar import CookieJar
+from http.cookiejar import Cookie, CookieJar
 
 import pytest
 
@@ -105,6 +105,43 @@ def test_exception_chain_redacts_signed_urls_and_cookie_values():
     assert len(chain) == 2
     assert "TOPSECRET" not in text and "COOKIESECRET" not in text
     assert "https://" not in text
+
+
+def test_anonymous_adapter_allows_only_its_own_server_issued_session(monkeypatch):
+    def reject_user_cookie_access(*args, **kwargs):
+        pytest.fail("The smoke must not read user Chrome cookies")
+
+    monkeypatch.setattr(
+        douyin_signing, "_load_chrome_cookie_jar", reject_user_cookie_access
+    )
+    with smoke.anonymous_browser_adapter([]):
+        jar = douyin_signing._load_chrome_cookie_jar(None)
+        jar.set_cookie(
+            Cookie(
+                0,
+                "ttwid",
+                "synthetic-server-session",
+                None,
+                False,
+                ".douyin.com",
+                True,
+                True,
+                "/",
+                True,
+                True,
+                None,
+                True,
+                None,
+                None,
+                {},
+            )
+        )
+        converted = douyin_signing._cookie_jar_to_playwright(jar)
+        assert len(converted) == 1
+        assert converted[0]["name"] == "ttwid"
+        assert converted[0]["value"] == "synthetic-server-session"
+        with pytest.raises(RuntimeError, match="unexpected cookie jar"):
+            douyin_signing._cookie_jar_to_playwright(CookieJar())
 
 
 def test_missing_ffprobe_writes_failed_report_without_network(tmp_path, monkeypatch):

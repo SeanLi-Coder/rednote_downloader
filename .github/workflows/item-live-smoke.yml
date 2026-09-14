@@ -23,8 +23,15 @@ permissions:
 
 jobs:
   download:
-    runs-on: ubuntu-24.04
+    name: Current / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 85
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-24.04
+          - macos-14
     steps:
       - uses: actions/checkout@v7
         with:
@@ -34,14 +41,31 @@ jobs:
           python-version: "3.10"
           cache: pip
       - name: Install FFmpeg and Python dependencies
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          if ! command -v ffprobe >/dev/null 2>&1; then
+            if [[ "$RUNNER_OS" == "macOS" ]]; then
+              brew install ffmpeg
+            else
+              sudo apt-get update
+              sudo apt-get install -y ffmpeg
+            fi
+          fi
           python -m pip install -r requirements.txt
           python -m pip check
       - name: Verify production Chrome channel
+        shell: bash
         run: |
-          google-chrome --version
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            chrome_binary="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+          else
+            chrome_binary="$(command -v google-chrome || command -v google-chrome-stable || true)"
+          fi
+          if [[ -z "$chrome_binary" || ! -x "$chrome_binary" ]]; then
+            echo "Google Chrome is not available at its standard installation path." >&2
+            exit 1
+          fi
+          "$chrome_binary" --version
           python - <<'PY'
           from playwright.sync_api import sync_playwright
           with sync_playwright() as playwright:
@@ -50,6 +74,7 @@ jobs:
               browser.close()
           PY
       - name: Run anonymous production discovery and download
+        shell: bash
         env:
           INPUT_URLS: ${{ inputs.urls || 'https://www.douyin.com/user/self?modal_id=7684132989608949594 https://www.douyin.com/user/self?modal_id=7677863372330774922' }}
         run: |
@@ -67,7 +92,76 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: douyin-item-live-report
+          name: douyin-item-live-report-${{ matrix.os }}
           path: ${{ runner.temp }}/douyin-item-report.json
+          if-no-files-found: error
+          retention-days: 7
+
+  baseline:
+    name: Baseline v1.2.18 / ubuntu-24.04 (diagnostic)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 85
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Check out previous production version
+        uses: actions/checkout@v7
+        with:
+          ref: 56149a79078a39e218738069944b6bfb050069e8
+          path: baseline
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: baseline/requirements.txt
+      - name: Install baseline dependencies and current diagnostic CLI
+        shell: bash
+        run: |
+          if ! command -v ffprobe >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y ffmpeg
+          fi
+          python -m pip install -r baseline/requirements.txt
+          python -m pip check
+          cp scripts/douyin_item_live_smoke.py baseline/scripts/douyin_item_live_smoke.py
+      - name: Verify baseline import and production Chrome channel
+        working-directory: baseline
+        run: |
+          google-chrome --version
+          python - <<'PY'
+          from pathlib import Path
+          import app
+          from playwright.sync_api import sync_playwright
+          assert Path(app.__file__).resolve().parent == Path.cwd() / "app"
+          print("Verified that the diagnostic CLI will use the baseline app.")
+          with sync_playwright() as playwright:
+              browser = playwright.chromium.launch(channel="chrome", headless=True)
+              print(f"Production Chrome channel: {browser.version}")
+              browser.close()
+          PY
+      - name: Run baseline anonymous production discovery and download
+        working-directory: baseline
+        env:
+          INPUT_URLS: ${{ inputs.urls || 'https://www.douyin.com/user/self?modal_id=7684132989608949594 https://www.douyin.com/user/self?modal_id=7677863372330774922' }}
+        run: |
+          python - <<'PY'
+          import os
+          import subprocess
+          import sys
+          command = [sys.executable, "scripts/douyin_item_live_smoke.py",
+                     "--report", os.path.join(os.environ["RUNNER_TEMP"], "douyin-item-baseline-report.json")]
+          for url in os.environ["INPUT_URLS"].split():
+              command.extend(["--url", url])
+          raise SystemExit(subprocess.call(command))
+          PY
+      - name: Upload sanitized baseline report only
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: douyin-item-baseline-report-ubuntu-24.04
+          path: ${{ runner.temp }}/douyin-item-baseline-report.json
           if-no-files-found: error
           retention-days: 7

@@ -23,6 +23,12 @@
 - 任务状态保存在本机，程序异常退出后可继续处理失败项
 - 启动、安装依赖和后台运行共用内核单实例锁；关闭启动终端或启动器异常退出时，受管进程会先尝试安全停止并在超时后整组回收，不会长期遗留假运行状态
 
+### v1.2.19 抖音单视频更新
+
+- 单视频从已验证的详情恢复下载时，复用同一份完整媒体元数据，避免再次请求相同作品详情；复用前仍核对作品 ID 和作者 ID。
+- 新增 `Douyin item live smoke` 独立机器测试，从实际单作品链接走正式发现、下载和 FFprobe 校验链路。测试只使用新建的匿名浏览器会话，不读取个人 Chrome Cookie；仅上传脱敏报告，不上传下载媒体。
+- 匿名测试成功只证明当前公开内容在该测试网络上可下载，不代表用户账号、Cookie、代理或网络过滤器的问题也已经排除。
+
 ### v1.2.18 稳定性更新
 
 - 后台暂时断连会自动恢复；首次读取设置失败也会自动重试。只有确定的前后端版本冲突才要求重新启动和刷新。
@@ -365,6 +371,20 @@ pytest
 ```bash
 python scripts/douyin_portable_live_smoke.py --report portable-live-report.json
 ```
+
+### 任意抖音单作品的真实下载检查
+
+`Douyin item live smoke` workflow 接受单作品链接，也支持带 `modal_id` 的收藏弹窗链接；当前在独立 macOS 和 Ubuntu 环境检查。它不会只检查媒体地址是否可访问，而是下载完整文件，再用 FFprobe 读取实际尺寸、时长，并记录大小和 SHA-256。临时媒体在检查结束后删除，Actions 只保留脱敏 JSON 报告。
+
+本机可运行同一入口，重复 `--url` 可检查多个作品：
+
+```bash
+python scripts/douyin_item_live_smoke.py \
+  --url 'https://www.douyin.com/user/self?modal_id=7684132989608949594' \
+  --report data/diagnostics/item-live-report.json
+```
+
+该入口不读取个人 Chrome Cookie，只允许本次匿名会话由网站设置的临时 Cookie。需要登录权限的作品仍可能失败；请以实际报告为准，不要将匿名检查结果当作个人账号权限的验证结果。
 
 ## 隐私、安全与免责声明
 
