@@ -8,6 +8,7 @@ import socket
 import subprocess
 import sys
 import sysconfig
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -214,6 +215,81 @@ def test_direct_backend_signals_shutdown_cleanly(
     finally:
         if process.poll() is None:
             _finish_owned_process(process)
+
+
+def test_idle_event_streams_do_not_starve_health_or_block_shutdown(
+    tmp_path: Path,
+) -> None:
+    project = _isolated_project(tmp_path)
+    runtime_dir = project / "data" / "runtime"
+    port = _free_port()
+    process = _start_backend(project, port=port, runtime_dir=runtime_dir)
+    streams = []
+    captured_output = []
+
+    def drain_output() -> None:
+        assert process.stdout is not None
+        with process.stdout:
+            captured_output.append(process.stdout.read())
+
+    output_reader = threading.Thread(target=drain_output, daemon=True)
+    output_reader.start()
+    try:
+        for _ in range(44):
+            request = Request(
+                f"http://127.0.0.1:{port}/api/events",
+                headers={"Accept": "text/event-stream"},
+            )
+            stream = urlopen(request, timeout=3)
+            streams.append(stream)
+            assert stream.readline() == b": connected\n"
+            assert stream.readline() == b"\n"
+
+        health = _fetch_health(port, timeout=3)
+        assert health is not None
+        assert health["status"] == "ok"
+
+        for stream in streams:
+            stream.close()
+        streams.clear()
+        stopped = subprocess.run(
+            [
+                sys.executable,
+                str(project / "stop.py"),
+                "--port",
+                str(port),
+                "--runtime-dir",
+                str(runtime_dir),
+                "--timeout",
+                "10",
+            ],
+            cwd=project,
+            env=_clean_environment(),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=WAIT_SECONDS,
+        )
+        process.wait(timeout=WAIT_SECONDS)
+        output_reader.join(timeout=5)
+        assert not output_reader.is_alive()
+        output = "".join(captured_output)
+        assert stopped.returncode == 0, stopped.stderr
+        assert process.returncode == 0
+        assert "Application shutdown complete" in output
+        assert _wait_until(lambda: _port_is_free(port))
+        assert not (runtime_dir / f"runtime-{port}.json").exists()
+    finally:
+        for stream in streams:
+            stream.close()
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=WAIT_SECONDS)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+        output_reader.join(timeout=5)
 
 
 def test_duplicate_port_choice_reuses_one_project_instance_and_stop_is_safe(

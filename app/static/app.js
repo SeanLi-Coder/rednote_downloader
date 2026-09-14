@@ -54,9 +54,11 @@
   };
 
   const state = {
+    backendReady: false,
     chromeProfile: null,
     eventSource: null,
     filter: "all",
+    initialized: false,
     jobs: new Map(),
     polling: false,
     pollingTick: 0,
@@ -972,6 +974,9 @@
 
   function localizeRuntimeMessage(value, job = null) {
     let text = asText(value);
+    if (text.startsWith("Could not save settings. Check free disk space and write permissions for the project's data folder")) {
+      return "设置未能保存，程序仍在使用之前的设置。请检查磁盘剩余空间，以及项目 data 文件夹是否有写入权限，处理后再次点击“保存设置”。";
+    }
     if (text.includes("Some Douyin image positions reported Live Photo data")) {
       const localizedWarning = "部分抖音图片位带有 Live Photo 数据，但程序没有取得完整可信且明确无水印的动态图版本；这些位置会保存最高像素静态图。若之后仍想重试动态图，请稍后从原链接新建任务。";
       const withoutCurrentWarning = text.replace(douyinLivePhotoStaticFallbackWarning, "");
@@ -1346,6 +1351,14 @@
   }
 
   async function api(path, options = {}) {
+    const method = String(options.method || "GET").toUpperCase();
+    if (!["GET", "HEAD"].includes(method) && (!state.backendReady || state.versionBlocked || !state.initialized)) {
+      throw new Error(state.versionBlocked
+        ? "页面与后台版本不一致，请重新启动程序并刷新页面"
+        : !state.backendReady
+          ? "暂时无法连接后台，正在自动重连；连接恢复后再试，已下载文件会保留"
+          : "正在读取后台设置，请稍后再试；若持续失败，请确认后台仍在运行");
+    }
     const requestOptions = {
       ...options,
       headers: {
@@ -1432,14 +1445,25 @@
     const expectedVersion = metaContent("app-version");
     const expectedBuild = metaContent("app-build");
     let health = null;
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 5000);
     try {
       const response = await fetch("/api/health", {
         cache: "no-store",
+        signal: controller.signal,
         headers: { Accept: "application/json", "Cache-Control": "no-cache" }
       });
       if (response.ok) health = await response.json();
+      else if (response.status === 404) health = {};
     } catch {
       health = null;
+    } finally {
+      window.clearTimeout(timeout);
+    }
+    if (health === null) {
+      state.backendReady = false;
+      setConnection("disconnected", "后台暂时不可用，正在自动重连");
+      return false;
     }
 
     const rendered = expectedBuild && !expectedBuild.startsWith("__");
@@ -1453,10 +1477,16 @@
       && health?.restart_required === false
     );
     if (compatible) {
+      const recovered = !state.backendReady && state.initialized;
+      state.backendReady = true;
       elements.buildInfo.textContent = `v${health.version} · ${health.build_id}`;
+      if (recovered) {
+        setConnection("connected", state.eventSource?.readyState === 1 ? "实时连接" : "连接已恢复");
+      }
       return true;
     }
 
+    state.backendReady = false;
     state.versionBlocked = true;
     document.body.classList.add("version-blocked");
     if (state.eventSource) {
@@ -2032,7 +2062,9 @@
     if (state.eventSource) state.eventSource.close();
     const source = new EventSource("/api/events");
     state.eventSource = source;
-    source.onopen = () => setConnection("connected", "实时连接");
+    source.onopen = () => {
+      if (state.backendReady) setConnection("connected", "实时连接");
+    };
     source.onerror = () => setConnection("disconnected", "正在重连");
     source.onmessage = handleEvent;
     ["job", "progress", "status", "update"].forEach((eventName) => source.addEventListener(eventName, handleEvent));
@@ -2151,8 +2183,10 @@
       elements.chromeCookies.checked = Boolean(cookieValue);
       state.chromeProfile = firstDefined(config.chrome_profile, config.browser_profile) ?? null;
       elements.downloadDir.value = firstDefined(config.download_dir, config.output_dir, config.download_path, "downloads");
+      return true;
     } catch (error) {
       showToast(`读取设置失败：${error.message}`, "error");
+      return false;
     }
   }
 
@@ -2183,7 +2217,7 @@
         elements.settingsSaved.textContent = "";
       }, 3000);
     } catch (error) {
-      showToast(`保存设置失败：${error.message}`, "error");
+      showToast(`保存设置失败：${localizeRuntimeMessage(error.message)}`, "error");
     } finally {
       elements.saveSettingsButton.disabled = false;
       elements.saveSettingsButton.textContent = "保存设置";
@@ -2196,6 +2230,12 @@
     state.pollingTick += 1;
     try {
       if (!(await verifyBackendBuild())) return;
+      if (!state.initialized) {
+        if (!state.eventSource) connectEvents();
+        const [configLoaded] = await Promise.all([loadConfig(), fetchJobs(true)]);
+        state.initialized = configLoaded;
+        return;
+      }
       if (state.selectedJobId) await fetchJob(state.selectedJobId, true);
       if (state.pollingTick % 3 === 0) await fetchJobs(true);
     } finally {
@@ -2248,11 +2288,9 @@
 
   async function initialize() {
     bindEvents();
-    if (!(await verifyBackendBuild())) return;
-    connectEvents();
-    await Promise.all([loadConfig(), fetchJobs(true)]);
     window.setInterval(refreshActivityClock, 1000);
     window.setInterval(poll, 4000);
+    await poll();
   }
 
   initialize();

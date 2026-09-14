@@ -7748,6 +7748,110 @@ def test_cancel_while_temporary_limit_propagates_converges_to_cancelled(
         manager.shutdown()
 
 
+@pytest.mark.parametrize("phase", ["discovery", "download"])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        RuntimeError("Unexpected parser failure"),
+        MediaDownloadError("HTTP Error 503: Service Unavailable"),
+    ],
+    ids=["ordinary-failure", "queue-pausing-failure"],
+)
+def test_cancel_while_general_failure_propagates_preserves_saved_files(
+    monkeypatch, tmp_path, phase, failure
+) -> None:
+    failure_pending = threading.Event()
+    release_failure = threading.Event()
+    saved_paths: list[Path] = []
+
+    class BlockingFailureEngine:
+        def fail_after_cancellation(self):
+            failure_pending.set()
+            assert release_failure.wait(timeout=5)
+            raise failure
+
+        def discover(self, url, platform, kind, *, should_cancel):
+            if phase == "discovery":
+                self.fail_after_cancellation()
+            return DiscoveryResult(
+                author="Cancellation Author",
+                items=[
+                    DownloadItem(
+                        id=item_id,
+                        media_id=media_id,
+                        source_url=f"https://www.youtube.com/watch?v={media_id}",
+                        title=item_id,
+                        media_type=MediaType.VIDEO,
+                    )
+                    for item_id, media_id in [
+                        ("completed", "abcdefghijk"),
+                        ("active", "lmnopqrstuv"),
+                        ("queued", "wxyzABCDEFG"),
+                    ]
+                ],
+            )
+
+        def download_item(self, item, platform, output_dir, *, callback, should_cancel):
+            assert item.id != "queued"
+            path = Path(output_dir) / f"{item.id}.mp4"
+            path.write_bytes(b"saved media")
+            saved_paths.append(path)
+            callback(EngineEvent(event="asset_completed", output_paths=[str(path)]))
+            if item.id == "active":
+                self.fail_after_cancellation()
+            return DownloadOutcome(
+                output_paths=[str(path)],
+                title=item.title,
+                upload_date="2025-11-14",
+                author="Cancellation Author",
+                media_type=MediaType.VIDEO,
+            )
+
+    manager = DownloadManager(
+        state_dir=tmp_path / "state",
+        default_output_root=tmp_path / "downloads",
+        max_workers=1,
+    )
+    monkeypatch.setattr(manager, "_engine_for_job", lambda job: BlockingFailureEngine())
+    try:
+        created = manager.create_job(
+            "https://www.youtube.com/@BlenderOfficial", cookie_browser=None
+        )
+        assert failure_pending.wait(timeout=2)
+        cancelling = manager.cancel_job(created.id)
+        assert cancelling.cancel_requested is True
+
+        release_failure.set()
+        final = wait_for_job(manager, created.id)
+
+        assert final.status == JobStatus.CANCELLED
+        assert final.cancel_requested is False
+        assert final.error == "Cancelled by user"
+        assert final.issue_code is None
+        assert final.issue_message is None
+        assert final.auth_message is None
+        assert final.verification_url is None
+        assert final.active_item_id is None
+        assert final.activity_message is None
+        if phase == "download":
+            assert [item.status for item in final.items] == [
+                ItemStatus.COMPLETED,
+                ItemStatus.CANCELLED,
+                ItemStatus.CANCELLED,
+            ]
+            assert final.completed_items == 1
+            assert final.failed_items == 0
+            assert final.items[0].output_paths == [str(saved_paths[0])]
+            assert final.items[1].output_paths == [str(saved_paths[1])]
+            assert all(path.read_bytes() == b"saved media" for path in saved_paths)
+        else:
+            assert final.items == []
+        assert JsonJobStore(tmp_path / "state").get(created.id) == final
+    finally:
+        release_failure.set()
+        manager.shutdown()
+
+
 @pytest.mark.parametrize(
     ("failure", "expected_status", "expected_code"),
     [

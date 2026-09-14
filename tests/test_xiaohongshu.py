@@ -13,6 +13,7 @@ from yt_dlp.utils import DownloadError
 from app.errors import (
     AuthenticationRequiredError,
     DiscoveryError,
+    SiteIssueCode,
     TemporaryAccessError,
 )
 from app.xiaohongshu import (
@@ -277,6 +278,162 @@ def test_parse_note_respects_disabled_browser_cookies(monkeypatch) -> None:
     assert note.note_id == NOTE_ID
     assert fallback_used is False
     assert "cookiesfrombrowser" not in FakeYoutubeDL.created_options[0]
+
+
+def _note_identity_html(identity: dict) -> str:
+    note = {
+        "title": "Identity fixture",
+        "type": "video",
+        "user": {"userId": "5c99d4b30000000011015e6d"},
+        "video": {
+            "media": {
+                "stream": {
+                    "h264": [
+                        {
+                            "masterUrl": "https://sns-video-bd.xhscdn.com/fixture.mp4",
+                            "width": 1920,
+                            "height": 1080,
+                        }
+                    ]
+                }
+            }
+        },
+        **identity,
+    }
+    state = {"note": {"noteDetailMap": {NOTE_ID: {"note": note}}}}
+    return f"<script>window.__INITIAL_STATE__ = {json.dumps(state)};</script>"
+
+
+@pytest.mark.parametrize("identity_key", ["noteId", "note_id", "id"])
+@pytest.mark.parametrize(
+    "payload_id",
+    ["6411cf99000000001300b6d8", "", None, 123, {"id": NOTE_ID}],
+)
+def test_parse_note_rejects_conflicting_or_invalid_inner_identity(
+    monkeypatch,
+    identity_key,
+    payload_id,
+) -> None:
+    monkeypatch.setattr(
+        "app.xiaohongshu._read_page",
+        lambda *args: _note_identity_html({identity_key: payload_id}),
+    )
+
+    with pytest.raises(DiscoveryError, match="note identity") as failure:
+        parse_note(NOTE_URL, use_browser_cookies=False)
+
+    assert failure.value.issue_code == SiteIssueCode.SITE_RESPONSE_CHANGED
+    assert "Chrome verification is not required" in str(failure.value)
+
+
+@pytest.mark.parametrize(
+    "identity",
+    [
+        {},
+        {"noteId": NOTE_ID},
+        {"note_id": NOTE_ID.upper()},
+        {"id": NOTE_ID},
+        {"noteId": NOTE_ID, "note_id": NOTE_ID, "id": NOTE_ID},
+    ],
+)
+def test_parse_note_keeps_matching_and_legacy_key_bound_payloads(
+    monkeypatch,
+    identity,
+) -> None:
+    monkeypatch.setattr(
+        "app.xiaohongshu._read_page",
+        lambda *args: _note_identity_html(identity),
+    )
+
+    note, _ = parse_note(
+        f"https://www.xiaohongshu.com/explore/{NOTE_ID.upper()}",
+        use_browser_cookies=False,
+    )
+
+    assert note.note_id == NOTE_ID
+    assert note.videos
+
+
+def test_parse_note_rejects_conflicting_alias_despite_matching_primary_id(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "app.xiaohongshu._read_page",
+        lambda *args: _note_identity_html(
+            {
+                "noteId": NOTE_ID,
+                "note_id": "6411cf99000000001300b6d8",
+            }
+        ),
+    )
+
+    with pytest.raises(DiscoveryError, match="note identity"):
+        parse_note(NOTE_URL, use_browser_cookies=False)
+
+
+def test_parse_note_token_refresh_preserves_identity_failure(monkeypatch) -> None:
+    requested_urls = []
+
+    def read_page(ydl, url):
+        requested_urls.append(url)
+        if "xsec_token=" in url:
+            return (
+                "<script>window.__INITIAL_STATE__ = "
+                '{"note":{"noteDetailMap":{}}};</script>'
+            )
+        return _note_identity_html({"noteId": "6411cf99000000001300b6d8"})
+
+    monkeypatch.setattr("app.xiaohongshu._read_page", read_page)
+
+    with pytest.raises(DiscoveryError, match="note identity") as failure:
+        parse_note(f"{NOTE_URL}?xsec_token=stale", use_browser_cookies=False)
+
+    assert failure.value.issue_code == SiteIssueCode.SITE_RESPONSE_CHANGED
+    assert len(requested_urls) == 2
+    assert requested_urls[-1] == NOTE_URL
+
+
+@pytest.mark.parametrize("stage", ["discover", "download"])
+def test_downloader_blocks_inner_identity_mismatch_before_media_transfer(
+    monkeypatch,
+    tmp_path,
+    stage,
+) -> None:
+    from app.downloader import DownloaderConfig, MediaDownloader
+    from app.models import DownloadItem, MediaType
+    from app.platforms import Platform, SourceKind
+
+    monkeypatch.setattr(
+        "app.xiaohongshu._read_page",
+        lambda *args: _note_identity_html({"noteId": "6411cf99000000001300b6d8"}),
+    )
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    transfers = []
+    monkeypatch.setattr(
+        engine,
+        "_download_first_available_asset",
+        lambda *args, **kwargs: transfers.append(True),
+    )
+    item = DownloadItem(
+        id=NOTE_ID,
+        media_id=NOTE_ID,
+        source_url=NOTE_URL,
+        title="Expected work",
+        media_type=MediaType.VIDEO,
+        metadata={
+            "xiaohongshu_profile_id": "5c99d4b30000000011015e6d",
+            "profile_note_membership_verified": True,
+        },
+    )
+
+    with pytest.raises(DiscoveryError, match="note identity"):
+        if stage == "discover":
+            engine.discover(NOTE_URL, Platform.XIAOHONGSHU, SourceKind.ITEM)
+        else:
+            engine.download_item(item, Platform.XIAOHONGSHU, tmp_path)
+
+    assert not transfers
+    assert not list(tmp_path.iterdir())
 
 
 def test_parse_note_retries_without_cookies_when_browser_database_is_unavailable(

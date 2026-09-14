@@ -5421,17 +5421,34 @@ class MediaDownloader:
                         if declared_assets
                         else None
                     )
+                    highest_pixels = (
+                        int(declared_floor.width or 0) * int(declared_floor.height or 0)
+                        if declared_floor
+                        else 0
+                    )
+                    # A failed highest rendition must not silently select a lower one.
+                    # Original or incompletely sized streams must meet that floor.
                     flattened = [
                         RemoteAsset(
                             candidates=list(asset.candidates),
                             index=asset.index,
                             width=(
-                                asset.width
-                                or (declared_floor.width if declared_floor else None)
+                                declared_floor.width
+                                if declared_floor
+                                and (
+                                    asset.format_id == "original"
+                                    or not (asset.width and asset.height)
+                                )
+                                else asset.width
                             ),
                             height=(
-                                asset.height
-                                or (declared_floor.height if declared_floor else None)
+                                declared_floor.height
+                                if declared_floor
+                                and (
+                                    asset.format_id == "original"
+                                    or not (asset.width and asset.height)
+                                )
+                                else asset.height
                             ),
                             size=asset.size,
                             format_id=asset.format_id,
@@ -5439,6 +5456,11 @@ class MediaDownloader:
                             duration=asset.duration,
                         )
                         for asset in note.videos
+                        if not highest_pixels
+                        or asset.format_id == "original"
+                        or not (asset.width and asset.height)
+                        or int(asset.width or 0) * int(asset.height or 0)
+                        == highest_pixels
                     ]
                     try:
                         path, chosen = self._download_first_available_asset(

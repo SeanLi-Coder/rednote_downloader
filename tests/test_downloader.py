@@ -10071,3 +10071,212 @@ def test_xhs_original_video_inherits_best_declared_floor_and_is_verified(
     )
     assert outcome.selected_format == "original"
     assert outcome.resolution == "1920x1080"
+
+
+def _xhs_quality_download_fixture(monkeypatch, assets, routes):
+    note_id = "6411cf99000000001300b6d9"
+    note = XiaohongshuNote(
+        note_id=note_id,
+        title="Quality fixture",
+        author="Test Author",
+        upload_date="2025-11-14",
+        videos=assets,
+    )
+    requests = []
+    payload_dimensions = {}
+
+    class QualityYoutubeDL(FakeYoutubeDL):
+        def urlopen(self, request):
+            name = Path(urlsplit(request.url).path).stem
+            requests.append(name)
+            dimensions = routes[name]
+            if isinstance(dimensions, Exception):
+                raise dimensions
+            payload = b"\x00\x00\x00\x18ftypmp42" + name.encode()
+            payload_dimensions[payload] = dimensions
+            return Response(
+                BytesIO(payload),
+                url=request.url,
+                headers={
+                    "Content-Type": "video/mp4",
+                    "Content-Length": str(len(payload)),
+                },
+            )
+
+    def ffprobe_output(command, **kwargs):
+        width, height = payload_dimensions[Path(command[-1]).read_bytes()]
+        return json.dumps(
+            {
+                "streams": [
+                    {
+                        "codec_type": "video",
+                        "codec_name": "h264",
+                        "width": width,
+                        "height": height,
+                    }
+                ],
+            }
+        ).encode()
+
+    monkeypatch.setattr(
+        "app.downloader.parse_xhs_note", lambda *args, **kwargs: (note, False)
+    )
+    monkeypatch.setattr("app.downloader.YoutubeDL", QualityYoutubeDL)
+    engine = MediaDownloader(DownloaderConfig(cookie_browser=None))
+    monkeypatch.setattr(engine, "_find_ffprobe_executable", lambda: "/fake/ffprobe")
+    monkeypatch.setattr(engine, "_run_ffprobe", ffprobe_output)
+    item = DownloadItem(
+        id=note_id,
+        media_id=note_id,
+        source_url=f"https://www.xiaohongshu.com/explore/{note_id}",
+        title=note.title,
+        media_type=MediaType.VIDEO,
+    )
+    return engine, item, requests
+
+
+def _xhs_quality_asset(name, width=None, height=None, *, backups=()):
+    return RemoteAsset(
+        candidates=[
+            f"https://sns-video-bd.xhscdn.com/{candidate}.mp4"
+            for candidate in (name, *backups)
+        ],
+        index=1,
+        width=width,
+        height=height,
+        format_id=name,
+    )
+
+
+def test_xhs_highest_video_failure_never_downloads_lower_rendition(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    engine, item, requests = _xhs_quality_download_fixture(
+        monkeypatch,
+        [
+            _xhs_quality_asset("highest", 1920, 1080),
+            _xhs_quality_asset("lower", 1280, 720),
+        ],
+        {
+            "highest": TransportError(cause=TimeoutError("Media request timed out")),
+            "lower": (1280, 720),
+        },
+    )
+    events = []
+
+    with pytest.raises(MediaDownloadError, match="timed out") as failure:
+        engine.download_item(
+            item, Platform.XIAOHONGSHU, tmp_path, callback=events.append
+        )
+
+    assert failure.value.issue_code == SiteIssueCode.NETWORK_ERROR
+    assert requests == ["highest"]
+    assert not list(tmp_path.iterdir())
+    assert not any(event.event == "completed" for event in events)
+
+
+@pytest.mark.parametrize("same_rendition", [False, True])
+def test_xhs_highest_video_can_use_equivalent_backup_without_lowering_quality(
+    monkeypatch,
+    tmp_path,
+    same_rendition,
+) -> None:
+    assets = [
+        _xhs_quality_asset(
+            "highest",
+            1920,
+            1080,
+            backups=("backup",) if same_rendition else (),
+        ),
+    ]
+    if not same_rendition:
+        assets.append(_xhs_quality_asset("backup", 1920, 1080))
+    assets.append(_xhs_quality_asset("lower", 1280, 720))
+    engine, item, requests = _xhs_quality_download_fixture(
+        monkeypatch,
+        assets,
+        {
+            "highest": TransportError(cause=TimeoutError("Media request timed out")),
+            "backup": (1920, 1080),
+            "lower": (1280, 720),
+        },
+    )
+
+    outcome = engine.download_item(item, Platform.XIAOHONGSHU, tmp_path)
+
+    assert requests == ["highest", "backup"]
+    assert outcome.resolution == "1920x1080"
+    assert len(outcome.output_paths) == 1
+    assert Path(outcome.output_paths[0]).read_bytes().endswith(b"backup")
+    assert not list(tmp_path.glob("*.part"))
+
+
+@pytest.mark.parametrize("original_dimensions", [(1280, 720), (1920, 1080)])
+def test_xhs_original_video_is_measured_against_highest_known_stream(
+    monkeypatch,
+    tmp_path,
+    original_dimensions,
+) -> None:
+    engine, item, requests = _xhs_quality_download_fixture(
+        monkeypatch,
+        [
+            _xhs_quality_asset("original"),
+            _xhs_quality_asset("highest", 1920, 1080),
+            _xhs_quality_asset("lower", 1280, 720),
+        ],
+        {
+            "original": original_dimensions,
+            "highest": TransportError(cause=TimeoutError("Media request timed out")),
+            "lower": (1280, 720),
+        },
+    )
+
+    if original_dimensions == (1280, 720):
+        with pytest.raises(MediaDownloadError):
+            engine.download_item(item, Platform.XIAOHONGSHU, tmp_path)
+        assert requests == ["original", "highest"]
+        assert not list(tmp_path.iterdir())
+    else:
+        outcome = engine.download_item(item, Platform.XIAOHONGSHU, tmp_path)
+        assert requests == ["original"]
+        assert outcome.selected_format == "original"
+        assert outcome.resolution == "1920x1080"
+        assert len(outcome.output_paths) == 1
+
+
+@pytest.mark.parametrize(
+    "declared_dimensions", [(None, None), (None, 1920), (1080, None)]
+)
+@pytest.mark.parametrize("actual_dimensions", [(1920, 1080), (1280, 720)])
+def test_xhs_unknown_video_dimensions_use_complete_highest_floor(
+    monkeypatch,
+    tmp_path,
+    declared_dimensions,
+    actual_dimensions,
+) -> None:
+    engine, item, requests = _xhs_quality_download_fixture(
+        monkeypatch,
+        [
+            _xhs_quality_asset("highest", 1920, 1080),
+            _xhs_quality_asset("unknown", *declared_dimensions),
+            _xhs_quality_asset("lower", 1280, 720),
+        ],
+        {
+            "highest": TransportError(cause=TimeoutError("Media request timed out")),
+            "unknown": actual_dimensions,
+            "lower": (1280, 720),
+        },
+    )
+
+    if actual_dimensions == (1920, 1080):
+        outcome = engine.download_item(item, Platform.XIAOHONGSHU, tmp_path)
+        assert outcome.resolution == "1920x1080"
+        assert len(outcome.output_paths) == 1
+        assert Path(outcome.output_paths[0]).read_bytes().endswith(b"unknown")
+        assert not list(tmp_path.glob("*.part"))
+    else:
+        with pytest.raises(MediaDownloadError, match="below its declared 1920x1080"):
+            engine.download_item(item, Platform.XIAOHONGSHU, tmp_path)
+        assert not list(tmp_path.iterdir())
+    assert requests == ["highest", "unknown"]

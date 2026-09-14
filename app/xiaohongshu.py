@@ -31,6 +31,7 @@ from .errors import (
     AuthenticationRequiredError,
     DiscoveryError,
     DownloadCancelledError,
+    SiteIssueCode,
     TemporaryAccessError,
 )
 
@@ -124,6 +125,10 @@ class _XiaohongshuRedirectRejected(RuntimeError):
         super().__init__(f"Xiaohongshu redirect was blocked ({reason})")
         self.reason = reason
         self.target_url = target_url
+
+
+class _XiaohongshuNoteIdentityError(DiscoveryError):
+    pass
 
 
 class _QuietCookieLogger:
@@ -1261,7 +1266,7 @@ def parse_note(
     )
     if not match:
         raise DiscoveryError("Invalid Xiaohongshu note URL")
-    note_id = match.group(1)
+    note_id = match.group(1).lower()
     cookie_fallback_used = False
 
     def load(use_cookies: bool) -> str:
@@ -1334,6 +1339,8 @@ def parse_note(
                         use_browser_cookies=use_browser_cookies,
                         allow_cookie_fallback=allow_cookie_fallback,
                     )
+                except _XiaohongshuNoteIdentityError:
+                    raise
                 except DiscoveryError as exc:
                     raise TemporaryAccessError(
                         "Xiaohongshu returned no note data for the saved access token "
@@ -1346,6 +1353,19 @@ def parse_note(
             "Xiaohongshu returned no note data. The note may be private, deleted, "
             "or require verification."
         )
+
+    # The map key binds legacy payloads; an explicit inner ID must agree with it.
+    for identity_key in ("noteId", "note_id", "id"):
+        if identity_key not in note:
+            continue
+        value = note[identity_key]
+        if not isinstance(value, str) or value.strip().lower() != note_id:
+            raise _XiaohongshuNoteIdentityError(
+                "Xiaohongshu returned a mismatched or invalid note identity. "
+                "The response was blocked before downloading media; check the "
+                "original note link. Chrome verification is not required.",
+                issue_code=SiteIssueCode.SITE_RESPONSE_CHANGED,
+            )
 
     user = note.get("user") if isinstance(note.get("user"), dict) else {}
     author_id = ""

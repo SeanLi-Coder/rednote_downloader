@@ -243,6 +243,12 @@ def test_douyin_redirect_messages_execute_with_safe_legacy_and_reason_parsing(
             "required.",
             "在过滤器中放行抖音",
         ),
+        (
+            "Could not save settings. Check free disk space and write permissions "
+            "for the project's data folder, then save again. The previous settings "
+            "are still in use.",
+            "程序仍在使用之前的设置。请检查磁盘剩余空间",
+        ),
     ]
     harness = (
         "globalThis.window = {};\n"
@@ -284,11 +290,11 @@ def test_douyin_redirect_messages_execute_with_safe_legacy_and_reason_parsing(
     assert "无法判断" in messages[9]
     assert "代理或 VPN" in messages[9]
     assert "不需要打开 Chrome 验证" in messages[9]
-    assert "稍后从原链接新建任务" in messages[-3]
-    assert "明确无水印的动态图版本" in messages[-2]
-    assert "Some Douyin image positions" not in messages[-2]
-    assert "关闭 DNS 过滤、切换网络" in messages[-1]
-    assert "不需要打开 Chrome 验证" in messages[-1]
+    assert "稍后从原链接新建任务" in messages[-4]
+    assert "明确无水印的动态图版本" in messages[-3]
+    assert "Some Douyin image positions" not in messages[-3]
+    assert "关闭 DNS 过滤、切换网络" in messages[-2]
+    assert "不需要打开 Chrome 验证" in messages[-2]
 
 
 def test_interrupted_job_labels_queued_items_as_waiting_to_continue(
@@ -965,3 +971,169 @@ def test_discovery_activity_and_active_item_progress_are_visible(
         "mediaCandidateOverall": 25,
         "qualityCandidateReadOverall": 25,
     }
+
+
+def test_backend_connection_recovers_without_bypassing_version_checks(
+    tmp_path: Path,
+) -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is unavailable")
+    source = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
+    tail = "  initialize();\n})();\n"
+    assert tail in source
+    source = source.replace(
+        tail,
+        "  window.test = { initialize, poll, verifyBackendBuild, api, state };\n})();\n",
+    )
+    harness = r"""
+const assert = require("node:assert/strict");
+const vm = require("node:vm");
+
+function makeApp(healthResponses, configResponses = []) {
+  const elements = new Map();
+  const intervals = [];
+  const timeouts = new Map();
+  const calls = [];
+  const sources = [];
+  let timeoutId = 0;
+  const element = () => ({
+    textContent: "", value: "", hidden: false, disabled: false, dataset: {},
+    classList: { add() {}, remove() {}, toggle() {} },
+    addEventListener() {}, setAttribute() {}, append() {}, replaceChildren() {},
+    querySelector() { return this; }, querySelectorAll() { return []; }
+  });
+  const meta = { "app-id": "downloader", "app-version": "1.0", "app-build": "build-a" };
+  const document = {
+    hidden: false, body: element(), addEventListener() {},
+    querySelector(selector) {
+      const match = selector.match(/^meta\[name="(.*)"\]$/);
+      if (match) return { content: meta[match[1]] };
+      if (!elements.has(selector)) elements.set(selector, element());
+      return elements.get(selector);
+    },
+    querySelectorAll() { return [...elements.values()]; },
+    createElement: element
+  };
+  const healthy = {
+    status: "ok", app_id: "downloader", version: "1.0",
+    build_id: "build-a", source_build_id: "build-a", restart_required: false
+  };
+  const jsonResponse = (body) => ({
+    ok: true, status: 200, headers: { get: () => "application/json" },
+    json: async () => body
+  });
+  const context = {
+    document, AbortController,
+    window: {
+      addEventListener() {},
+      setInterval(fn, delay) { intervals.push({ fn, delay }); },
+      setTimeout(fn, delay) { const id = ++timeoutId; timeouts.set(id, { fn, delay }); return id; },
+      clearTimeout(id) { timeouts.delete(id); }
+    },
+    EventSource: class {
+      constructor() { this.readyState = 1; sources.push(this); }
+      addEventListener() {}
+      close() { this.closed = true; }
+    },
+    fetch: async (path, options) => {
+      calls.push({ path, method: options?.method || "GET" });
+      if (path === "/api/health") {
+        const response = healthResponses.shift() || "ok";
+        if (response === "network") throw new Error("temporary disconnect");
+        if (response === "timeout") return new Promise((resolve, reject) => {
+          options.signal.addEventListener("abort", () => reject(new Error("aborted")));
+        });
+        if (response === "503") return { ok: false, status: 503 };
+        if (response === "bad-json") return { ok: true, json: async () => { throw new Error("invalid JSON"); } };
+        if (response === "mismatch") return jsonResponse({ ...healthy, build_id: "build-b" });
+        return jsonResponse(healthy);
+      }
+      if (path === "/api/config") {
+        if (configResponses.shift() === "503") return { ok: false, status: 503, json: async () => ({ detail: "temporary settings failure" }) };
+        return jsonResponse({ download_dir: "/tmp/downloads", use_chrome_cookies: true });
+      }
+      if (path === "/api/jobs") return jsonResponse([]);
+      return jsonResponse({ status: "ok" });
+    }
+  };
+  context.window.EventSource = context.EventSource;
+  vm.runInNewContext(__source, context);
+  return { test: context.window.test, intervals, timeouts, calls, sources, elements };
+}
+
+(async () => {
+  const startup = makeApp(["network", "ok", "503", "ok"]);
+  await startup.test.initialize();
+  assert.equal(startup.test.state.versionBlocked, false);
+  assert.equal(startup.test.state.initialized, false);
+  assert.equal(startup.intervals.filter(timer => timer.delay === 4000).length, 1);
+  assert.match(startup.elements.get("#connection-status").textContent, /自动重连/);
+  await assert.rejects(startup.test.api("/api/jobs/a/retry", { method: "POST" }), /自动重连/);
+  assert.equal(startup.calls.filter(call => call.method === "POST").length, 0);
+
+  await startup.intervals.find(timer => timer.delay === 4000).fn();
+  assert.equal(startup.test.state.initialized, true);
+  assert.equal(startup.test.state.backendReady, true);
+  assert.equal(startup.sources.length, 1);
+  assert.equal(startup.elements.get("#download-dir").value, "/tmp/downloads");
+  await startup.test.api("/api/jobs/a/retry", { method: "POST" });
+  assert.equal(startup.calls.filter(call => call.method === "POST").length, 1);
+
+  await startup.test.poll();
+  assert.equal(startup.test.state.versionBlocked, false);
+  assert.equal(startup.test.state.backendReady, false);
+  await assert.rejects(startup.test.api("/api/jobs/a/cancel", { method: "POST" }), /自动重连/);
+  await startup.test.poll();
+  assert.equal(startup.test.state.backendReady, true);
+  assert.equal(startup.sources.length, 1);
+  await startup.test.api("/api/config", { method: "PUT", body: "{}" });
+
+  const settingsFailure = makeApp(["ok", "ok"], ["503", "ok"]);
+  await settingsFailure.test.initialize();
+  assert.equal(settingsFailure.test.state.initialized, false);
+  assert.equal(settingsFailure.test.state.backendReady, true);
+  await assert.rejects(settingsFailure.test.api("/api/jobs", { method: "POST" }), /读取后台设置/);
+  assert.equal(settingsFailure.calls.filter(call => call.method === "POST").length, 0);
+  await settingsFailure.test.poll();
+  assert.equal(settingsFailure.test.state.initialized, true);
+  assert.equal(settingsFailure.sources.length, 1);
+  assert.equal(settingsFailure.elements.get("#download-dir").value, "/tmp/downloads");
+  assert.equal(settingsFailure.calls.filter(call => call.path === "/api/config").length, 2);
+  await settingsFailure.test.api("/api/jobs", { method: "POST" });
+
+  const malformed = makeApp(["bad-json", "ok"]);
+  assert.equal(await malformed.test.verifyBackendBuild(), false);
+  assert.equal(malformed.test.state.versionBlocked, false);
+  assert.equal(await malformed.test.verifyBackendBuild(), true);
+
+  const timedOut = makeApp(["timeout", "ok"]);
+  const pending = timedOut.test.verifyBackendBuild();
+  assert.equal(timedOut.timeouts.size, 1);
+  const timer = [...timedOut.timeouts.values()][0];
+  assert.equal(timer.delay, 5000);
+  timer.fn();
+  assert.equal(await pending, false);
+  assert.equal(timedOut.timeouts.size, 0);
+  assert.equal(timedOut.test.state.versionBlocked, false);
+  assert.equal(await timedOut.test.verifyBackendBuild(), true);
+
+  const mismatch = makeApp(["mismatch", "ok"]);
+  assert.equal(await mismatch.test.verifyBackendBuild(), false);
+  assert.equal(mismatch.test.state.versionBlocked, true);
+  assert.equal(mismatch.test.state.backendReady, false);
+  assert.equal(mismatch.elements.get("#download-button").disabled, true);
+  await assert.rejects(mismatch.test.api("/api/jobs/a/retry", { method: "POST" }), /版本不一致/);
+  assert.equal(await mismatch.test.verifyBackendBuild(), false);
+  assert.equal(mismatch.calls.length, 1);
+  process.stdout.write("connection recovery and version protection passed");
+})().catch(error => { console.error(error); process.exitCode = 1; });
+"""
+    completed = _run_node_script(
+        node,
+        f"const __source = {json.dumps(source)};\n" + harness,
+        tmp_path,
+        "backend-connection-recovery.js",
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout == "connection recovery and version protection passed"

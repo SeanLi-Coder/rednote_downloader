@@ -1,15 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
-import queue
 import re
 import secrets
+import tempfile
 import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Annotated, Iterator
+from typing import Annotated, AsyncIterator
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from fastapi import Body, FastAPI, HTTPException, Request
@@ -22,6 +23,7 @@ from .browser import open_chrome
 from .build_info import APP_ID, APP_VERSION, BUILD_ID, calculate_build_id
 from .downloader import DownloaderConfig
 from .errors import SiteIssueCode
+from .event_stream import JobEventBuffer
 from .models import DownloadJob, ItemStatus, JobStatus, Platform, SourceKind
 from .platforms import UnsupportedUrlError, identify_url
 from .runtime import (
@@ -67,6 +69,7 @@ PUBLIC_DOUYIN_MEDIA_FIELDS = frozenset(
     }
 )
 PUBLIC_SENSITIVE_QUERY_FIELDS = frozenset({"xsec_token"})
+_CONFIG_LOCK = threading.RLock()
 
 
 class AppConfig(BaseModel):
@@ -105,12 +108,19 @@ def _load_config() -> AppConfig:
 
 def _save_config(config: AppConfig) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    temporary = CONFIG_PATH.with_suffix(".json.tmp")
-    temporary.write_text(
-        json.dumps(config.model_dump(), ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
+    descriptor, name = tempfile.mkstemp(
+        prefix=".config-", suffix=".tmp", dir=CONFIG_PATH.parent
     )
-    temporary.replace(CONFIG_PATH)
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(config.model_dump(), handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(CONFIG_PATH)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 config = _load_config()
@@ -278,12 +288,14 @@ def stop_runtime(request: Request) -> dict[str, str]:
 
 @app.get("/api/config", response_model=AppConfig)
 def get_config() -> AppConfig:
-    return config.model_copy(deep=True)
+    with _CONFIG_LOCK:
+        return config.model_copy(deep=True)
 
 
 @app.put("/api/config", response_model=AppConfig)
 def update_config(request: AppConfig) -> AppConfig:
     global config
+    request = request.model_copy(deep=True)
     output_dir = Path(request.download_dir)
     try:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -292,25 +304,37 @@ def update_config(request: AppConfig) -> AppConfig:
             status_code=422,
             detail=f"Cannot create download directory: {exc}",
         ) from exc
-    config = request
-    manager.default_output_root = output_dir
-    manager.downloader_config.cookie_browser = (
-        "chrome" if request.use_chrome_cookies else None
-    )
-    manager.downloader_config.cookie_profile = request.chrome_profile
-    _save_config(config)
-    return config.model_copy(deep=True)
+    with _CONFIG_LOCK:
+        try:
+            _save_config(request)
+        except OSError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Could not save settings. Check free disk space and write "
+                    "permissions for the project's data folder, then save again. "
+                    "The previous settings are still in use."
+                ),
+            ) from exc
+        config = request
+        manager.default_output_root = output_dir
+        manager.downloader_config.cookie_browser = (
+            "chrome" if request.use_chrome_cookies else None
+        )
+        manager.downloader_config.cookie_profile = request.chrome_profile
+        return config.model_copy(deep=True)
 
 
 @app.post("/api/jobs", status_code=201)
 def create_job(request: CreateJobRequest):
+    snapshot = get_config()
     try:
         return _public_job(
             manager.create_job(
                 request.url,
-                output_root=config.download_dir,
-                cookie_browser="chrome" if config.use_chrome_cookies else None,
-                cookie_profile=config.chrome_profile,
+                output_root=snapshot.download_dir,
+                cookie_browser="chrome" if snapshot.use_chrome_cookies else None,
+                cookie_profile=snapshot.chrome_profile,
             )
         )
     except Exception as exc:
@@ -524,35 +548,27 @@ def open_verification(job_id: str) -> dict[str, str]:
 
 
 @app.get("/api/events")
-def events() -> StreamingResponse:
-    messages: queue.Queue[str] = queue.Queue(maxsize=1)
-
-    def listener(_, job) -> None:
-        payload = json.dumps(
-            _public_job(job).model_dump(mode="json"),
-            ensure_ascii=False,
-        )
-        try:
-            messages.put_nowait(payload)
-        except queue.Full:
-            try:
-                messages.get_nowait()
-                messages.put_nowait(payload)
-            except (queue.Empty, queue.Full):
-                pass
-
-    def stream() -> Iterator[str]:
-        manager.add_listener(listener)
+async def events() -> StreamingResponse:
+    async def stream() -> AsyncIterator[str]:
+        messages = JobEventBuffer()
+        manager.add_listener(messages.publish)
         try:
             yield ": connected\n\n"
             while True:
                 try:
-                    payload = messages.get(timeout=15)
-                    yield f"event: job\ndata: {payload}\n\n"
-                except queue.Empty:
+                    jobs = await messages.take()
+                except asyncio.TimeoutError:
                     yield ": keepalive\n\n"
+                    continue
+                for job in jobs:
+                    payload = json.dumps(
+                        _public_job(job).model_dump(mode="json"),
+                        ensure_ascii=False,
+                    )
+                    yield f"event: job\ndata: {payload}\n\n"
         finally:
-            manager.remove_listener(listener)
+            messages.close()
+            manager.remove_listener(messages.publish)
 
     return StreamingResponse(
         stream(),

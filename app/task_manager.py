@@ -1346,6 +1346,8 @@ class DownloadManager:
                     pause_queue = False
                     with self._lock:
                         job = self._require_job(job_id)
+                        if cancel_event.is_set() or job.cancel_requested:
+                            raise DownloadCancelledError("Task cancelled") from exc
                         item = self._find_item(job, item_id)
                         item.status = ItemStatus.FAILED
                         item.error = safe_message
@@ -1455,18 +1457,22 @@ class DownloadManager:
             safe_message = safe_external_error_message(exc)
             with self._lock:
                 job = self._require_job(job_id)
-                job.status = JobStatus.FAILED
-                self._clear_activity_locked(job)
-                job.error = safe_message
-                job.auth_message = None
-                self._record_issue_locked(job, safe_message, cause=exc)
-                job.retryable = job.issue_code not in NON_RETRYABLE_SITE_ISSUES
-                job.verification_url = None
-                job.active_item_id = None
-                job.finished_at = utc_now()
-                job.refresh_counts()
+                cancelled = cancel_event.is_set() or job.cancel_requested
+                if cancelled:
+                    self._mark_cancelled_locked(job)
+                else:
+                    job.status = JobStatus.FAILED
+                    self._clear_activity_locked(job)
+                    job.error = safe_message
+                    job.auth_message = None
+                    self._record_issue_locked(job, safe_message, cause=exc)
+                    job.retryable = job.issue_code not in NON_RETRYABLE_SITE_ISSUES
+                    job.verification_url = None
+                    job.active_item_id = None
+                    job.finished_at = utc_now()
+                    job.refresh_counts()
                 self._commit_locked(job)
-            self._notify(self.get_job(job_id), "failed")
+            self._notify(self.get_job(job_id), "cancelled" if cancelled else "failed")
 
     def _refresh_douyin_media_during_run(
         self,
