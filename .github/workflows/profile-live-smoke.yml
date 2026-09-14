@@ -1,0 +1,90 @@
+name: Douyin profile live smoke
+
+on:
+  push:
+    branches:
+      - codex/douyin-duration-probe
+    paths:
+      - app/**
+      - scripts/douyin_profile_live_smoke.py
+      - scripts/douyin_item_live_smoke.py
+      - .github/workflows/profile-live-smoke.yml
+  workflow_dispatch:
+    inputs:
+      url:
+        description: Public Douyin profile URL (downloads at most five items near 80%)
+        required: true
+        type: string
+        default: https://www.douyin.com/user/MS4wLjABAAAAUbSbP1q7W3AILSzSn3AsSsvgm3vmwPTdsgPyJXwZPg6vl51ORWgOUYrQ4HLw6YWb
+
+permissions:
+  contents: read
+
+jobs:
+  download:
+    name: Profile sample / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.10"
+          cache: pip
+      - name: Install FFmpeg and Python dependencies
+        shell: bash
+        run: |
+          if ! command -v ffprobe >/dev/null 2>&1; then
+            if [[ "$RUNNER_OS" == "macOS" ]]; then
+              brew install ffmpeg
+            else
+              sudo apt-get update
+              sudo apt-get install -y ffmpeg
+            fi
+          fi
+          python -m pip install -r requirements-dev.txt
+          python -m pip check
+      - name: Run duration and harness regression tests with real FFmpeg
+        shell: bash
+        run: |
+          ffmpeg -version
+          ffprobe -version
+          python -m pytest -q tests/test_douyin_duration_probe.py tests/test_profile_live_smoke.py
+      - name: Verify production Chrome channel
+        shell: bash
+        run: |
+          python - <<'PY'
+          from playwright.sync_api import sync_playwright
+          with sync_playwright() as playwright:
+              browser = playwright.chromium.launch(channel="chrome", headless=True)
+              print(f"Production Chrome channel: {browser.version}")
+              browser.close()
+          PY
+      - name: Discover profile and download bounded sample
+        shell: bash
+        env:
+          INPUT_URL: ${{ inputs.url || 'https://www.douyin.com/user/MS4wLjABAAAAUbSbP1q7W3AILSzSn3AsSsvgm3vmwPTdsgPyJXwZPg6vl51ORWgOUYrQ4HLw6YWb' }}
+        run: |
+          python - <<'PY'
+          import os
+          import subprocess
+          import sys
+          command = [sys.executable, "scripts/douyin_profile_live_smoke.py",
+                     "--url", os.environ["INPUT_URL"], "--timeout", "900",
+                     "--report", os.path.join(os.environ["RUNNER_TEMP"], "douyin-profile-report.json")]
+          raise SystemExit(subprocess.call(command))
+          PY
+      - name: Upload sanitized report only
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: douyin-profile-live-report-${{ matrix.os }}
+          path: ${{ runner.temp }}/douyin-profile-report.json
+          if-no-files-found: error
+          retention-days: 7

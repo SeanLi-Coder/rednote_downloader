@@ -3386,7 +3386,21 @@ class MediaDownloader:
         temporary_directory = None
         reuse_registered = False
         try:
-            if not self._douyin_probe_metadata_complete(media, filesize=filesize):
+            prefix_duration = (
+                self._float_or_none(media.get("duration")) if media else None
+            )
+            # A fragmented MP4 prefix can report a positive fragment duration.
+            # Confirm the complete, byte-bound file before rejecting its identity.
+            confirm_full_duration = (
+                expected_duration is not None
+                and prefix_duration is not None
+                and abs(prefix_duration - expected_duration)
+                > self._douyin_duration_tolerance(expected_duration)
+                and (filesize is None or filesize > len(payload))
+            )
+            if confirm_full_duration or not self._douyin_probe_metadata_complete(
+                media, filesize=filesize
+            ):
                 reuse = getattr(self._douyin_probe_context, "reuse", None)
                 if isinstance(reuse, _DouyinProbeReuseContext):
                     temporary_fd, temporary_name = tempfile.mkstemp(
@@ -3429,7 +3443,9 @@ class MediaDownloader:
                 tolerance = self._douyin_duration_tolerance(expected_duration)
                 if abs(duration - expected_duration) > tolerance:
                     raise _DouyinProbeRejected(
-                        "media duration did not match the requested Douyin item"
+                        "media duration did not match the requested Douyin item "
+                        f"(expected {expected_duration:.3f}s, "
+                        f"measured {duration:.3f}s, tolerance {tolerance:.3f}s)"
                     )
             bit_rate = int(media.get("bit_rate") or 0)
             if bit_rate <= 0 and filesize and duration and duration > 0:

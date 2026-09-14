@@ -4071,6 +4071,12 @@ def test_douyin_probe_caps_range_omits_cookie_and_validates_duration(
             "bit_rate": 1_000_000,
         },
     )
+    full_probe_calls = []
+    monkeypatch.setattr(
+        engine,
+        "_download_douyin_probe_file",
+        lambda *args, **kwargs: full_probe_calls.append(kwargs),
+    )
     with pytest.raises(RuntimeError, match="duration did not match"):
         engine._probe_douyin_candidate(
             ProbeYoutubeDL(),
@@ -4078,6 +4084,8 @@ def test_douyin_probe_caps_range_omits_cookie_and_validates_duration(
             expected_duration=72.8,
             should_cancel=lambda: False,
         )
+    assert len(full_probe_calls) == 1
+    assert full_probe_calls[0]["expected_filesize"] == 10_425_019
 
 
 def test_douyin_probe_rejects_unrecognized_final_redirect_before_ffprobe(

@@ -169,7 +169,13 @@ def test_quality_metrics_only_accepts_bounded_numeric_fields():
             "author": "private author",
             "url": "private URL",
         }
-    ) == {"width": 1080, "height": None, "bit_rate": None, "filesize": None}
+    ) == {
+        "width": 1080,
+        "height": None,
+        "bit_rate": None,
+        "filesize": None,
+        "duration_seconds": None,
+    }
     assert all(value is None for value in smoke.quality_metrics(None).values())
 
 
@@ -241,7 +247,13 @@ def test_quality_observer_records_dimensions_without_changing_results(monkeypatc
     assert reports[0]["status"] == "returned"
     assert reports[0]["unresolved_candidate_count"] == 0
     assert reports[0]["declared_candidates"] == [
-        {"width": 1080, "height": 1920, "bit_rate": 1_600_000, "filesize": 2100}
+        {
+            "width": 1080,
+            "height": 1920,
+            "bit_rate": 1_600_000,
+            "filesize": 2100,
+            "duration_seconds": None,
+        }
     ]
     assert [probe["meets_declared_dimensions"] for probe in reports[0]["probes"]] == [
         False,
@@ -304,6 +316,7 @@ def test_quality_observer_redacts_unrecognized_labels_and_empty_response(monkeyp
     assert reports[0]["probes"] == [
         {
             "label": "other",
+            "expected_duration_seconds": None,
             "endpoint_attempt": 1,
             "status": "empty",
             "measured": {
@@ -311,6 +324,7 @@ def test_quality_observer_redacts_unrecognized_labels_and_empty_response(monkeyp
                 "height": None,
                 "bit_rate": None,
                 "filesize": None,
+                "duration_seconds": None,
             },
         }
     ]
@@ -339,3 +353,14 @@ def test_quality_observer_limits_report_size_without_skipping_calls(monkeypatch)
     assert len(calls) == 33 * 121
     assert len(reports) == 32
     assert all(len(report["probes"]) == 120 for report in reports)
+
+
+@pytest.mark.parametrize(
+    "value", [True, "NaN", float("inf"), -1, 604_801, "private media URL", {}]
+)
+def test_quality_duration_rejects_invalid_or_unbounded_values(value):
+    assert smoke.quality_duration(value) is None
+
+
+def test_quality_metrics_preserves_ffprobe_numeric_string_duration():
+    assert smoke.quality_metrics({"duration": "12.000000"})["duration_seconds"] == 12.0

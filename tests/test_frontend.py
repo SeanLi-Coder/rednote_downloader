@@ -49,6 +49,42 @@ def _run_node_script(
     )
 
 
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "Douyin media was discovered, but its highest quality could not be verified.",
+        "Douyin Live Photo author-feed quality source could not be verified.",
+    ],
+)
+def test_duration_mismatch_shows_measured_values_and_retry_advice(tmp_path, prefix):
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is unavailable")
+    source = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
+    source = source.replace(
+        "  initialize();\n})();\n",
+        "  window.__localizeRuntimeMessage = localizeRuntimeMessage;\n})();\n",
+    )
+    message = (
+        f"{prefix} Probe details: default: "
+        "media duration did not match the requested Douyin item "
+        "(expected 12.000s, measured 1.000s, tolerance 0.500s)"
+    )
+    completed = _run_node_script(
+        node,
+        "globalThis.window = {};\n"
+        "globalThis.document = {querySelector: () => null};\n"
+        + source
+        + f"\nprocess.stdout.write(window.__localizeRuntimeMessage({json.dumps(message)}));\n",
+        tmp_path,
+        "duration-mismatch.js",
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "作品声明时长 12.000 秒，完整媒体实测 1.000 秒" in completed.stdout
+    assert "允许差值 0.500 秒" in completed.stdout
+    assert "重试" in completed.stdout
+
+
 def test_douyin_redirect_messages_execute_with_safe_legacy_and_reason_parsing(
     tmp_path: Path,
 ) -> None:

@@ -853,10 +853,17 @@
     );
   }
 
+  function localizedDurationMismatch(text) {
+    return text.replace(
+      /media duration did not match the requested Douyin item \(expected ([\d.]+)s, measured ([\d.]+)s, tolerance ([\d.]+)s\)/g,
+      "作品声明时长 $1 秒，完整媒体实测 $2 秒，允许差值 $3 秒，仍不一致"
+    ).replaceAll("media duration did not match the requested Douyin item", "媒体时长与目标抖音作品不匹配");
+  }
+
   function localizedProbeDetails(text) {
     const marker = "Probe details:";
     if (!text.includes(marker)) return "";
-    return localizedRenditionMismatch(text)
+    return localizedDurationMismatch(localizedRenditionMismatch(text))
       .split(marker, 2)[1]
       .trim()
       .replace(/[.。]+$/, "")
@@ -1195,7 +1202,10 @@
       text.includes("Douyin Live Photo default original-quality source could not be verified")
     ) {
       const details = localizedProbeDetails(text);
-      return `抖音 Live Photo 的作者直连或原始档没有通过完整性校验，程序没有下载可能降级的动态图${details ? `。本次原因：${details}` : ""}。`;
+      const advice = text.includes("media duration did not match the requested Douyin item")
+        ? "请更新程序后从原链接重新解析该作品并重试；若仍不符，请反馈失败作品链接及上述时长。不需要打开 Chrome 验证。"
+        : "";
+      return `抖音 Live Photo 的作者直连或原始档没有通过完整性校验，程序没有下载可能降级的动态图${details ? `。本次原因：${details}` : ""}。${advice}`;
     }
     if (text.includes("Douyin Live Photo highest quality could not be verified")) {
       const details = localizedProbeDetails(text);
@@ -1282,7 +1292,8 @@
     if (!text.includes("Douyin media was discovered") && !text.includes("Douyin profile media was discovered")) return text;
 
     const renditionMismatch = text.includes("verified media was below the author-feed");
-    text = localizedRenditionMismatch(text)
+    const durationMismatch = text.includes("media duration did not match the requested Douyin item");
+    text = localizedDurationMismatch(localizedRenditionMismatch(text))
       .replace(
         /Douyin (?:profile )?media was discovered, but its highest quality could not be verified\.[\s\S]*?Probe details:\s*/,
         "已发现该抖音作品，但无法验证其最高画质；为避免下错低清版本，本次没有下载。探测详情："
@@ -1305,6 +1316,7 @@
       .replaceAll("below the discovered minimum", "低于解析阶段确认的最低画质")
       .replaceAll("highest candidate uses unsupported video codec", "最高画质使用当前不支持的视频编码")
       .replaceAll("default", "原始档");
+    if (durationMismatch) return `${text}。请更新程序后从原链接重新解析该作品并重试；若仍不符，请反馈失败作品链接及上述时长，程序不会跳过校验保存可能串号的文件。不需要打开 Chrome 验证。`;
     return renditionMismatch
       ? `${text}。请更新程序后重试，让程序刷新同一作品的媒体地址并检查备用源；若仍失败，请反馈以上声明尺寸与实际尺寸。不需要打开 Chrome 验证。`
       : text;

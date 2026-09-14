@@ -6,6 +6,7 @@ import argparse
 import contextlib
 import hashlib
 import json
+import math
 import multiprocessing
 import os
 import re
@@ -116,7 +117,17 @@ def exception_chain(exc: BaseException) -> list[dict[str, Any]]:
     return result
 
 
-def quality_metrics(value: Any) -> dict[str, int | None]:
+def quality_duration(value: Any) -> float | None:
+    if type(value) not in (int, float, str):
+        return None
+    try:
+        duration = float(value)
+    except (ValueError, OverflowError):
+        return None
+    return duration if math.isfinite(duration) and 0 < duration <= 604_800 else None
+
+
+def quality_metrics(value: Any) -> dict[str, int | float | None]:
     """Copy bounded numeric fields only; never serialize media response payloads."""
     value = value if isinstance(value, dict) else {}
     bounds = {
@@ -125,12 +136,14 @@ def quality_metrics(value: Any) -> dict[str, int | None]:
         "bit_rate": 10**12,
         "filesize": 10**15,
     }
-    return {
+    metrics = {
         field: (
             raw if type(raw := value.get(field)) is int and 0 <= raw <= bound else None
         )
         for field, bound in bounds.items()
     }
+    metrics["duration_seconds"] = quality_duration(value.get("duration"))
+    return metrics
 
 
 @contextlib.contextmanager
@@ -193,6 +206,9 @@ def observe_quality_probes(engine: MediaDownloader, reports: list[dict[str, Any]
             )
             record = {
                 "label": label,
+                "expected_duration_seconds": quality_duration(
+                    kwargs.get("expected_duration")
+                ),
                 "endpoint_attempt": 1
                 + sum(probe["label"] == label for probe in scope["probes"]),
                 "status": "running",
