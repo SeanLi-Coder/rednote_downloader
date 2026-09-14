@@ -1248,6 +1248,118 @@ def test_douyin_item_discovery_accepts_bound_live_photo_signed_detail(
     ]
 
 
+@pytest.mark.parametrize("media_id", ["7684132989608949594", "7677863372330774922"])
+@pytest.mark.parametrize("parser_mismatch", [None, "id", "channel_id", "missing_owner"])
+def test_douyin_item_discovery_reuses_only_identity_bound_video_detail(
+    monkeypatch, media_id: str, parser_mismatch: str | None
+) -> None:
+    owner_id = "MS4wLjABAAAAsignedverifiedvideoowner"
+    video_uri = "v0300signedverifiedvideomedia"
+    source_url = f"https://www.douyin.com/video/{media_id}"
+    direct_url = "https://v26-web.douyinvod.com/signed-original.mp4"
+    detail_calls = []
+    parsed = {
+        "id": media_id,
+        "channel_id": owner_id,
+        "channel": "Verified Author",
+        "title": "Verified signed video",
+        "timestamp": 1_756_656_000,
+        "upload_date": "20250901",
+        "duration": 4.0,
+        "formats": [
+            {
+                "url": (
+                    "https://api-play.amemv.com/aweme/v1/play/"
+                    f"?video_id={video_uri}&ratio=720p"
+                ),
+                "width": 1080,
+                "height": 1920,
+            }
+        ],
+    }
+    if parser_mismatch == "id":
+        parsed["id"] = "1111111111111111111"
+    elif parser_mismatch == "channel_id":
+        parsed["channel_id"] = "MS4wLjABAAAAanotherverifiedvideoowner"
+    elif parser_mismatch == "missing_owner":
+        parsed.pop("channel_id")
+
+    class SignedDetailYoutubeDL(FakeYoutubeDL):
+        def extract_info(self, url: str, download: bool, process: bool = True):
+            assert url == source_url
+            assert download is False
+            assert process is False
+            raise DownloadError("Fresh cookies are needed")
+
+    class SignedVideoIE:
+        def __init__(self, ydl) -> None:
+            self.ydl = ydl
+
+        def _parse_aweme_video_app(self, detail):
+            assert detail["aweme_id"] == media_id
+            return parsed
+
+    def fetch_detail(requested_id: str, **kwargs):
+        detail_calls.append((requested_id, kwargs))
+        if len(detail_calls) > 1:
+            raise TemporaryAccessError(
+                "Repeated signed detail request was rate-limited",
+                issue_code=SiteIssueCode.RATE_LIMITED,
+            )
+        return {
+            "aweme_id": media_id,
+            "aweme_type": 0,
+            "desc": "Verified signed video",
+            "create_time": 1_756_656_000,
+            "author": {"sec_uid": owner_id, "nickname": "Verified Author"},
+            "video": {
+                "duration": 4_000,
+                "play_addr": {
+                    "uri": video_uri,
+                    "width": 1080,
+                    "height": 1920,
+                    "url_list": [direct_url],
+                },
+            },
+        }
+
+    monkeypatch.setattr("app.downloader.YoutubeDL", SignedDetailYoutubeDL)
+    monkeypatch.setattr("app.downloader.DouyinIE", SignedVideoIE)
+    monkeypatch.setattr("app.downloader.fetch_signed_aweme_detail", fetch_detail)
+    monkeypatch.setattr("app.douyin.fetch_signed_aweme_detail", fetch_detail)
+    monkeypatch.setattr(
+        "app.douyin.fetch_signed_profile_awemes",
+        lambda *args, **kwargs: pytest.fail(
+            "A complete signed detail must not trigger another author-feed scan"
+        ),
+    )
+    engine = MediaDownloader(DownloaderConfig(cookie_browser="chrome"))
+
+    if parser_mismatch is not None:
+        reason = "different video" if parser_mismatch == "id" else "different author"
+        with pytest.raises(MediaDownloadError, match=reason):
+            engine.discover(source_url, Platform.DOUYIN, SourceKind.ITEM)
+        assert "_douyin_profile_media" not in parsed
+    else:
+        result = engine.discover(source_url, Platform.DOUYIN, SourceKind.ITEM)
+        assert len(result.items) == 1
+        item = result.items[0]
+        assert item.media_id == media_id
+        assert item.source_url == source_url
+        assert item.media_type == MediaType.VIDEO
+        assert item.author == "Verified Author"
+        assert item.upload_date == "2025-09-01"
+        cached = item.metadata["douyin_item_media"]
+        assert cached["owner_id"] == owner_id
+        assert cached["video_uri"] == video_uri
+        assert cached["duration_ms"] == 4_000
+        assert cached["direct_candidates"][0]["urls"] == [direct_url]
+    assert len(detail_calls) == 1
+    assert detail_calls[0][0] == media_id
+    assert detail_calls[0][1]["verification_url"] == source_url
+    assert detail_calls[0][1]["expected_sec_uid"] is None
+
+
 def test_douyin_item_exact_detail_overrides_ytdlp_live_photo_video_guess(
     monkeypatch,
 ) -> None:
@@ -2222,6 +2334,7 @@ def test_douyin_signed_detail_fallback_parses_verified_raw_info(monkeypatch) -> 
     assert result["id"] == media_id
     assert result["channel_id"] == profile_id
     assert result["webpage_url"] == source_url
+    assert "_douyin_profile_media" not in result
     assert calls[0][0] == media_id
     assert calls[0][1]["expected_sec_uid"] == profile_id
     assert calls[0][1]["verification_url"] == profile_url

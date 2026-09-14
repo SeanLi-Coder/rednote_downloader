@@ -1,0 +1,73 @@
+name: Douyin item live smoke
+
+on:
+  push:
+    branches:
+      - codex/douyin-two-video-fix
+    paths:
+      - app/**
+      - scripts/douyin_item_live_smoke.py
+      - .github/workflows/item-live-smoke.yml
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: Public Douyin item URLs, separated by whitespace
+        required: true
+        type: string
+        default: >-
+          https://www.douyin.com/user/self?modal_id=7684132989608949594
+          https://www.douyin.com/user/self?modal_id=7677863372330774922
+
+permissions:
+  contents: read
+
+jobs:
+  download:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 85
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.10"
+          cache: pip
+      - name: Install FFmpeg and Python dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          python -m pip install -r requirements.txt
+          python -m pip check
+      - name: Verify production Chrome channel
+        run: |
+          google-chrome --version
+          python - <<'PY'
+          from playwright.sync_api import sync_playwright
+          with sync_playwright() as playwright:
+              browser = playwright.chromium.launch(channel="chrome", headless=True)
+              print(f"Production Chrome channel: {browser.version}")
+              browser.close()
+          PY
+      - name: Run anonymous production discovery and download
+        env:
+          INPUT_URLS: ${{ inputs.urls || 'https://www.douyin.com/user/self?modal_id=7684132989608949594 https://www.douyin.com/user/self?modal_id=7677863372330774922' }}
+        run: |
+          python - <<'PY'
+          import os
+          import subprocess
+          import sys
+          command = [sys.executable, "scripts/douyin_item_live_smoke.py",
+                     "--report", os.path.join(os.environ["RUNNER_TEMP"], "douyin-item-report.json")]
+          for url in os.environ["INPUT_URLS"].split():
+              command.extend(["--url", url])
+          raise SystemExit(subprocess.call(command))
+          PY
+      - name: Upload sanitized report only
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: douyin-item-live-report
+          path: ${{ runner.temp }}/douyin-item-report.json
+          if-no-files-found: error
+          retention-days: 7

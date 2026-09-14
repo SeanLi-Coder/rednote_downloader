@@ -2357,6 +2357,14 @@ class MediaDownloader:
         parsed = DouyinIE(ydl)._parse_aweme_video_app(detail)
         if not isinstance(parsed, dict):
             raise DownloadError("Douyin signed detail returned no downloadable media")
+        if verified_metadata and verified_metadata.get("media_kind") == "video":
+            self._validate_douyin_info(
+                parsed,
+                expected_id,
+                verification_url,
+                str(verified_metadata["owner_id"]),
+            )
+            parsed["_douyin_profile_media"] = verified_metadata
         parsed.setdefault("webpage_url", source_url)
         parsed.setdefault("original_url", source_url)
         parsed.setdefault("extractor", "Douyin")
