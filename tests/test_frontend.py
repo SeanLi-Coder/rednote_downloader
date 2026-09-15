@@ -52,6 +52,140 @@ def _run_node_script(
 @pytest.mark.parametrize(
     "prefix",
     [
+        "Douyin signed data failed identity or integrity validation.",
+        "Douyin author-feed data failed identity or integrity validation.",
+        "Douyin signed discovery failed before a verified response was available.",
+    ],
+)
+def test_signing_validation_displays_only_allowlisted_diagnostics(tmp_path, prefix):
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is unavailable")
+    source = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
+    source = source.replace(
+        "  initialize();\n})();\n",
+        "  window.__localizeRuntimeMessage = localizeRuntimeMessage;\n})();\n",
+    )
+    cases = {
+        "ssr-redirect": "原作品页面返回了跳转指令",
+        "ssr-unknown-item": "原作品页面没有提供可确认的目标作品身份",
+        "ssr-item-mismatch": "原作品页面返回的作品 ID 与目标作品不一致",
+        "ssr-author-mismatch": "原作品页面返回的作者身份与任务绑定的作者不一致",
+        "ssr-conflicting-items": "相互冲突的作品信息",
+        "detail-item-mismatch": "详情接口返回的作品 ID 与目标作品不一致",
+        "detail-author-mismatch": "详情接口返回的作者身份与任务绑定的作者不一致",
+        "detail-response-redirect": "详情接口的响应地址与已验证的请求目标不一致",
+        "detail-metadata-incomplete": "详情接口缺少完成作品校验所需的媒体信息",
+        "ssr-metadata-incomplete": "原作品页面缺少完成作品校验所需的媒体信息",
+        "signer-html-invalid": "签名初始化页面未通过格式或完整性校验",
+        "signer-script-invalid": "签名初始化脚本未通过来源或完整性校验",
+        "signing-validation-failed": "现有诊断不足以确定更具体的原因",
+        "signing-runtime-error": "签名组件运行异常",
+    }
+    messages = [f"{prefix} Diagnostic code: {code}." for code in cases]
+    completed = _run_node_script(
+        node,
+        "globalThis.window = {};\n"
+        "globalThis.document = {querySelector: () => null};\n"
+        + source
+        + f"\nconst inputs = {json.dumps(messages)};\n"
+        + "process.stdout.write(JSON.stringify(inputs.map((value) => "
+        "window.__localizeRuntimeMessage(value))));\n",
+        tmp_path,
+        "signing-validation-diagnostics.js",
+    )
+    assert completed.returncode == 0, completed.stderr
+    localized = json.loads(completed.stdout)
+    for (code, description), message in zip(cases.items(), localized, strict=True):
+        assert description in message
+        assert f"诊断码：{code}。" in message
+        assert "版本号和 build ID" in message
+        assert "不需要打开 Chrome 验证" in message
+        assert "等待一两分钟" not in message
+        assert "Diagnostic code:" not in message
+        if code in {
+            "ssr-unknown-item",
+            "ssr-item-mismatch",
+            "ssr-author-mismatch",
+            "ssr-conflicting-items",
+            "detail-item-mismatch",
+            "detail-author-mismatch",
+        }:
+            assert "新建任务尝试一次" in message
+            assert "停止反复重试" in message
+        if code == "ssr-redirect":
+            assert "不等于已确认跳到了其他视频" in message
+            assert "更新到最新版后从原链接重新解析一次" in message
+
+
+def test_signing_validation_hides_legacy_malformed_and_injected_details(tmp_path):
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is unavailable")
+    source = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
+    source = source.replace(
+        "  initialize();\n})();\n",
+        "  window.__localizeRuntimeMessage = localizeRuntimeMessage;\n})();\n",
+    )
+    prefix = "Douyin signed data failed identity or integrity validation."
+    secret = "https://sensitive.example/media?signature=PRIVATE_TOKEN"
+    invalid_suffixes = [
+        "",
+        " Diagnostic code: unknown-private-code.",
+        " Diagnostic code: constructor.",
+        " Diagnostic code: __proto__.",
+        " Diagnostic code: ssr-redirect",
+        " Diagnostic code: SSR-REDIRECT.",
+        " Diagnostic code: ssr-redirect.extra.",
+        " Diagnostic code: ssr-redirect. trailing-private-data",
+        " Diagnostic code: ssr-redirect.\n",
+        " Diagnostic code: ssr-redirect.\r\n",
+        " Diagnostic code: ssr-redirect.\ntrailing-private-data",
+        " Diagnostic code: ssr-redirect. Diagnostic code: detail-item-mismatch.",
+        " Diagnostic code: ssr-redirect\u0000.",
+        f" Diagnostic code: {secret}.",
+        f" Diagnostic code: ssr-redirect.{secret}",
+    ]
+    messages = [prefix + suffix for suffix in invalid_suffixes]
+    messages += [
+        f"{prefix} {secret}",
+        f"{prefix} media endpoint redirected to an unrecognized Douyin CDN host {secret}",
+        "Douyin author-feed data failed identity or integrity validation.",
+        "Douyin signed discovery failed before a verified response was available.",
+    ]
+    messages.append(f"{prefix} {secret} Diagnostic code: ssr-redirect.")
+    completed = _run_node_script(
+        node,
+        "globalThis.window = {};\n"
+        "globalThis.document = {querySelector: () => null};\n"
+        + source
+        + f"\nconst inputs = {json.dumps(messages)};\n"
+        + "process.stdout.write(JSON.stringify(inputs.map((value) => "
+        "window.__localizeRuntimeMessage(value))));\n",
+        tmp_path,
+        "signing-validation-unsafe-diagnostics.js",
+    )
+    assert completed.returncode == 0, completed.stderr
+    localized = json.loads(completed.stdout)
+    for message in localized[:-1]:
+        assert message == localized[0]
+        assert "旧版本未保留具体原因" in message
+        assert "请更新到最新版" in message
+        assert "版本号和 build ID" in message
+        assert "诊断码：" not in message
+    assert "诊断码：ssr-redirect。" in localized[-1]
+    for message in localized:
+        assert "PRIVATE_TOKEN" not in message
+        assert "sensitive.example" not in message
+        assert "signature=" not in message
+        assert "unknown-private-code" not in message
+        assert "trailing-private-data" not in message
+        assert "不需要打开 Chrome 验证" in message
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
         "Douyin media was discovered, but its highest quality could not be verified.",
         "Douyin Live Photo author-feed quality source could not be verified.",
     ],

@@ -22,6 +22,9 @@ from typing import Any, Sequence
 from unittest import mock
 from urllib.parse import parse_qs, urlsplit
 
+from yt_dlp import YoutubeDL
+from yt_dlp.utils import DownloadError
+
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
@@ -543,6 +546,29 @@ def observe_quality_probes(engine: MediaDownloader, reports: list[dict[str, Any]
 
 
 @contextlib.contextmanager
+def force_signed_detail_adapter(url: str, *, enabled: bool = False):
+    """Inject only the exact item's primary extraction miss for fallback testing."""
+    state = {"extract_count": 0}
+    if not enabled:
+        yield state
+        return
+    if target_url(url)[0] != url:
+        raise ValueError("Forced signing requires an exact canonical item URL")
+    original_extract = YoutubeDL.extract_info
+
+    def extract_info(self, source_url, *args, **kwargs):
+        download = kwargs.get("download", args[0] if args else True)
+        process = kwargs.get("process", args[3] if len(args) > 3 else True)
+        if source_url == url and download is False and process is False:
+            state["extract_count"] += 1
+            raise DownloadError("Douyin returned an empty aweme detail")
+        return original_extract(self, source_url, *args, **kwargs)
+
+    with mock.patch.object(YoutubeDL, "extract_info", extract_info):
+        yield state
+
+
+@contextlib.contextmanager
 def anonymous_browser_adapter(shapes: list[dict[str, Any]]):
     """Adapt only cookie access; preserve actual responses and validators."""
     empty_jar = CookieJar()
@@ -637,7 +663,14 @@ def inspect_media(path: Path, output_root: Path, ffprobe: str) -> dict[str, Any]
     }
 
 
-def _worker(url: str, media_id: str, output_dir: str, ffprobe: str, connection) -> None:
+def _worker(
+    url: str,
+    media_id: str,
+    output_dir: str,
+    ffprobe: str,
+    connection,
+    force_signed_detail: bool = False,
+) -> None:
     if hasattr(os, "setsid"):
         os.setsid()
     # Native libraries and browser subprocesses must never print raw network data.
@@ -661,7 +694,13 @@ def _worker(url: str, media_id: str, output_dir: str, ffprobe: str, connection) 
                 connection.send({"stage": stage, "event": event.event})
                 last_event = event.event
 
-    result: dict[str, Any] = {"media_id": media_id, "status": "failed", "media": []}
+    force_state = {"extract_count": 0}
+    result: dict[str, Any] = {
+        "media_id": media_id,
+        "status": "failed",
+        "media": [],
+        "forced_signed_detail": force_signed_detail,
+    }
     try:
         info = identify_url(url)
         engine = MediaDownloader(
@@ -671,6 +710,9 @@ def _worker(url: str, media_id: str, output_dir: str, ffprobe: str, connection) 
         with (
             anonymous_browser_adapter(shapes),
             observe_quality_probes(engine, quality_reports),
+            force_signed_detail_adapter(
+                info.url, enabled=force_signed_detail
+            ) as force_state,
         ):
             stage = "discover"
             connection.send({"stage": stage})
@@ -700,10 +742,19 @@ def _worker(url: str, media_id: str, output_dir: str, ffprobe: str, connection) 
                 media["type"] == "video" for media in result["media"]
             ):
                 raise RuntimeError("A video item produced only still images")
+            if force_signed_detail and force_state["extract_count"] == 0:
+                raise RuntimeError(
+                    "Forced signed discovery did not exercise the primary extractor miss"
+                )
         result["status"] = "passed"
     except Exception as exc:
         result["exception_chain"] = exception_chain(exc)
-    result.update(stage=stage, ssr_shapes=shapes, quality_probes=quality_reports)
+    result.update(
+        stage=stage,
+        ssr_shapes=shapes,
+        quality_probes=quality_reports,
+        forced_extract_count=force_state["extract_count"],
+    )
     connection.send({"result": result})
     connection.close()
 
@@ -727,7 +778,14 @@ def _stop_worker(process) -> None:
     process.join(timeout=3)
 
 
-def run_item(url: str, media_id: str, ffprobe: str, timeout: int) -> dict[str, Any]:
+def run_item(
+    url: str,
+    media_id: str,
+    ffprobe: str,
+    timeout: int,
+    *,
+    force_signed_detail: bool = False,
+) -> dict[str, Any]:
     context = multiprocessing.get_context("spawn")
     receiver, sender = context.Pipe(duplex=False)
     started = time.monotonic()
@@ -735,7 +793,8 @@ def run_item(url: str, media_id: str, ffprobe: str, timeout: int) -> dict[str, A
     result = None
     with tempfile.TemporaryDirectory(prefix="douyin-item-smoke-") as directory:
         process = context.Process(
-            target=_worker, args=(url, media_id, directory, ffprobe, sender)
+            target=_worker,
+            args=(url, media_id, directory, ffprobe, sender, force_signed_detail),
         )
         process.start()
         sender.close()
@@ -765,6 +824,7 @@ def run_item(url: str, media_id: str, ffprobe: str, timeout: int) -> dict[str, A
             "media_id": media_id,
             "status": "failed",
             "stage": stage,
+            "forced_signed_detail": force_signed_detail,
             "exception_chain": [
                 {
                     "type": (
@@ -789,7 +849,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     modes.add_argument("--observe-profile-item-url")
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--item-timeout", type=int, default=600)
+    parser.add_argument(
+        "--force-signed-detail",
+        action="store_true",
+        help="Inject an exact-item primary extraction miss to test real signed fallback",
+    )
     args = parser.parse_args(argv)
+    if args.observe_profile_item_url and args.force_signed_detail:
+        parser.error("Forced signed discovery requires item URL mode")
     if args.observe_profile_item_url:
         try:
             result = run_profile_observer(args.observe_profile_item_url)
@@ -807,9 +874,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("Use 1-8 item URLs and a 30-900 second per-item timeout")
     report: dict[str, Any] = {
         "description": "Anonymous production discovery and download; no user cookies. Temporary media is removed after validation; only sanitized results are retained.",
+        "forced_signed_detail": args.force_signed_detail,
         "status": "running",
         "items": [],
     }
+    if args.force_signed_detail:
+        report["description"] += (
+            " Diagnostic injection forces only the exact item's primary extractor "
+            "to fail; signed discovery, identity guards and media downloads remain "
+            "real. This is not evidence that the primary API naturally failed."
+        )
 
     def save():
         args.report.parent.mkdir(parents=True, exist_ok=True)
@@ -824,7 +898,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise RuntimeError("FFprobe was not found on PATH")
         targets = [target_url(url) for url in args.url]
         for url, media_id in targets:
-            report["items"].append(run_item(url, media_id, ffprobe, args.item_timeout))
+            report["items"].append(
+                run_item(
+                    url,
+                    media_id,
+                    ffprobe,
+                    args.item_timeout,
+                    force_signed_detail=args.force_signed_detail,
+                )
+            )
             save()
         report["status"] = (
             "passed"

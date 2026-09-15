@@ -988,8 +988,50 @@
     return `抖音${phase}的重定向地址未通过安全校验。原因：${diagnostic.reasonText}。程序在读取文件前已拦截，这个媒体响应没有保存；此前已完成的文件会保留，并暂停了后续队列。请检查代理或 VPN 是否改写了媒体地址，稍后从原链接重试，不需要打开 Chrome 验证。`;
   }
 
+  function douyinSigningValidationMessage(text) {
+    const prefixes = [
+      "Douyin signed discovery failed before a verified response",
+      "Douyin signed data failed identity or integrity validation",
+      "Douyin author-feed data failed identity or integrity validation"
+    ];
+    if (!prefixes.some((prefix) => text.includes(prefix))) return null;
+
+    const identityAdvice = "请先核对原链接对应的作品，再从正确链接新建任务尝试一次；若仍出现，请停止反复重试并反馈诊断码、版本号和 build ID。";
+    const refreshAdvice = "请更新到最新版后从原链接重新解析一次；若仍出现，请反馈诊断码、版本号和 build ID，不要连续重试。";
+    const labels = {
+      "ssr-redirect": ["原作品页面返回了跳转指令，当前响应无法直接用于作品校验；这不等于已确认跳到了其他视频", refreshAdvice],
+      "ssr-unknown-item": ["原作品页面没有提供可确认的目标作品身份", identityAdvice],
+      "ssr-item-mismatch": ["原作品页面返回的作品 ID 与目标作品不一致", identityAdvice],
+      "ssr-author-mismatch": ["原作品页面返回的作者身份与任务绑定的作者不一致", identityAdvice],
+      "ssr-conflicting-items": ["原作品页面返回了相互冲突的作品信息，无法确认唯一目标", identityAdvice],
+      "detail-item-mismatch": ["详情接口返回的作品 ID 与目标作品不一致", identityAdvice],
+      "detail-author-mismatch": ["详情接口返回的作者身份与任务绑定的作者不一致", identityAdvice],
+      "detail-response-redirect": ["详情接口的响应地址与已验证的请求目标不一致", refreshAdvice],
+      "detail-metadata-incomplete": ["详情接口缺少完成作品校验所需的媒体信息，或字段格式无法识别", refreshAdvice],
+      "ssr-metadata-incomplete": ["原作品页面缺少完成作品校验所需的媒体信息，或字段格式无法识别", refreshAdvice],
+      "signer-html-invalid": ["签名初始化页面未通过格式或完整性校验", refreshAdvice],
+      "signer-script-invalid": ["签名初始化脚本未通过来源或完整性校验", refreshAdvice],
+      "signing-validation-failed": ["签名响应未通过校验，现有诊断不足以确定更具体的原因", refreshAdvice],
+      "signing-runtime-error": ["签名组件运行异常，未取得可验证的作品响应", "请更新程序并重启后从原链接尝试一次；若仍出现，请反馈诊断码、版本号和 build ID，不要连续重试。"]
+    };
+    // Only a single, exact allowlisted suffix may be displayed, never exception text.
+    const match = text.match(/ Diagnostic code: ([a-z][a-z0-9-]{0,63})\.$/);
+    const code = match && match.index + match[0].length === text.length ? match[1] : null;
+    if (
+      text.split("Diagnostic code:").length !== 2 ||
+      !code ||
+      !Object.prototype.hasOwnProperty.call(labels, code)
+    ) {
+      return "抖音响应未通过作品身份或完整性校验，程序已停止处理。本次记录没有可识别的诊断码；旧版本未保留具体原因。请更新到最新版，核对原作品链接后新建任务尝试一次；若仍失败，请反馈版本号和 build ID。不要反复重试旧任务，不需要打开 Chrome 验证。";
+    }
+    const [detail, advice] = labels[code];
+    return `抖音解析已停止：${detail}。程序没有接受该响应或下载替代内容。${advice}不需要打开 Chrome 验证。诊断码：${code}。`;
+  }
+
   function localizeRuntimeMessage(value, job = null) {
     let text = asText(value);
+    const signingValidation = douyinSigningValidationMessage(text);
+    if (signingValidation) return signingValidation;
     if (text.startsWith("Could not save settings. Check free disk space and write permissions for the project's data folder")) {
       return "设置未能保存，程序仍在使用之前的设置。请检查磁盘剩余空间，以及项目 data 文件夹是否有写入权限，处理后再次点击“保存设置”。";
     }
@@ -1138,9 +1180,6 @@
     }
     if (text.includes("Douyin signed discovery temporarily failed before a verified response")) {
       return "抖音签名解析在拿到可验证响应前遇到临时网络或超时错误。请稍等后从原链接重试，不需要打开 Chrome 验证。";
-    }
-    if (text.includes("Douyin signed discovery failed before a verified response") || text.includes("Douyin signed data failed identity or integrity validation") || text.includes("Douyin author-feed data failed identity or integrity validation")) {
-      return "抖音响应未通过作品身份或完整性校验，程序已停止处理。请从原链接重试；没有明确验证码或登录页面时，不需要打开 Chrome 验证。";
     }
     if (text.includes("Douyin returned data for a different video while requesting") || text.includes("Douyin returned data from a different author while requesting") || text.includes("Douyin author-feed enrichment returned a different media identity")) {
       return "抖音返回了其他视频或其他作者的数据，程序已拦截，未下载串号内容。请从原链接直接重试，不需要打开 Chrome 验证。";

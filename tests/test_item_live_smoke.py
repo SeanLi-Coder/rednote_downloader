@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 from http.cookiejar import Cookie, CookieJar
 from types import SimpleNamespace
@@ -157,6 +158,236 @@ def test_anonymous_adapter_allows_only_its_own_server_issued_session(monkeypatch
         assert converted[0]["value"] == "synthetic-server-session"
         with pytest.raises(RuntimeError, match="unexpected cookie jar"):
             douyin_signing._cookie_jar_to_playwright(CookieJar())
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_forced_signed_adapter_only_injects_exact_unprocessed_metadata_miss(
+    monkeypatch, enabled
+):
+    calls = []
+    marker = object()
+
+    def original(self, url, *args, **kwargs):
+        calls.append((url, args, kwargs))
+        return marker
+
+    monkeypatch.setattr(smoke.YoutubeDL, "extract_info", original)
+    url = "https://www.douyin.com/video/7649744769275263409"
+    ydl = object.__new__(smoke.YoutubeDL)
+    with smoke.force_signed_detail_adapter(url, enabled=enabled) as state:
+        if enabled:
+            with pytest.raises(smoke.DownloadError, match="empty aweme detail"):
+                ydl.extract_info(url, download=False, process=False)
+            assert calls == []
+        else:
+            assert ydl.extract_info(url, download=False, process=False) is marker
+        assert state["extract_count"] == int(enabled)
+    assert smoke.YoutubeDL.extract_info is original
+    assert ydl.extract_info(url, download=False, process=False) is marker
+
+
+@pytest.mark.parametrize(
+    ("url", "kwargs"),
+    [
+        ("https://www.douyin.com/video/999", {"download": False, "process": False}),
+        (
+            "https://www.douyin.com/user/self?modal_id=123",
+            {"download": False, "process": False},
+        ),
+        (
+            "https://www.douyin.com/video/123?other=1",
+            {"download": False, "process": False},
+        ),
+        ("https://www.youtube.com/watch?v=123", {"download": False, "process": False}),
+        ("https://www.douyin.com/video/123", {"download": True, "process": False}),
+        ("https://www.douyin.com/video/123", {"download": False, "process": True}),
+        ("https://www.douyin.com/video/123", {"download": False}),
+        ("https://www.douyin.com/video/123", {"process": False}),
+        ("https://www.douyin.com/video/123", {}),
+    ],
+)
+def test_forced_signed_adapter_preserves_other_urls_and_processing(
+    monkeypatch, url, kwargs
+):
+    calls = []
+    marker = object()
+
+    def original(self, source_url, *args, **options):
+        calls.append((source_url, args, options))
+        return marker
+
+    monkeypatch.setattr(smoke.YoutubeDL, "extract_info", original)
+    ydl = object.__new__(smoke.YoutubeDL)
+    with smoke.force_signed_detail_adapter(
+        "https://www.douyin.com/video/123", enabled=True
+    ) as state:
+        assert ydl.extract_info(url, **kwargs) is marker
+        assert state["extract_count"] == 0
+    assert calls == [(url, (), kwargs)]
+
+
+def test_forced_signed_adapter_restores_after_error_and_accepts_positional_flags(
+    monkeypatch,
+):
+    def original(*args, **kwargs):
+        pytest.fail("An injected metadata request must not make a network request")
+
+    monkeypatch.setattr(smoke.YoutubeDL, "extract_info", original)
+    url = "https://www.douyin.com/video/123"
+    ydl = object.__new__(smoke.YoutubeDL)
+    with pytest.raises(smoke.DownloadError, match="empty aweme detail"):
+        with smoke.force_signed_detail_adapter(url, enabled=True) as state:
+            ydl.extract_info(url, False, None, None, False)
+    assert state["extract_count"] == 1
+    assert smoke.YoutubeDL.extract_info is original
+
+
+def test_forced_signed_adapter_rejects_noncanonical_targets_before_patch():
+    original = smoke.YoutubeDL.extract_info
+    with pytest.raises(ValueError, match="canonical"):
+        with smoke.force_signed_detail_adapter(
+            "https://www.douyin.com/user/self?modal_id=123", enabled=True
+        ):
+            pytest.fail("The invalid target must not enter the adapter")
+    assert smoke.YoutubeDL.extract_info is original
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_item_cli_passes_diagnostic_flag_and_labels_report(
+    monkeypatch, tmp_path, enabled
+):
+    calls = []
+
+    def run_item(url, media_id, ffprobe, timeout, *, force_signed_detail=False):
+        calls.append((url, media_id, ffprobe, timeout, force_signed_detail))
+        return {"status": "passed", "forced_signed_detail": force_signed_detail}
+
+    monkeypatch.setattr(smoke.shutil, "which", lambda name: "ffprobe")
+    monkeypatch.setattr(smoke, "run_item", run_item)
+    path = tmp_path / "report.json"
+    args = [
+        "--url",
+        "https://www.douyin.com/user/self?modal_id=123",
+        "--report",
+        str(path),
+    ]
+    if enabled:
+        args.append("--force-signed-detail")
+    assert smoke.main(args) == 0
+    assert calls == [
+        ("https://www.douyin.com/video/123", "123", "ffprobe", 600, enabled)
+    ]
+    report = json.loads(path.read_text())
+    assert report["forced_signed_detail"] is enabled
+    assert ("not evidence" in report["description"]) is enabled
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_run_item_passes_forcing_flag_to_worker_and_preserves_cleanup(
+    monkeypatch, enabled
+):
+    created = []
+    closed = []
+    stopped = []
+    receiver = SimpleNamespace(
+        poll=lambda timeout: True,
+        recv=lambda: {"result": {"status": "passed", "forced_signed_detail": enabled}},
+        close=lambda: closed.append("receiver"),
+    )
+    sender = SimpleNamespace(close=lambda: closed.append("sender"))
+    process = SimpleNamespace(start=lambda: None)
+
+    def create_process(*, target, args):
+        assert target is smoke._worker
+        created.append(args)
+        return process
+
+    context = SimpleNamespace(
+        Pipe=lambda duplex: (receiver, sender), Process=create_process
+    )
+    monkeypatch.setattr(smoke.multiprocessing, "get_context", lambda kind: context)
+    monkeypatch.setattr(smoke, "_stop_worker", lambda value: stopped.append(value))
+    result = smoke.run_item(
+        "https://www.douyin.com/video/123",
+        "123",
+        "ffprobe",
+        30,
+        force_signed_detail=enabled,
+    )
+    assert result["status"] == "passed"
+    assert result["forced_signed_detail"] is enabled
+    assert created[0][:2] == ("https://www.douyin.com/video/123", "123")
+    assert created[0][3:] == ("ffprobe", sender, enabled)
+    assert not smoke.Path(created[0][2]).exists()
+    assert stopped == [process]
+    assert closed == ["sender", "receiver"]
+
+
+def test_forced_signed_cli_rejects_page_observer_combination(tmp_path):
+    with pytest.raises(SystemExit) as error:
+        smoke.main(
+            [
+                "--observe-profile-item-url",
+                "https://www.douyin.com/user/self?modal_id=123&vid=456",
+                "--force-signed-detail",
+                "--report",
+                str(tmp_path / "report.json"),
+            ]
+        )
+    assert error.value.code == 2
+
+
+@pytest.mark.parametrize(
+    ("enabled", "call_extractor", "expected_status"),
+    [(False, False, "passed"), (True, False, "failed"), (True, True, "passed")],
+)
+def test_worker_requires_forced_extraction_before_reporting_passed(
+    monkeypatch, tmp_path, enabled, call_extractor, expected_status
+):
+    url = "https://www.douyin.com/video/123"
+    results = []
+    item = SimpleNamespace(
+        media_id="123", source_url=url, media_type=smoke.MediaType.VIDEO
+    )
+
+    class Engine:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def discover(self, source_url, platform, kind):
+            assert source_url == url
+            if call_extractor:
+                ydl = object.__new__(smoke.YoutubeDL)
+                with pytest.raises(smoke.DownloadError, match="empty aweme detail"):
+                    ydl.extract_info(url, download=False, process=False)
+            return SimpleNamespace(
+                discovery_complete=True, items=[item], cookie_fallback_used=False
+            )
+
+        def download_item(self, *args, **kwargs):
+            return SimpleNamespace(
+                cookie_fallback_used=False, output_paths=["video.mp4"]
+            )
+
+    monkeypatch.setattr(smoke.os, "dup2", lambda *args: None)
+    if hasattr(smoke.os, "setsid"):
+        monkeypatch.setattr(smoke.os, "setsid", lambda: None)
+    monkeypatch.setattr(smoke, "MediaDownloader", Engine)
+    monkeypatch.setattr(
+        smoke, "anonymous_browser_adapter", lambda shapes: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(
+        smoke, "observe_quality_probes", lambda *args: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(smoke, "inspect_media", lambda *args: {"type": "video"})
+    connection = SimpleNamespace(send=results.append, close=lambda: None)
+    smoke._worker(url, "123", str(tmp_path), "ffprobe", connection, enabled)
+    result = results[-1]["result"]
+    assert result["status"] == expected_status
+    assert result["forced_signed_detail"] is enabled
+    assert result["forced_extract_count"] == int(call_extractor)
+    if expected_status == "failed":
+        assert "did not exercise" in result["exception_chain"][0]["message"]
 
 
 def test_missing_ffprobe_writes_failed_report_without_network(tmp_path, monkeypatch):

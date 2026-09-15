@@ -2129,6 +2129,61 @@ def _run_with_signing_page(
         _close_resources(page, context, browser)
 
 
+def _signing_diagnostic_code(cause: Exception) -> str:
+    """Expose fixed local reason codes, never exception text or response data."""
+    if not isinstance(cause, _SigningFailure):
+        return "signing-runtime-error"
+    reasons = {
+        "ssr-redirect": ("Douyin SSR item requested a redirect",),
+        "ssr-unknown-item": ("Douyin SSR returned an unknown aweme",),
+        "ssr-item-mismatch": ("Douyin SSR returned a different aweme",),
+        "ssr-author-mismatch": ("Douyin SSR returned a different author",),
+        "ssr-conflicting-items": (
+            "Douyin SSR returned conflicting copies of the requested aweme",
+        ),
+        "detail-item-mismatch": ("Douyin detail API returned a different aweme",),
+        "detail-author-mismatch": ("Douyin detail API returned a different author",),
+        "detail-response-redirect": (
+            "Douyin detail response redirected outside its bound endpoint",
+        ),
+        "detail-metadata-incomplete": (
+            "Douyin detail API returned no aweme detail",
+            "Douyin detail API returned no author",
+            "Douyin detail API returned no author identity",
+            "Douyin detail response returned no complete body",
+        ),
+        "ssr-metadata-incomplete": (
+            "Douyin SSR returned no page data",
+            "Douyin SSR returned no item data",
+            "Douyin SSR returned no aweme detail",
+            "Douyin SSR item returned no author",
+            "Douyin SSR returned no valid author identity",
+        ),
+        "signer-html-invalid": (
+            "Douyin HTML redirected outside the trusted origin",
+            "Douyin HTML returned an invalid HTTP status",
+            "Douyin HTML returned an invalid browser response",
+            "Douyin HTML returned an invalid content length",
+            "Douyin HTML response could not be decoded",
+            "Douyin HTML response was unexpectedly large",
+            "Douyin SecSDK HTML could not be parsed",
+        ),
+        "signer-script-invalid": (
+            "Douyin returned an untrusted SecSDK script URL",
+            "Douyin SecSDK marker is missing",
+            "Douyin returned nested SecSDK script tags",
+            "Douyin returned an incomplete SecSDK script tag",
+            "Douyin returned too many SecSDK glue tags",
+            "Douyin SecSDK glue was unexpectedly large",
+        ),
+    }
+    message = str(cause)
+    for code, messages in reasons.items():
+        if message in messages:
+            return code
+    return "signing-validation-failed"
+
+
 def _raise_signing_error(
     verification_url: str,
     cause: Exception,
@@ -2216,7 +2271,8 @@ def _raise_signing_error(
         raise DiscoveryError(
             "Douyin signed data failed identity or integrity validation. Retry the "
             "original link; Chrome verification is not required unless Douyin "
-            "explicitly shows a CAPTCHA or login page.",
+            "explicitly shows a CAPTCHA or login page. "
+            f"Diagnostic code: {_signing_diagnostic_code(cause)}.",
             issue_code=SiteIssueCode.SITE_RESPONSE_CHANGED,
         ) from cause
     message = str(cause).lower()
@@ -2244,7 +2300,8 @@ def _raise_signing_error(
     raise DiscoveryError(
         "Douyin signed discovery failed before a verified response was available. "
         "Retry the original link; Chrome verification is not required unless Douyin "
-        "explicitly shows a CAPTCHA or login page.",
+        "explicitly shows a CAPTCHA or login page. "
+        f"Diagnostic code: {_signing_diagnostic_code(cause)}.",
         issue_code=SiteIssueCode.SITE_RESPONSE_CHANGED,
     ) from cause
 

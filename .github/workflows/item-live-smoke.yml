@@ -22,6 +22,11 @@ on:
         required: false
         type: string
         default: ""
+      force_signed_detail:
+        description: Inject an exact-item primary extractor miss to test real signed fallback (diagnostic only)
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -101,6 +106,7 @@ jobs:
         shell: bash
         env:
           INPUT_URLS: ${{ inputs.urls || 'https://www.douyin.com/user/self?modal_id=7684132989608949594 https://www.douyin.com/user/self?modal_id=7677863372330774922' }}
+          FORCE_SIGNED_DETAIL: ${{ inputs.force_signed_detail && 'true' || 'false' }}
         run: |
           python - <<'PY'
           import os
@@ -110,6 +116,8 @@ jobs:
                      "--report", os.path.join(os.environ["RUNNER_TEMP"], "douyin-item-report.json")]
           for url in os.environ["INPUT_URLS"].split():
               command.extend(["--url", url])
+          if os.environ["FORCE_SIGNED_DETAIL"] == "true":
+              command.append("--force-signed-detail")
           raise SystemExit(subprocess.call(command))
           PY
       - name: Upload sanitized report only
