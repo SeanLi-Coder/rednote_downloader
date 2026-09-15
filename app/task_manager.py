@@ -31,7 +31,7 @@ from .douyin import (
     is_complete_profile_media_metadata,
     quality_floor_dimensions,
 )
-from .douyin_signing import new_signed_discovery_budget
+from .douyin_signing import new_signed_discovery_budget, public_signing_diagnostic_code
 from .errors import (
     AuthenticationRequiredError,
     DiscoveryError,
@@ -1584,11 +1584,13 @@ class DownloadManager:
                         f"{safe_external_error_message(exc)}",
                         issue_code=issue_code,
                     ) from exc
+                diagnostic_code = public_signing_diagnostic_code(exc)
                 raise TemporaryAccessError(
                     "Douyin automatic item refresh did not pass identity or "
                     "integrity validation. The task was paused without downloading "
-                    "a fallback.",
+                    f"a fallback. Diagnostic code: {diagnostic_code}.",
                     issue_code=issue_code,
+                    diagnostic_code=diagnostic_code,
                 ) from exc
             if not refreshed_metadata or not is_complete_profile_media_metadata(
                 refreshed_metadata,
@@ -1664,11 +1666,13 @@ class DownloadManager:
                         f"{safe_external_error_message(exc)}",
                         issue_code=issue_code,
                     ) from exc
+                diagnostic_code = public_signing_diagnostic_code(exc)
                 raise TemporaryAccessError(
                     "Douyin automatic media refresh did not pass identity or "
                     "integrity validation. The task was paused without downloading "
-                    "a fallback.",
+                    f"a fallback. Diagnostic code: {diagnostic_code}.",
                     issue_code=issue_code,
+                    diagnostic_code=diagnostic_code,
                 ) from exc
             fresh_current = next(
                 (

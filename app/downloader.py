@@ -44,7 +44,7 @@ from .douyin import discover_item_metadata_from_profile
 from .douyin import is_complete_profile_media_metadata
 from .douyin import quality_floor_dimensions
 from .douyin import verified_aweme_metadata
-from .douyin_signing import fetch_signed_aweme_detail
+from .douyin_signing import fetch_signed_aweme_detail, public_signing_diagnostic_code
 from .errors import (
     AuthenticationRequiredError,
     DiscoveryError,
@@ -1121,11 +1121,14 @@ class MediaDownloader:
                         f"Details: {safe_external_error_message(exc)}",
                         issue_code=issue_code,
                     ) from exc
+                diagnostic_code = public_signing_diagnostic_code(exc)
                 raise MediaDownloadError(
                     "Douyin author-feed data failed identity or integrity validation. "
                     "Retry the original video; Chrome verification is not required "
-                    "unless Douyin explicitly shows a CAPTCHA or login page.",
+                    "unless Douyin explicitly shows a CAPTCHA or login page. "
+                    f"Diagnostic code: {diagnostic_code}.",
                     issue_code=issue_code,
+                    diagnostic_code=diagnostic_code,
                 ) from exc
             if not enriched_media:
                 raise TemporaryAccessError(

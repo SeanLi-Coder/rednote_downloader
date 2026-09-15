@@ -992,7 +992,9 @@
     const prefixes = [
       "Douyin signed discovery failed before a verified response",
       "Douyin signed data failed identity or integrity validation",
-      "Douyin author-feed data failed identity or integrity validation"
+      "Douyin author-feed data failed identity or integrity validation",
+      "Douyin automatic item refresh did not pass identity or integrity validation",
+      "Douyin automatic media refresh did not pass identity or integrity validation"
     ];
     if (!prefixes.some((prefix) => text.includes(prefix))) return null;
 
@@ -1011,7 +1013,7 @@
       "ssr-metadata-incomplete": ["原作品页面缺少完成作品校验所需的媒体信息，或字段格式无法识别", refreshAdvice],
       "signer-html-invalid": ["签名初始化页面未通过格式或完整性校验", refreshAdvice],
       "signer-script-invalid": ["签名初始化脚本未通过来源或完整性校验", refreshAdvice],
-      "signing-validation-failed": ["签名响应未通过校验，现有诊断不足以确定更具体的原因", refreshAdvice],
+      "signing-validation-failed": ["当前作品未能完成校验，现有诊断不足以确定更具体的原因", "请反馈原作品链接、诊断码、版本号和 build ID，不要反复更新或重试。"],
       "signing-runtime-error": ["签名组件运行异常，未取得可验证的作品响应", "请更新程序并重启后从原链接尝试一次；若仍出现，请反馈诊断码、版本号和 build ID，不要连续重试。"]
     };
     // Only a single, exact allowlisted suffix may be displayed, never exception text.
@@ -1022,7 +1024,7 @@
       !code ||
       !Object.prototype.hasOwnProperty.call(labels, code)
     ) {
-      return "抖音响应未通过作品身份或完整性校验，程序已停止处理。本次记录没有可识别的诊断码；旧版本未保留具体原因。请更新到最新版，核对原作品链接后新建任务尝试一次；若仍失败，请反馈版本号和 build ID。不要反复重试旧任务，不需要打开 Chrome 验证。";
+      return "抖音响应未通过作品身份或完整性校验，程序已停止处理。本次记录没有可识别的诊断码，无法据此确定失败原因。请反馈原作品链接、版本号和 build ID；如果已更新并新建任务仍出现，不要反复更新或重试。不需要打开 Chrome 验证。";
     }
     const [detail, advice] = labels[code];
     return `抖音解析已停止：${detail}。程序没有接受该响应或下载替代内容。${advice}不需要打开 Chrome 验证。诊断码：${code}。`;

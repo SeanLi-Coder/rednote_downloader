@@ -55,6 +55,10 @@ def _run_node_script(
         "Douyin signed data failed identity or integrity validation.",
         "Douyin author-feed data failed identity or integrity validation.",
         "Douyin signed discovery failed before a verified response was available.",
+        "Douyin automatic item refresh did not pass identity or integrity validation. "
+        "The task was paused without downloading a fallback.",
+        "Douyin automatic media refresh did not pass identity or integrity validation. "
+        "The task was paused without downloading a fallback.",
     ],
 )
 def test_signing_validation_displays_only_allowlisted_diagnostics(tmp_path, prefix):
@@ -116,9 +120,27 @@ def test_signing_validation_displays_only_allowlisted_diagnostics(tmp_path, pref
         if code == "ssr-redirect":
             assert "不等于已确认跳到了其他视频" in message
             assert "更新到最新版后从原链接重新解析一次" in message
+        if code == "signing-validation-failed":
+            assert "当前作品未能完成校验" in message
+            assert "签名响应未通过校验" not in message
+            assert "不要反复更新或重试" in message
 
 
-def test_signing_validation_hides_legacy_malformed_and_injected_details(tmp_path):
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "Douyin signed data failed identity or integrity validation.",
+        "Douyin author-feed data failed identity or integrity validation.",
+        "Douyin signed discovery failed before a verified response was available.",
+        "Douyin automatic item refresh did not pass identity or integrity validation. "
+        "The task was paused without downloading a fallback.",
+        "Douyin automatic media refresh did not pass identity or integrity validation. "
+        "The task was paused without downloading a fallback.",
+    ],
+)
+def test_signing_validation_hides_missing_malformed_and_injected_details(
+    tmp_path, prefix
+):
     node = shutil.which("node")
     if node is None:
         pytest.skip("Node.js is unavailable")
@@ -127,7 +149,6 @@ def test_signing_validation_hides_legacy_malformed_and_injected_details(tmp_path
         "  initialize();\n})();\n",
         "  window.__localizeRuntimeMessage = localizeRuntimeMessage;\n})();\n",
     )
-    prefix = "Douyin signed data failed identity or integrity validation."
     secret = "https://sensitive.example/media?signature=PRIVATE_TOKEN"
     invalid_suffixes = [
         "",
@@ -169,8 +190,11 @@ def test_signing_validation_hides_legacy_malformed_and_injected_details(tmp_path
     localized = json.loads(completed.stdout)
     for message in localized[:-1]:
         assert message == localized[0]
-        assert "旧版本未保留具体原因" in message
-        assert "请更新到最新版" in message
+        assert "本次记录没有可识别的诊断码" in message
+        assert "无法据此确定失败原因" in message
+        assert "旧版本" not in message
+        assert "请更新" not in message
+        assert "不要反复更新或重试" in message
         assert "版本号和 build ID" in message
         assert "诊断码：" not in message
     assert "诊断码：ssr-redirect。" in localized[-1]

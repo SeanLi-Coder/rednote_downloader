@@ -102,6 +102,8 @@ def test_fixed_metadata_and_signer_failures_have_specific_codes(
     assert error.issue_code == SiteIssueCode.SITE_RESPONSE_CHANGED
     assert error.__cause__ is cause
     assert f"Diagnostic code: {expected_code}." in str(error)
+    assert error.diagnostic_code == expected_code
+    assert signing.public_signing_diagnostic_code(error) == expected_code
     assert message not in str(error)
     for secret in SECRET_MARKERS:
         assert secret not in str(error)
@@ -122,6 +124,8 @@ def test_identity_failure_has_a_stable_public_diagnostic(
     assert error.issue_code == SiteIssueCode.SITE_RESPONSE_CHANGED
     assert error.__cause__ is cause
     assert f"Diagnostic code: {expected_code}." in str(error)
+    assert error.diagnostic_code == expected_code
+    assert signing.public_signing_diagnostic_code(error) == expected_code
     assert message not in str(error)
 
 
@@ -139,6 +143,8 @@ def test_diagnostics_require_exact_internal_messages(
     assert error.__cause__ is cause
     assert error.issue_code == SiteIssueCode.SITE_RESPONSE_CHANGED
     assert "Diagnostic code: signing-validation-failed." in str(error)
+    assert error.diagnostic_code == "signing-validation-failed"
+    assert signing.public_signing_diagnostic_code(error) == "signing-validation-failed"
     assert f"Diagnostic code: {expected_code}." not in str(error)
     for secret in SECRET_MARKERS:
         assert secret not in str(error)
@@ -167,6 +173,8 @@ def test_unknown_failures_do_not_expose_untrusted_exception_text(
     assert error.issue_code == SiteIssueCode.SITE_RESPONSE_CHANGED
     assert error.__cause__ is cause
     assert f"Diagnostic code: {expected_code}." in str(error)
+    assert error.diagnostic_code == expected_code
+    assert signing.public_signing_diagnostic_code(error) == expected_code
     for secret in SECRET_MARKERS:
         assert secret not in str(error)
 
@@ -184,6 +192,11 @@ def test_unknown_exception_cannot_impersonate_a_known_internal_failure(
     assert captured.value.__cause__ is cause
     assert captured.value.issue_code == SiteIssueCode.SITE_RESPONSE_CHANGED
     assert "Diagnostic code: signing-runtime-error." in str(captured.value)
+    assert captured.value.diagnostic_code == "signing-runtime-error"
+    assert (
+        signing.public_signing_diagnostic_code(captured.value)
+        == "signing-runtime-error"
+    )
 
 
 @pytest.mark.parametrize(
@@ -218,6 +231,8 @@ def test_real_detail_identity_validation_preserves_diagnostic(
     assert public.value.__cause__ is internal.value
     assert public.value.issue_code == SiteIssueCode.SITE_RESPONSE_CHANGED
     assert f"Diagnostic code: {expected_code}." in str(public.value)
+    assert public.value.diagnostic_code == expected_code
+    assert signing.public_signing_diagnostic_code(public.value) == expected_code
 
 
 @pytest.mark.parametrize(

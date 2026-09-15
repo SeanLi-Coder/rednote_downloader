@@ -367,9 +367,11 @@ class DownloaderCoreError(RuntimeError):
         message: str,
         *,
         issue_code: SiteIssueCode | None = None,
+        diagnostic_code: str | None = None,
     ) -> None:
         super().__init__(message)
         self.issue_code = issue_code
+        self.diagnostic_code = diagnostic_code
 
 
 class AuthenticationRequiredError(DownloaderCoreError):

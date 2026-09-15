@@ -2129,6 +2129,34 @@ def _run_with_signing_page(
         _close_resources(page, context, browser)
 
 
+_PUBLIC_SIGNING_DIAGNOSTIC_CODES = frozenset(
+    {
+        "ssr-redirect",
+        "ssr-unknown-item",
+        "ssr-item-mismatch",
+        "ssr-author-mismatch",
+        "ssr-conflicting-items",
+        "detail-item-mismatch",
+        "detail-author-mismatch",
+        "detail-response-redirect",
+        "detail-metadata-incomplete",
+        "ssr-metadata-incomplete",
+        "signer-html-invalid",
+        "signer-script-invalid",
+        "signing-validation-failed",
+        "signing-runtime-error",
+    }
+)
+
+
+def public_signing_diagnostic_code(error: Exception) -> str:
+    """Carry only structured, fixed codes across exception boundaries."""
+    code = getattr(error, "diagnostic_code", None)
+    if isinstance(code, str) and code in _PUBLIC_SIGNING_DIAGNOSTIC_CODES:
+        return code
+    return "signing-validation-failed"
+
+
 def _signing_diagnostic_code(cause: Exception) -> str:
     """Expose fixed local reason codes, never exception text or response data."""
     if not isinstance(cause, _SigningFailure):
@@ -2268,12 +2296,14 @@ def _raise_signing_error(
             issue_code=SiteIssueCode.VERIFICATION_REQUIRED,
         ) from cause
     if isinstance(cause, _SigningFailure):
+        diagnostic_code = _signing_diagnostic_code(cause)
         raise DiscoveryError(
             "Douyin signed data failed identity or integrity validation. Retry the "
             "original link; Chrome verification is not required unless Douyin "
             "explicitly shows a CAPTCHA or login page. "
-            f"Diagnostic code: {_signing_diagnostic_code(cause)}.",
+            f"Diagnostic code: {diagnostic_code}.",
             issue_code=SiteIssueCode.SITE_RESPONSE_CHANGED,
+            diagnostic_code=diagnostic_code,
         ) from cause
     message = str(cause).lower()
     if isinstance(cause, ImportError) or any(
@@ -2297,12 +2327,14 @@ def _raise_signing_error(
             "required. Reason category: network-timeout.",
             issue_code=SiteIssueCode.NETWORK_ERROR,
         ) from cause
+    diagnostic_code = _signing_diagnostic_code(cause)
     raise DiscoveryError(
         "Douyin signed discovery failed before a verified response was available. "
         "Retry the original link; Chrome verification is not required unless Douyin "
         "explicitly shows a CAPTCHA or login page. "
-        f"Diagnostic code: {_signing_diagnostic_code(cause)}.",
+        f"Diagnostic code: {diagnostic_code}.",
         issue_code=SiteIssueCode.SITE_RESPONSE_CHANGED,
+        diagnostic_code=diagnostic_code,
     ) from cause
 
 

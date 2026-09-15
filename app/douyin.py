@@ -1017,8 +1017,9 @@ def discover_item_metadata_from_profile(
                 return metadata
             raise DiscoveryError(
                 "Douyin returned the requested item detail without complete, "
-                "verified media metadata.",
+                "verified media metadata. Diagnostic code: detail-metadata-incomplete.",
                 issue_code=SiteIssueCode.SITE_RESPONSE_CHANGED,
+                diagnostic_code="detail-metadata-incomplete",
             )
 
     awemes = fetch_signed_profile_awemes(
