@@ -1690,9 +1690,11 @@ def _validated_ssr_wrapper_detail(
     detail = aweme.get("detail")
     if not isinstance(detail, dict):
         raise _SigningFailure("Douyin SSR returned no aweme detail")
+    wrapper_aweme_id = str(wrapper.get("awemeId") or "").strip()
     actual_aweme_id = str(detail.get("awemeId") or "").strip()
-    group_id = str(detail.get("groupId") or "").strip()
-    if actual_aweme_id != aweme_id or group_id != aweme_id:
+    # A real SSR response can have a different groupId. It is not an alias for
+    # the item ID and must never replace either explicit awemeId binding.
+    if wrapper_aweme_id != aweme_id or actual_aweme_id != aweme_id:
         raise _IdentitySigningFailure("Douyin SSR returned a different aweme")
     author = detail.get("authorInfo")
     if not isinstance(author, dict):

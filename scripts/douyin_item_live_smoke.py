@@ -569,6 +569,62 @@ def force_signed_detail_adapter(url: str, *, enabled: bool = False):
 
 
 @contextlib.contextmanager
+def force_ssr_detail_adapter(url: str, *, enabled: bool = False):
+    """Suppress only validated target capture success to exercise real SSR parsing."""
+    state = {
+        "capture_suppressed_count": 0,
+        "ssr_attempt_count": 0,
+        "ssr_success_count": 0,
+    }
+    if not enabled:
+        yield state
+        return
+    canonical_url, media_id = target_url(url)
+    if canonical_url != url:
+        raise ValueError("Forced SSR requires an exact canonical item URL")
+    original_capture = douyin_signing._PageDetailCapture.handle_request_finished
+    original_ssr = douyin_signing._read_ssr_aweme_detail_from_page
+
+    def capture_finished(capture, request):
+        # Always execute production response binding, authentication, identity,
+        # content-size and network checks before suppressing a successful capture.
+        result = original_capture(capture, request)
+        if (
+            capture.aweme_id == media_id
+            and douyin_signing._is_target_page_detail_request(request, media_id)
+            and capture.detail is not None
+            and capture.authentication_failure is None
+            and capture.identity_failure is None
+            and capture.terminal_failure is None
+        ):
+            capture.detail = None
+            state["capture_suppressed_count"] += 1
+        return result
+
+    def read_ssr(page, aweme_id, expected_sec_uid):
+        if aweme_id == media_id:
+            state["ssr_attempt_count"] += 1
+        result = original_ssr(page, aweme_id, expected_sec_uid)
+        if (
+            aweme_id == media_id
+            and isinstance(result, dict)
+            and result.get("aweme_id") == media_id
+        ):
+            state["ssr_success_count"] += 1
+        return result
+
+    with (
+        mock.patch.object(
+            douyin_signing._PageDetailCapture,
+            "handle_request_finished",
+            capture_finished,
+        ),
+        mock.patch.object(douyin_signing, "_read_ssr_aweme_detail_from_page", read_ssr),
+    ):
+        yield state
+
+
+@contextlib.contextmanager
 def anonymous_browser_adapter(shapes: list[dict[str, Any]]):
     """Adapt only cookie access; preserve actual responses and validators."""
     empty_jar = CookieJar()
@@ -670,7 +726,9 @@ def _worker(
     ffprobe: str,
     connection,
     force_signed_detail: bool = False,
+    force_ssr_detail: bool = False,
 ) -> None:
+    force_signed_detail = force_signed_detail or force_ssr_detail
     if hasattr(os, "setsid"):
         os.setsid()
     # Native libraries and browser subprocesses must never print raw network data.
@@ -695,11 +753,17 @@ def _worker(
                 last_event = event.event
 
     force_state = {"extract_count": 0}
+    ssr_state = {
+        "capture_suppressed_count": 0,
+        "ssr_attempt_count": 0,
+        "ssr_success_count": 0,
+    }
     result: dict[str, Any] = {
         "media_id": media_id,
         "status": "failed",
         "media": [],
         "forced_signed_detail": force_signed_detail,
+        "forced_ssr_detail": force_ssr_detail,
     }
     try:
         info = identify_url(url)
@@ -713,6 +777,7 @@ def _worker(
             force_signed_detail_adapter(
                 info.url, enabled=force_signed_detail
             ) as force_state,
+            force_ssr_detail_adapter(info.url, enabled=force_ssr_detail) as ssr_state,
         ):
             stage = "discover"
             connection.send({"stage": stage})
@@ -724,6 +789,10 @@ def _worker(
                 raise RuntimeError("Discovery returned a different item identity")
             if discovery.cookie_fallback_used:
                 raise RuntimeError("Discovery unexpectedly used cookie fallback")
+            if force_ssr_detail and ssr_state["ssr_success_count"] == 0:
+                raise RuntimeError(
+                    "Forced SSR discovery did not return verified exact-item SSR metadata"
+                )
             result["discovered_type"] = item.media_type.value
             stage = "download"
             connection.send({"stage": stage})
@@ -754,6 +823,9 @@ def _worker(
         ssr_shapes=shapes,
         quality_probes=quality_reports,
         forced_extract_count=force_state["extract_count"],
+        forced_ssr_capture_suppressed_count=ssr_state["capture_suppressed_count"],
+        forced_ssr_attempt_count=ssr_state["ssr_attempt_count"],
+        forced_ssr_success_count=ssr_state["ssr_success_count"],
     )
     connection.send({"result": result})
     connection.close()
@@ -785,7 +857,9 @@ def run_item(
     timeout: int,
     *,
     force_signed_detail: bool = False,
+    force_ssr_detail: bool = False,
 ) -> dict[str, Any]:
+    force_signed_detail = force_signed_detail or force_ssr_detail
     context = multiprocessing.get_context("spawn")
     receiver, sender = context.Pipe(duplex=False)
     started = time.monotonic()
@@ -794,7 +868,15 @@ def run_item(
     with tempfile.TemporaryDirectory(prefix="douyin-item-smoke-") as directory:
         process = context.Process(
             target=_worker,
-            args=(url, media_id, directory, ffprobe, sender, force_signed_detail),
+            args=(
+                url,
+                media_id,
+                directory,
+                ffprobe,
+                sender,
+                force_signed_detail,
+                force_ssr_detail,
+            ),
         )
         process.start()
         sender.close()
@@ -825,6 +907,7 @@ def run_item(
             "status": "failed",
             "stage": stage,
             "forced_signed_detail": force_signed_detail,
+            "forced_ssr_detail": force_ssr_detail,
             "exception_chain": [
                 {
                     "type": (
@@ -854,7 +937,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="Inject an exact-item primary extraction miss to test real signed fallback",
     )
+    parser.add_argument(
+        "--force-ssr-detail",
+        action="store_true",
+        help="Force signed fallback and suppress validated page capture to test real SSR",
+    )
     args = parser.parse_args(argv)
+    args.force_signed_detail = args.force_signed_detail or args.force_ssr_detail
     if args.observe_profile_item_url and args.force_signed_detail:
         parser.error("Forced signed discovery requires item URL mode")
     if args.observe_profile_item_url:
@@ -875,6 +964,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     report: dict[str, Any] = {
         "description": "Anonymous production discovery and download; no user cookies. Temporary media is removed after validation; only sanitized results are retained.",
         "forced_signed_detail": args.force_signed_detail,
+        "forced_ssr_detail": args.force_ssr_detail,
         "status": "running",
         "items": [],
     }
@@ -883,6 +973,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             " Diagnostic injection forces only the exact item's primary extractor "
             "to fail; signed discovery, identity guards and media downloads remain "
             "real. This is not evidence that the primary API naturally failed."
+        )
+    if args.force_ssr_detail:
+        report["description"] += (
+            " Forced SSR additionally suppresses only successful exact-item page API "
+            "captures after their production validation; authentication, identity and "
+            "network failures remain authoritative. A pass requires actual verified "
+            "SSR metadata, not a later signed-API fallback."
         )
 
     def save():
@@ -905,6 +1002,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     ffprobe,
                     args.item_timeout,
                     force_signed_detail=args.force_signed_detail,
+                    force_ssr_detail=args.force_ssr_detail,
                 )
             )
             save()

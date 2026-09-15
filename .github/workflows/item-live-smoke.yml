@@ -27,6 +27,11 @@ on:
         required: false
         type: boolean
         default: false
+      force_ssr_detail:
+        description: Force real SSR fallback after validating page API responses (implies forced signing; diagnostic only)
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -107,6 +112,7 @@ jobs:
         env:
           INPUT_URLS: ${{ inputs.urls || 'https://www.douyin.com/user/self?modal_id=7684132989608949594 https://www.douyin.com/user/self?modal_id=7677863372330774922' }}
           FORCE_SIGNED_DETAIL: ${{ inputs.force_signed_detail && 'true' || 'false' }}
+          FORCE_SSR_DETAIL: ${{ inputs.force_ssr_detail && 'true' || 'false' }}
         run: |
           python - <<'PY'
           import os
@@ -118,6 +124,8 @@ jobs:
               command.extend(["--url", url])
           if os.environ["FORCE_SIGNED_DETAIL"] == "true":
               command.append("--force-signed-detail")
+          if os.environ["FORCE_SSR_DETAIL"] == "true":
+              command.append("--force-ssr-detail")
           raise SystemExit(subprocess.call(command))
           PY
       - name: Upload sanitized report only

@@ -1258,6 +1258,158 @@ def test_direct_item_uses_identity_bound_live_photo_ssr_without_detail_api(
     assert manager.resources_closed_on_exit is True
 
 
+SSR_DISTINCT_GROUP_AWEME_ID = "7649744769275263409"
+SSR_DISTINCT_GROUP_ID = "7649743858876479333"
+
+
+def _ssr_distinct_group_video_wrapper() -> dict:
+    detail = _ssr_live_photo_detail(aweme_id=SSR_DISTINCT_GROUP_AWEME_ID)
+    detail.update(
+        groupId=SSR_DISTINCT_GROUP_ID,
+        awemeType=0,
+        mediaType=4,
+        video=detail["images"][0]["video"],
+        images=[],
+    )
+    return _ssr_wrapper(detail, aweme_id=SSR_DISTINCT_GROUP_AWEME_ID)
+
+
+@pytest.mark.parametrize(
+    "group_id", [SSR_DISTINCT_GROUP_ID, SSR_DISTINCT_GROUP_AWEME_ID, None]
+)
+def test_ssr_group_id_is_not_required_to_equal_explicit_item_id(group_id) -> None:
+    wrapper = _ssr_distinct_group_video_wrapper()
+    raw_detail = wrapper["aweme"]["detail"]
+    if group_id is None:
+        raw_detail.pop("groupId")
+    else:
+        raw_detail["groupId"] = group_id
+
+    detail = douyin_signing._extract_ssr_aweme_detail(
+        _ssr_flight_fragments(wrapper), SSR_DISTINCT_GROUP_AWEME_ID, SEC_UID
+    )
+
+    assert detail is not None
+    assert detail["aweme_id"] == SSR_DISTINCT_GROUP_AWEME_ID
+    assert "groupId" not in detail
+    metadata = verified_aweme_metadata(
+        detail, SSR_DISTINCT_GROUP_AWEME_ID, expected_profile_id=SEC_UID
+    )
+    assert metadata is not None
+    assert metadata["media_id"] == SSR_DISTINCT_GROUP_AWEME_ID
+    assert metadata["media_kind"] == "video"
+
+
+@pytest.mark.parametrize("detail_id", [None, "7000000000000000000"])
+def test_ssr_group_id_never_substitutes_for_missing_or_wrong_detail_id(
+    detail_id,
+) -> None:
+    wrapper = _ssr_distinct_group_video_wrapper()
+    detail = wrapper["aweme"]["detail"]
+    detail["groupId"] = SSR_DISTINCT_GROUP_AWEME_ID
+    if detail_id is None:
+        detail.pop("awemeId")
+    else:
+        detail["awemeId"] = detail_id
+
+    with pytest.raises(douyin_signing._IdentitySigningFailure, match="different aweme"):
+        douyin_signing._extract_ssr_aweme_detail(
+            _ssr_flight_fragments(wrapper), SSR_DISTINCT_GROUP_AWEME_ID, SEC_UID
+        )
+
+
+@pytest.mark.parametrize("wrapper_id", [None, "7000000000000000000"])
+def test_ssr_group_id_never_substitutes_for_missing_or_wrong_wrapper_id(
+    wrapper_id,
+) -> None:
+    wrapper = _ssr_distinct_group_video_wrapper()
+    wrapper["aweme"]["detail"]["groupId"] = SSR_DISTINCT_GROUP_AWEME_ID
+    if wrapper_id is None:
+        wrapper.pop("awemeId")
+    else:
+        wrapper["awemeId"] = wrapper_id
+
+    assert (
+        douyin_signing._extract_ssr_aweme_detail(
+            _ssr_flight_fragments(wrapper), SSR_DISTINCT_GROUP_AWEME_ID, SEC_UID
+        )
+        is None
+    )
+    with pytest.raises(douyin_signing._IdentitySigningFailure, match="different aweme"):
+        douyin_signing._validated_ssr_wrapper_detail(
+            wrapper, SSR_DISTINCT_GROUP_AWEME_ID, SEC_UID
+        )
+
+
+def test_ssr_distinct_group_keeps_author_identity_check() -> None:
+    wrapper = _ssr_distinct_group_video_wrapper()
+    wrapper["aweme"]["detail"]["authorInfo"]["secUid"] = "MS4wLjABAAAAwrongowner"
+
+    with pytest.raises(
+        douyin_signing._IdentitySigningFailure, match="different author"
+    ):
+        douyin_signing._extract_ssr_aweme_detail(
+            _ssr_flight_fragments(wrapper), SSR_DISTINCT_GROUP_AWEME_ID, SEC_UID
+        )
+
+
+@pytest.mark.parametrize("change_media", [False, True])
+def test_ssr_distinct_groups_do_not_hide_conflicting_media(change_media) -> None:
+    first = _ssr_distinct_group_video_wrapper()
+    second = _ssr_distinct_group_video_wrapper()
+    second["aweme"]["detail"]["groupId"] = "7000000000000000001"
+    if change_media:
+        second["aweme"]["detail"]["video"]["duration"] += 1_000
+    fragments = _ssr_flight_fragments(first) + _ssr_flight_fragments(second)
+
+    if change_media:
+        with pytest.raises(
+            douyin_signing._IdentitySigningFailure, match="conflicting copies"
+        ):
+            douyin_signing._extract_ssr_aweme_detail(
+                fragments, SSR_DISTINCT_GROUP_AWEME_ID, SEC_UID
+            )
+    else:
+        detail = douyin_signing._extract_ssr_aweme_detail(
+            fragments, SSR_DISTINCT_GROUP_AWEME_ID, SEC_UID
+        )
+        assert detail is not None
+        assert detail["aweme_id"] == SSR_DISTINCT_GROUP_AWEME_ID
+
+
+def test_signed_item_accepts_distinct_group_ssr_without_fallback(monkeypatch) -> None:
+    wrapper = _ssr_distinct_group_video_wrapper()
+    page, context, browser, manager = _install_fake_playwright(
+        monkeypatch,
+        _detail_response(aweme_id="7000000000000000000"),
+        pace_snapshot=_pace_snapshot(wrapper),
+    )
+
+    def fail_if_glue_is_extracted(*args, **kwargs):
+        pytest.fail("A verified exact SSR item must not fall back to signing")
+
+    monkeypatch.setattr(
+        douyin_signing, "_extract_glue_with_context_fallback", fail_if_glue_is_extracted
+    )
+    detail = fetch_signed_aweme_detail(
+        SSR_DISTINCT_GROUP_AWEME_ID,
+        verification_url=f"https://www.douyin.com/video/{SSR_DISTINCT_GROUP_AWEME_ID}",
+        expected_sec_uid=SEC_UID,
+        signer_settle_ms=0,
+    )
+
+    assert detail["aweme_id"] == SSR_DISTINCT_GROUP_AWEME_ID
+    assert detail["author"]["sec_uid"] == SEC_UID
+    assert page.goto_urls == [
+        f"https://www.douyin.com/note/{SSR_DISTINCT_GROUP_AWEME_ID}"
+    ]
+    assert page.started is False
+    assert page.signed_requests == []
+    assert page.response_handlers == []
+    assert page.closed and context.closed and browser.closed
+    assert manager.resources_closed_on_exit is True
+
+
 @pytest.mark.parametrize(
     ("detail_aweme_id", "detail_sec_uid", "failure_pattern"),
     [

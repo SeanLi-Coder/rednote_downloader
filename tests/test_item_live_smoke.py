@@ -252,14 +252,206 @@ def test_forced_signed_adapter_rejects_noncanonical_targets_before_patch():
     assert smoke.YoutubeDL.extract_info is original
 
 
+def _page_detail_request(media_id="123", *, response_url=None, payload=None):
+    url = f"https://www.douyin.com/aweme/v1/web/aweme/detail/?aweme_id={media_id}"
+    response = SimpleNamespace(
+        url=response_url or url,
+        status=200,
+        body=lambda: json.dumps(
+            payload
+            if payload is not None
+            else {
+                "status_code": 0,
+                "aweme_detail": {"aweme_id": media_id, "author": {"sec_uid": "owner"}},
+            }
+        ).encode(),
+    )
+    return SimpleNamespace(method="GET", url=url, response=lambda: response)
+
+
 @pytest.mark.parametrize("enabled", [False, True])
+def test_forced_ssr_only_suppresses_exact_target_after_real_capture_validation(enabled):
+    original_capture = douyin_signing._PageDetailCapture.handle_request_finished
+    original_ssr = douyin_signing._read_ssr_aweme_detail_from_page
+    target_capture = douyin_signing._PageDetailCapture("123", "owner")
+    other_capture = douyin_signing._PageDetailCapture("456", "owner")
+    with smoke.force_ssr_detail_adapter(
+        "https://www.douyin.com/video/123", enabled=enabled
+    ) as state:
+        target_capture.handle_request_finished(_page_detail_request("456"))
+        assert target_capture.detail is None
+        assert state["capture_suppressed_count"] == 0
+        target_capture.handle_request_finished(_page_detail_request())
+        assert (target_capture.detail is None) is enabled
+        other_capture.handle_request_finished(_page_detail_request("456"))
+        assert other_capture.detail["aweme_id"] == "456"
+        assert state["capture_suppressed_count"] == int(enabled)
+    assert douyin_signing._PageDetailCapture.handle_request_finished is original_capture
+    assert douyin_signing._read_ssr_aweme_detail_from_page is original_ssr
+
+
+@pytest.mark.parametrize(
+    ("response_url", "payload", "field", "error_type"),
+    [
+        (
+            "https://www.douyin.com/passport/web/login/",
+            None,
+            "authentication_failure",
+            douyin_signing._AuthenticationSigningFailure,
+        ),
+        (
+            None,
+            {"status_code": 1, "status_msg": "Please complete CAPTCHA"},
+            "authentication_failure",
+            douyin_signing._AuthenticationSigningFailure,
+        ),
+        (
+            "https://www.douyin.com/aweme/v1/web/aweme/detail/?aweme_id=999",
+            None,
+            "identity_failure",
+            douyin_signing._IdentitySigningFailure,
+        ),
+        (
+            None,
+            {
+                "status_code": 0,
+                "aweme_detail": {
+                    "aweme_id": "999",
+                    "author": {"sec_uid": "owner"},
+                },
+            },
+            "identity_failure",
+            douyin_signing._IdentitySigningFailure,
+        ),
+        (
+            "https://blocked.dnsfilter.com/?reason=blocked",
+            None,
+            "terminal_failure",
+            douyin_signing._NetworkFilterSigningFailure,
+        ),
+    ],
+)
+def test_forced_ssr_preserves_real_capture_auth_identity_and_network_failures(
+    response_url,
+    payload,
+    field,
+    error_type,
+):
+    capture = douyin_signing._PageDetailCapture("123", "owner")
+    with smoke.force_ssr_detail_adapter(
+        "https://www.douyin.com/video/123", enabled=True
+    ) as state:
+        capture.handle_request_finished(
+            _page_detail_request(response_url=response_url, payload=payload)
+        )
+        assert isinstance(getattr(capture, field), error_type)
+        failure = getattr(capture, field)
+        capture.handle_request_finished(_page_detail_request())
+        assert getattr(capture, field) is failure
+        assert capture.detail is None
+        assert state["capture_suppressed_count"] == 0
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_forced_ssr_observes_actual_reader_results_without_replacing_them(
+    monkeypatch,
+    enabled,
+):
+    calls = []
+    detail = {"aweme_id": "123", "author": {"sec_uid": "owner"}}
+
+    def original(page, aweme_id, expected_sec_uid):
+        calls.append((page, aweme_id, expected_sec_uid))
+        return detail
+
+    monkeypatch.setattr(douyin_signing, "_read_ssr_aweme_detail_from_page", original)
+    marker = object()
+    with smoke.force_ssr_detail_adapter(
+        "https://www.douyin.com/video/123", enabled=enabled
+    ) as state:
+        assert (
+            douyin_signing._read_ssr_aweme_detail_from_page(marker, "123", "owner")
+            is detail
+        )
+        assert (
+            douyin_signing._read_ssr_aweme_detail_from_page(marker, "456", "other")
+            is detail
+        )
+        assert state["ssr_attempt_count"] == int(enabled)
+        assert state["ssr_success_count"] == int(enabled)
+    assert calls == [(marker, "123", "owner"), (marker, "456", "other")]
+    assert douyin_signing._read_ssr_aweme_detail_from_page is original
+
+
+@pytest.mark.parametrize("result", [None, {}, {"aweme_id": "999"}, {"aweme_id": 123}])
+def test_forced_ssr_never_counts_missing_or_unbound_metadata(monkeypatch, result):
+    monkeypatch.setattr(
+        douyin_signing, "_read_ssr_aweme_detail_from_page", lambda *args: result
+    )
+    with smoke.force_ssr_detail_adapter(
+        "https://www.douyin.com/video/123", enabled=True
+    ) as state:
+        assert (
+            douyin_signing._read_ssr_aweme_detail_from_page(None, "123", None) is result
+        )
+        assert state["ssr_attempt_count"] == 1
+        assert state["ssr_success_count"] == 0
+
+
+def test_forced_ssr_rethrows_identical_failure_and_restores_adapters(monkeypatch):
+    error = douyin_signing._IdentitySigningFailure(
+        "Douyin SSR returned a different aweme"
+    )
+
+    def original(*args):
+        raise error
+
+    monkeypatch.setattr(douyin_signing, "_read_ssr_aweme_detail_from_page", original)
+    original_capture = douyin_signing._PageDetailCapture.handle_request_finished
+    with pytest.raises(douyin_signing._IdentitySigningFailure) as caught:
+        with smoke.force_ssr_detail_adapter(
+            "https://www.douyin.com/video/123", enabled=True
+        ) as state:
+            douyin_signing._read_ssr_aweme_detail_from_page(None, "123", None)
+    assert caught.value is error
+    assert state["ssr_attempt_count"] == 1 and state["ssr_success_count"] == 0
+    assert douyin_signing._PageDetailCapture.handle_request_finished is original_capture
+    assert douyin_signing._read_ssr_aweme_detail_from_page is original
+
+
+def test_forced_ssr_rejects_noncanonical_targets_before_patching():
+    original_capture = douyin_signing._PageDetailCapture.handle_request_finished
+    original_ssr = douyin_signing._read_ssr_aweme_detail_from_page
+    with pytest.raises(ValueError, match="canonical"):
+        with smoke.force_ssr_detail_adapter(
+            "https://www.douyin.com/user/self?modal_id=123", enabled=True
+        ):
+            pytest.fail("The invalid target must not enter the adapter")
+    assert douyin_signing._PageDetailCapture.handle_request_finished is original_capture
+    assert douyin_signing._read_ssr_aweme_detail_from_page is original_ssr
+
+
+@pytest.mark.parametrize(
+    ("enabled", "ssr_enabled"),
+    [(False, False), (True, False), (False, True), (True, True)],
+)
 def test_item_cli_passes_diagnostic_flag_and_labels_report(
-    monkeypatch, tmp_path, enabled
+    monkeypatch, tmp_path, enabled, ssr_enabled
 ):
     calls = []
 
-    def run_item(url, media_id, ffprobe, timeout, *, force_signed_detail=False):
-        calls.append((url, media_id, ffprobe, timeout, force_signed_detail))
+    def run_item(
+        url,
+        media_id,
+        ffprobe,
+        timeout,
+        *,
+        force_signed_detail=False,
+        force_ssr_detail=False,
+    ):
+        calls.append(
+            (url, media_id, ffprobe, timeout, force_signed_detail, force_ssr_detail)
+        )
         return {"status": "passed", "forced_signed_detail": force_signed_detail}
 
     monkeypatch.setattr(smoke.shutil, "which", lambda name: "ffprobe")
@@ -273,25 +465,46 @@ def test_item_cli_passes_diagnostic_flag_and_labels_report(
     ]
     if enabled:
         args.append("--force-signed-detail")
+    if ssr_enabled:
+        args.append("--force-ssr-detail")
     assert smoke.main(args) == 0
     assert calls == [
-        ("https://www.douyin.com/video/123", "123", "ffprobe", 600, enabled)
+        (
+            "https://www.douyin.com/video/123",
+            "123",
+            "ffprobe",
+            600,
+            enabled or ssr_enabled,
+            ssr_enabled,
+        )
     ]
     report = json.loads(path.read_text())
-    assert report["forced_signed_detail"] is enabled
-    assert ("not evidence" in report["description"]) is enabled
+    assert report["forced_signed_detail"] is (enabled or ssr_enabled)
+    assert report["forced_ssr_detail"] is ssr_enabled
+    assert ("not evidence" in report["description"]) is (enabled or ssr_enabled)
+    assert (
+        "requires actual verified SSR metadata" in report["description"]
+    ) is ssr_enabled
 
 
-@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize(
+    ("enabled", "ssr_enabled"), [(False, False), (True, False), (False, True)]
+)
 def test_run_item_passes_forcing_flag_to_worker_and_preserves_cleanup(
-    monkeypatch, enabled
+    monkeypatch, enabled, ssr_enabled
 ):
     created = []
     closed = []
     stopped = []
     receiver = SimpleNamespace(
         poll=lambda timeout: True,
-        recv=lambda: {"result": {"status": "passed", "forced_signed_detail": enabled}},
+        recv=lambda: {
+            "result": {
+                "status": "passed",
+                "forced_signed_detail": enabled or ssr_enabled,
+                "forced_ssr_detail": ssr_enabled,
+            }
+        },
         close=lambda: closed.append("receiver"),
     )
     sender = SimpleNamespace(close=lambda: closed.append("sender"))
@@ -313,23 +526,26 @@ def test_run_item_passes_forcing_flag_to_worker_and_preserves_cleanup(
         "ffprobe",
         30,
         force_signed_detail=enabled,
+        force_ssr_detail=ssr_enabled,
     )
     assert result["status"] == "passed"
-    assert result["forced_signed_detail"] is enabled
+    assert result["forced_signed_detail"] is (enabled or ssr_enabled)
+    assert result["forced_ssr_detail"] is ssr_enabled
     assert created[0][:2] == ("https://www.douyin.com/video/123", "123")
-    assert created[0][3:] == ("ffprobe", sender, enabled)
+    assert created[0][3:] == ("ffprobe", sender, enabled or ssr_enabled, ssr_enabled)
     assert not smoke.Path(created[0][2]).exists()
     assert stopped == [process]
     assert closed == ["sender", "receiver"]
 
 
-def test_forced_signed_cli_rejects_page_observer_combination(tmp_path):
+@pytest.mark.parametrize("flag", ["--force-signed-detail", "--force-ssr-detail"])
+def test_forced_signed_cli_rejects_page_observer_combination(tmp_path, flag):
     with pytest.raises(SystemExit) as error:
         smoke.main(
             [
                 "--observe-profile-item-url",
                 "https://www.douyin.com/user/self?modal_id=123&vid=456",
-                "--force-signed-detail",
+                flag,
                 "--report",
                 str(tmp_path / "report.json"),
             ]
@@ -402,6 +618,71 @@ def test_missing_ffprobe_writes_failed_report_without_network(tmp_path, monkeypa
     payload = json.loads(report.read_text())
     assert payload["status"] == "failed"
     assert payload["items"] == []
+
+
+@pytest.mark.parametrize("ssr_result", [None, {"aweme_id": "123"}])
+def test_worker_requires_real_ssr_result_even_if_signed_api_discovery_succeeds(
+    monkeypatch,
+    tmp_path,
+    ssr_result,
+):
+    url = "https://www.douyin.com/video/123"
+    results = []
+    downloads = []
+    item = SimpleNamespace(
+        media_id="123", source_url=url, media_type=smoke.MediaType.VIDEO
+    )
+
+    class Engine:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def discover(self, source_url, platform, kind):
+            ydl = object.__new__(smoke.YoutubeDL)
+            with pytest.raises(smoke.DownloadError, match="empty aweme detail"):
+                ydl.extract_info(url, download=False, process=False)
+            douyin_signing._read_ssr_aweme_detail_from_page(None, "123", "owner")
+            # Simulate a subsequent signed API success when SSR returns no detail.
+            return SimpleNamespace(
+                discovery_complete=True, items=[item], cookie_fallback_used=False
+            )
+
+        def download_item(self, *args, **kwargs):
+            downloads.append(item)
+            return SimpleNamespace(
+                cookie_fallback_used=False, output_paths=["video.mp4"]
+            )
+
+    monkeypatch.setattr(smoke.os, "dup2", lambda *args: None)
+    if hasattr(smoke.os, "setsid"):
+        monkeypatch.setattr(smoke.os, "setsid", lambda: None)
+    monkeypatch.setattr(smoke, "MediaDownloader", Engine)
+    monkeypatch.setattr(
+        smoke, "anonymous_browser_adapter", lambda *args: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(
+        smoke, "observe_quality_probes", lambda *args: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(smoke, "inspect_media", lambda *args: {"type": "video"})
+    monkeypatch.setattr(
+        douyin_signing, "_read_ssr_aweme_detail_from_page", lambda *args: ssr_result
+    )
+    connection = SimpleNamespace(send=results.append, close=lambda: None)
+    smoke._worker(url, "123", str(tmp_path), "ffprobe", connection, False, True)
+    result = results[-1]["result"]
+    success = ssr_result is not None
+    assert result["status"] == ("passed" if success else "failed")
+    assert result["forced_signed_detail"] is True
+    assert result["forced_ssr_detail"] is True
+    assert result["forced_extract_count"] == 1
+    assert result["forced_ssr_attempt_count"] == 1
+    assert result["forced_ssr_success_count"] == int(success)
+    assert len(downloads) == int(success)
+    if not success:
+        assert (
+            "verified exact-item SSR metadata"
+            in result["exception_chain"][0]["message"]
+        )
 
 
 def test_quality_metrics_only_accepts_bounded_numeric_fields():
