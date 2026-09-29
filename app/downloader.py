@@ -5661,6 +5661,15 @@ class MediaDownloader:
         return (facts.st_dev, facts.st_ino, facts.st_mode, facts.st_size,
                 facts.st_mtime_ns, facts.st_ctime_ns)
 
+    @staticmethod
+    def _kuaishou_path_signature(facts: os.stat_result) -> tuple[int, ...]:
+        # Windows Python 3.14 can report change time through fstat and creation
+        # time through lstat for the same file. Keep ctime in fd-to-fd checks
+        # everywhere and also in fd-to-path checks on other platforms.
+        signature = (facts.st_dev, facts.st_ino, facts.st_mode, facts.st_size,
+                     facts.st_mtime_ns)
+        return signature if os.name == "nt" else signature + (facts.st_ctime_ns,)
+
     @classmethod
     def _kuaishou_local_fingerprint(
         cls, path: Path, *, should_cancel: CancelCallback,
@@ -5684,8 +5693,11 @@ class MediaDownloader:
                     break
                 digest.update(chunk)
             signature = cls._kuaishou_file_signature(before)
+            path_facts = path.lstat()
             if (signature != cls._kuaishou_file_signature(os.fstat(handle.fileno()))
-                    or signature != cls._kuaishou_file_signature(path.lstat())):
+                    or not stat.S_ISREG(path_facts.st_mode)
+                    or cls._kuaishou_path_signature(before)
+                    != cls._kuaishou_path_signature(path_facts)):
                 raise MediaDownloadError("Saved media changed during verification")
         return digest.hexdigest(), before
 
@@ -5782,7 +5794,7 @@ class MediaDownloader:
                 should_cancel=should_cancel,
                 require_quality_fingerprint=False,
             )
-            if self._kuaishou_file_signature(facts) != self._kuaishou_file_signature(resolved.lstat()):
+            if self._kuaishou_path_signature(facts) != self._kuaishou_path_signature(resolved.lstat()):
                 return None
         except DownloadCancelledError:
             raise
@@ -5830,7 +5842,7 @@ class MediaDownloader:
                 dimensions = self._image_dimensions(handle.read(1024 * 1024))
             size = resolved.stat().st_size
             self._decode_local_image(resolved, should_cancel=should_cancel)
-            if self._kuaishou_file_signature(facts) != self._kuaishou_file_signature(resolved.lstat()):
+            if self._kuaishou_path_signature(facts) != self._kuaishou_path_signature(resolved.lstat()):
                 return None
         except DownloadCancelledError:
             raise

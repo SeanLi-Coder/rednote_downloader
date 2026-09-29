@@ -2402,6 +2402,51 @@ def test_video_completion_record_is_reported_with_its_media_kind(
     assert MEDIA not in json.dumps(records)
 
 
+def test_local_fingerprint_handles_platform_ctime_and_rejects_changed_identity(
+    monkeypatch, tmp_path
+):
+    saved = tmp_path / "saved.bin"
+    saved.write_bytes(b"verified-media")
+    original_lstat = Path.lstat
+    path_ctime_offset = 1
+    path_inode_offset = 0
+
+    def modified_lstat(path):
+        facts = original_lstat(path)
+        if path != saved:
+            return facts
+        values = {
+            key: getattr(facts, key)
+            for key in (
+                "st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns",
+                "st_ctime_ns",
+            )
+        }
+        values["st_ctime_ns"] += path_ctime_offset
+        values["st_ino"] += path_inode_offset
+        return SimpleNamespace(**values)
+
+    monkeypatch.setattr(Path, "lstat", modified_lstat)
+    if engine.os.name != "nt":
+        with pytest.raises(MediaDownloadError, match="changed during verification"):
+            engine.MediaDownloader._kuaishou_local_fingerprint(
+                saved, should_cancel=lambda: False,
+            )
+        path_ctime_offset = 0
+
+    digest, facts = engine.MediaDownloader._kuaishou_local_fingerprint(
+        saved, should_cancel=lambda: False,
+    )
+    assert len(digest) == 64
+    assert facts.st_size == len(b"verified-media")
+
+    path_inode_offset = 1
+    with pytest.raises(MediaDownloadError, match="changed during verification"):
+        engine.MediaDownloader._kuaishou_local_fingerprint(
+            saved, should_cancel=lambda: False,
+        )
+
+
 def test_video_record_survives_persistence_round_trip(tmp_path):
     """A video record must stay whitelisted and readable after a restart."""
     state_dir = tmp_path / "state"
@@ -2482,13 +2527,13 @@ def test_image_record_is_not_reused_by_the_video_path(monkeypatch, tmp_path):
     ) is None
 
 
-def test_album_records_are_rejected_when_identity_or_position_is_missing():
+def test_album_records_are_rejected_when_identity_or_position_is_missing(tmp_path):
     """R4: a record must bind the work, position and media kind, never a bare name."""
     valid = {
         "media_id": "3xalbum1",
         "index": 2,
         "media_kind": "image",
-        "path": "/tmp/album-002.jpg",
+        "path": str(tmp_path / "album-002.jpg"),
         "width": 800,
         "height": 600,
     }
@@ -2501,13 +2546,13 @@ def test_album_records_are_rejected_when_identity_or_position_is_missing():
     assert _public_kuaishou_saved_asset({**valid, "candidates": [MEDIA]}) == valid
 
 
-def test_saved_asset_records_require_a_known_media_kind():
+def test_saved_asset_records_require_a_known_media_kind(tmp_path):
     """A record must declare video or image; anything else is rejected outright."""
     valid = {
         "media_id": "3xwork1",
         "index": 1,
         "media_kind": "image",
-        "path": "/tmp/a.jpg",
+        "path": str(tmp_path / "a.jpg"),
     }
     assert _public_kuaishou_saved_asset(valid) == valid
     assert _public_kuaishou_saved_asset({**valid, "media_kind": "video"}) is not None

@@ -31,11 +31,15 @@ def run_ui(expression: str) -> object:
         "composeIssueMessage, issuePresentation, issueTitleForJob, "
         "cookieDiagnosticCode, warningPresentation};\n})();\n",
     )
+    script = (
+        "globalThis.window = {};\n"
+        "globalThis.document = {querySelector: () => null};\n"
+        + source
+        + f"\nprocess.stdout.write(JSON.stringify({expression}));\n"
+    )
     result = subprocess.run(
-        [node, "-e", "globalThis.window = {};\n"
-         "globalThis.document = {querySelector: () => null};\n" + source
-         + f"\nprocess.stdout.write(JSON.stringify({expression}));\n"],
-        capture_output=True, text=True, encoding="utf-8", timeout=30, check=False,
+        [node, "-"], input=script, capture_output=True, text=True,
+        encoding="utf-8", timeout=30, check=False,
     )
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout)
@@ -135,8 +139,8 @@ def run_profile_settings_ui(initial_profile, typed_profile):
         "})().catch(error => {process.stderr.write(String(error));process.exitCode=1});\n"
     )
     result = subprocess.run(
-        [node, "-e", script], capture_output=True, text=True, encoding="utf-8",
-        timeout=30, check=False,
+        [node, "-"], input=script, capture_output=True, text=True,
+        encoding="utf-8", timeout=30, check=False,
     )
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout)
