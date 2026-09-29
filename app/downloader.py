@@ -10,6 +10,7 @@ import mimetypes
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import threading
@@ -57,6 +58,9 @@ from .errors import (
     is_explicit_rate_limit_message,
 )
 from .models import DownloadItem, MediaType, Platform, SourceKind, TransferProgress
+from .kuaishou import discover as discover_kuaishou
+from .kuaishou import is_media_url as is_kuaishou_media_url
+from .kuaishou import source_identity as kuaishou_source_identity
 from .platforms import identify_url
 from .xiaohongshu import RemoteAsset, discover_profile as discover_xhs_profile
 from .xiaohongshu import (
@@ -112,6 +116,15 @@ FFPROBE_FALLBACK_PATHS = (
     "/opt/homebrew/bin/ffprobe",
     "/usr/local/bin/ffprobe",
 )
+FFMPEG_FALLBACK_PATHS = (
+    "/opt/homebrew/bin/ffmpeg",
+    "/usr/local/bin/ffmpeg",
+)
+# Persisted per-asset completion records for Kuaishou works. They carry work
+# identity, asset position, media kind and local file facts only, never a URL.
+KUAISHOU_SAVED_ASSETS_KEY = "kuaishou_saved_assets"
+# Kuaishou work is stored in its own folder, separate from every other platform.
+KUAISHOU_OUTPUT_FOLDER = "Kuaishou"
 DOUYIN_MEDIA_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) "
@@ -324,6 +337,21 @@ def safe_component(
     return value
 
 
+def platform_output_directory(
+    platform: Platform, output_root: str | Path, author: str | None
+) -> Path:
+    """Compute the real per-platform, per-author output directory.
+
+    Kuaishou work is stored in its own ``Kuaishou`` folder so it never mixes with
+    another platform's output; every other platform keeps its original layout. The
+    author segment is sanitized so a crafted author name cannot escape the folder.
+    """
+    root = Path(output_root).expanduser()
+    author_folder = safe_component(author, fallback=f"{platform.value}-author")
+    base = root / KUAISHOU_OUTPUT_FOLDER if platform == Platform.KUAISHOU else root
+    return base / author_folder
+
+
 def _safe_douyin_redirect_family(hostname: str) -> str | None:
     normalized = hostname.strip().lower().rstrip(".")
     if not normalized or len(normalized) > 253:
@@ -534,6 +562,9 @@ class EngineEvent:
     resolution: str | None = None
     output_paths: list[str] = field(default_factory=list)
     cookie_fallback_used: bool = False
+    # Verified per-image completion records for album downloads. They carry no
+    # media URL, so they are safe to persist across retries and restarts.
+    asset_records: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -707,6 +738,8 @@ class MediaDownloader:
         should_cancel = should_cancel or (lambda: False)
         if should_cancel():
             raise DownloadCancelledError("Task cancelled")
+        if platform == Platform.KUAISHOU:
+            return self._discover_kuaishou(url, should_cancel)
         xiaohongshu_browser_cookies = False
         if platform == Platform.XIAOHONGSHU:
             xiaohongshu_browser_cookies = self._xiaohongshu_browser_cookies_enabled()
@@ -950,6 +983,31 @@ class MediaDownloader:
             )
 
         return self._discover_with_ytdlp(url, platform, kind, should_cancel)
+
+    def _discover_kuaishou(self, url: str, should_cancel: CancelCallback) -> DiscoveryResult:
+        if self.config.cookie_browser not in {None, "chrome"}:
+            raise TemporaryAccessError("Kuaishou supports Chrome Cookie or explicit anonymous access only")
+        result = discover_kuaishou(
+            url, cookie_profile=self.config.cookie_profile,
+            use_browser_cookies=self.config.cookie_browser == "chrome",
+            should_cancel=should_cancel, status_callback=self._report_discovery,
+        )
+        items = [DownloadItem(
+            id=_item_key(Platform.KUAISHOU, video.media_id, video.url, index),
+            media_id=video.media_id, source_url=video.url, title=video.title,
+            author=video.author, upload_date=video.upload_date, playlist_index=index,
+            extractor_key="Kuaishou", media_type=(MediaType.IMAGE if video.media_type == "image" else MediaType.VIDEO),
+            metadata={
+                "kuaishou_author_id": video.author_id,
+                "kuaishou_source_kind": result.source_kind,
+                "kuaishou_source_id": result.source_id,
+                "kuaishou_refresh_url": url if result.source_kind == "item" else video.url,
+            },
+        ) for index, video in enumerate(result.videos, start=1)]
+        return DiscoveryResult(
+            author=result.videos[0].author if result.videos else "Kuaishou Author",
+            items=items, warning=result.warning, discovery_complete=result.complete,
+        )
 
     def _discover_douyin_item(
         self,
@@ -1299,6 +1357,10 @@ class MediaDownloader:
         should_cancel = should_cancel or (lambda: False)
         output_path = Path(output_dir).expanduser().resolve()
         output_path.mkdir(parents=True, exist_ok=True)
+        if platform == Platform.KUAISHOU:
+            return self._download_kuaishou_item(
+                item, output_path, callback=callback, should_cancel=should_cancel,
+            )
         if platform == Platform.XIAOHONGSHU:
             return self._download_xhs_item(
                 item,
@@ -3758,6 +3820,70 @@ class MediaDownloader:
                 return str(candidate)
         return None
 
+    @staticmethod
+    def _find_ffmpeg_executable() -> str | None:
+        executable = shutil.which("ffmpeg")
+        if executable:
+            return executable
+        for value in FFMPEG_FALLBACK_PATHS:
+            candidate = Path(value)
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return str(candidate)
+        return None
+
+    def _decode_local_image(self, path: Path, *, should_cancel: CancelCallback) -> None:
+        """Fully decode a saved image so a reused file is not trusted by header alone.
+
+        Raises ``MediaDownloadError`` when FFmpeg is missing, cannot start, or
+        reports a decode error. A truncated or corrupt image must be re-downloaded
+        rather than silently reused as a completed album member.
+        """
+        executable = self._find_ffmpeg_executable()
+        if not executable:
+            raise MediaDownloadError(FFPROBE_REQUIRED_MESSAGE)
+        try:
+            process = subprocess.Popen(
+                [
+                    executable,
+                    "-v",
+                    "error",
+                    "-xerror",
+                    "-err_detect",
+                    "explode",
+                    "-i",
+                    str(path),
+                    "-f",
+                    "null",
+                    "-",
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+        except OSError as exc:
+            raise MediaDownloadError(FFPROBE_START_MESSAGE) from exc
+        deadline = time.monotonic() + DOUYIN_FFPROBE_FILE_TIMEOUT_SECONDS
+        while True:
+            if should_cancel():
+                self._terminate_process(process)
+                raise DownloadCancelledError("Task cancelled")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._terminate_process(process)
+                raise MediaDownloadError("Image decode timed out while verifying a saved file")
+            try:
+                _, stderr = process.communicate(
+                    timeout=min(DOUYIN_PROCESS_POLL_SECONDS, remaining),
+                )
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        if process.returncode != 0:
+            detail = safe_external_error_message(
+                MediaDownloadError((stderr or b"").decode("utf-8", "replace")[:400])
+            )
+            raise MediaDownloadError(f"Saved image failed full decode verification: {detail}")
+
     def _run_ffprobe(
         self,
         command: list[str],
@@ -3766,36 +3892,46 @@ class MediaDownloader:
         timeout_seconds: float,
         should_cancel: CancelCallback,
     ) -> bytes | None:
-        try:
-            process = subprocess.Popen(
-                command,
-                stdin=(
-                    subprocess.PIPE if input_data is not None else subprocess.DEVNULL
-                ),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-            )
-        except OSError as exc:
-            raise MediaDownloadError(FFPROBE_START_MESSAGE) from exc
-
-        deadline = time.monotonic() + max(0.1, timeout_seconds)
-        pending_input = input_data
-        while True:
-            if should_cancel():
-                self._terminate_process(process)
-                raise DownloadCancelled("Task cancelled")
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                self._terminate_process(process)
-                raise TimeoutError("FFprobe timed out while reading media")
+        with contextlib.ExitStack() as cleanup:
             try:
-                stdout, _ = process.communicate(
-                    input=pending_input,
-                    timeout=min(DOUYIN_PROCESS_POLL_SECONDS, remaining),
+                stdin = subprocess.DEVNULL
+                if input_data is not None:
+                    # A timed-out communicate(input=...) may leave bytes unwritten;
+                    # retrying with input=None does not resume stdin on Python 3.13.
+                    # An anonymous input file keeps output polling cancellable without
+                    # a writer thread, private subprocess state or a longer deadline.
+                    stdin = cleanup.enter_context(tempfile.TemporaryFile())
+                    stdin.write(input_data)
+                    stdin.seek(0)
+                process = subprocess.Popen(
+                    command,
+                    stdin=stdin,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
                 )
-                return stdout or None
-            except subprocess.TimeoutExpired:
-                pending_input = None
+            except OSError as exc:
+                raise MediaDownloadError(FFPROBE_START_MESSAGE) from exc
+
+            deadline = time.monotonic() + max(0.1, timeout_seconds)
+            try:
+                while True:
+                    if should_cancel():
+                        raise DownloadCancelled("Task cancelled")
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("FFprobe timed out while reading media")
+                    try:
+                        stdout, _ = process.communicate(
+                            timeout=min(DOUYIN_PROCESS_POLL_SECONDS, remaining),
+                        )
+                        return stdout or None
+                    except subprocess.TimeoutExpired:
+                        continue
+            finally:
+                if process.poll() is None:
+                    self._terminate_process(process)
+                if process.stdout is not None:
+                    process.stdout.close()
 
     @staticmethod
     def _terminate_process(process: subprocess.Popen[bytes]) -> None:
@@ -5339,6 +5475,391 @@ class MediaDownloader:
             return MediaType.VIDEO
         return MediaType.IMAGE
 
+    def _download_kuaishou_item(
+        self, item: DownloadItem, output_dir: Path, *,
+        callback: EventCallback | None, should_cancel: CancelCallback,
+    ) -> DownloadOutcome:
+        if should_cancel():
+            raise DownloadCancelledError("Task cancelled")
+        source_kind, source_id = kuaishou_source_identity(item.source_url)
+        if source_kind != "item" or source_id != item.media_id:
+            raise MediaDownloadError("Kuaishou item identity changed; download was blocked")
+        refresh_url = item.metadata.get("kuaishou_refresh_url") or item.source_url
+        refresh_kind, refresh_id = kuaishou_source_identity(refresh_url)
+        if refresh_kind not in {"item", "short_link"} or (
+            refresh_kind == "item" and refresh_id != item.media_id
+        ):
+            raise MediaDownloadError("Kuaishou refresh URL identity changed; download was blocked")
+        if callback:
+            callback(EngineEvent(event="probing", message="Refreshing Kuaishou video links before download"))
+        result = discover_kuaishou(
+            refresh_url, cookie_profile=self.config.cookie_profile,
+            use_browser_cookies=self.config.cookie_browser == "chrome",
+            should_cancel=should_cancel,
+            status_callback=(lambda message: callback(EngineEvent(event="probing", message=message))) if callback else None,
+        )
+        if len(result.videos) != 1 or result.videos[0].media_id != item.media_id:
+            raise MediaDownloadError("Kuaishou returned a different video; download was blocked")
+        video = result.videos[0]
+        if not item.metadata.get("kuaishou_author_id") or video.author_id != item.metadata["kuaishou_author_id"]:
+            raise MediaDownloadError("Kuaishou author identity changed; download was blocked")
+        if not video.assets:
+            raise MediaDownloadError("Kuaishou item has no trusted highest-quality media assets")
+        media_type = MediaType.IMAGE if video.media_type == "image" else MediaType.VIDEO
+        if callback:
+            callback(EngineEvent(event="metadata", title=video.title, author=video.author,
+                                 upload_date=video.upload_date, media_type=media_type))
+        if media_type == MediaType.VIDEO:
+            return self._download_kuaishou_video(
+                item, video, output_dir,
+                callback=callback, should_cancel=should_cancel,
+            )
+        return self._download_kuaishou_album(
+            item, video, output_dir,
+            callback=callback, should_cancel=should_cancel,
+        )
+
+    def _download_kuaishou_video(
+        self, item: DownloadItem, video: Any, output_dir: Path, *,
+        callback: EventCallback | None, should_cancel: CancelCallback,
+    ) -> DownloadOutcome:
+        """Download ONE video from its already quality-filtered candidate set.
+
+        Video assets are alternate renditions of the SAME work, so they go to the
+        shared transfer helper as one ordered set: the first candidate that
+        passes verification wins and the attempt stops. Treating them as album
+        members emitted two finished files for one video, and abandoned the
+        remaining renditions after a single transfer failure.
+
+        A previously completed file is reused only after FFprobe re-verifies it
+        against the same declared quality, so a crash or a cancelled retry does
+        not re-download work that is already on disk.
+        """
+        saved = self._kuaishou_saved_asset_records(item, video.media_id, "video")
+        reused = None
+        for asset in video.assets:
+            reused = self._existing_kuaishou_video_asset(
+                saved.get(1), output_dir, asset, should_cancel=should_cancel,
+            )
+            if reused is not None:
+                break
+        if reused is None:
+            with YoutubeDL(self._base_options(False)) as ydl:
+                path, chosen = self._download_first_available_asset(
+                    ydl, list(video.assets), output_dir, video.upload_date, video.title,
+                    video.media_id, video.url, platform=Platform.KUAISHOU,
+                    media_type=MediaType.VIDEO, callback=callback,
+                    should_cancel=should_cancel,
+                    verify_declared_dimensions=True,
+                )
+        else:
+            path, chosen = reused
+        output_paths = [str(path)]
+        resolution = f"{chosen.width}x{chosen.height}" if chosen.width and chosen.height else None
+        record = self._kuaishou_completion_record(
+            path, chosen, video.media_id, "video", 1,
+            should_cancel=should_cancel, verified_record=saved.get(1) if reused else None,
+        )
+        if callback:
+            callback(EngineEvent(
+                event="asset_completed",
+                output_paths=output_paths,
+                asset_records=[record],
+            ))
+        return DownloadOutcome(output_paths=output_paths, title=video.title,
+                               author=video.author, upload_date=video.upload_date,
+                               media_type=MediaType.VIDEO, selected_format=chosen.format_id,
+                               resolution=resolution)
+
+    def _download_kuaishou_album(
+        self, item: DownloadItem, video: Any, output_dir: Path, *,
+        callback: EventCallback | None, should_cancel: CancelCallback,
+    ) -> DownloadOutcome:
+        """Download every album image separately, committing each one as it lands.
+
+        Each verified image is reported through ``asset_completed`` together with
+        a structured record immediately, so a later failure, a cancellation or a
+        process restart cannot lose the knowledge that an earlier image already
+        completed. Records carry no media URL and are persisted with the task.
+        """
+        total = len(video.assets)
+        saved = self._kuaishou_saved_asset_records(item, video.media_id, "image")
+        output_paths: list[str] = []
+        records: list[dict[str, Any]] = []
+        chosen_assets: list[RemoteAsset] = []
+        with YoutubeDL(self._base_options(False)) as ydl:
+            for asset_index, asset in enumerate(video.assets, 1):
+                if should_cancel():
+                    raise DownloadCancelledError("Task cancelled")
+                asset.index = asset_index
+                reused = self._existing_kuaishou_image_asset(
+                    saved.get(asset_index),
+                    output_dir,
+                    asset,
+                    should_cancel=should_cancel,
+                )
+                if reused is None:
+                    path, chosen = self._download_first_available_asset(
+                        ydl, [asset], output_dir, video.upload_date, video.title,
+                        video.media_id, video.url, platform=Platform.KUAISHOU,
+                        media_type=MediaType.IMAGE, callback=callback,
+                        should_cancel=should_cancel, asset_index=asset_index,
+                        progress_index=asset_index, progress_count=total,
+                        verify_declared_dimensions=True,
+                    )
+                else:
+                    path, chosen = reused
+                record = self._kuaishou_completion_record(
+                    path, chosen, video.media_id, "image", asset_index,
+                    should_cancel=should_cancel,
+                    verified_record=saved.get(asset_index) if reused else None,
+                )
+                output_paths.append(str(path))
+                records.append(record)
+                chosen_assets.append(chosen)
+                # Commit this image before the next one starts, so a later
+                # failure keeps an accurate record instead of re-downloading or
+                # renaming an already saved file.
+                if callback:
+                    callback(EngineEvent(
+                        event="asset_completed",
+                        output_paths=list(output_paths),
+                        asset_records=list(records),
+                    ))
+        chosen = chosen_assets[0]
+        resolution = f"{chosen.width}x{chosen.height}" if chosen.width and chosen.height else None
+        return DownloadOutcome(output_paths=output_paths, title=video.title,
+                               author=video.author, upload_date=video.upload_date,
+                               media_type=MediaType.IMAGE, selected_format=chosen.format_id,
+                               resolution=resolution)
+
+    @staticmethod
+    def _kuaishou_source_fingerprint(asset: RemoteAsset, media_kind: str) -> str:
+        """Bind a receipt to exact trusted sources without persisting signed URLs.
+
+        Signature changes intentionally invalidate reuse. URL equality does not
+        prove that a remote object has never changed; the local digest only
+        proves that the completed local bytes have not changed since download.
+        """
+        if not asset.candidates or any(
+            not is_kuaishou_media_url(url) for url in asset.candidates
+        ):
+            raise MediaDownloadError("Kuaishou asset has no trusted source identity")
+        payload = {
+            "version": 1,
+            "media_kind": media_kind,
+            "candidates": sorted(set(asset.candidates)),
+            "video_codec": asset.video_codec,
+            "audio_codec": asset.audio_codec,
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    @staticmethod
+    def _kuaishou_file_signature(facts: os.stat_result) -> tuple[int, ...]:
+        return (facts.st_dev, facts.st_ino, facts.st_mode, facts.st_size,
+                facts.st_mtime_ns, facts.st_ctime_ns)
+
+    @classmethod
+    def _kuaishou_local_fingerprint(
+        cls, path: Path, *, should_cancel: CancelCallback,
+    ) -> tuple[str, os.stat_result]:
+        """Hash bounded chunks of one unchanged regular file, with cancellation."""
+        if should_cancel():
+            raise DownloadCancelledError("Task cancelled")
+        descriptor = os.open(
+            path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+        )
+        with os.fdopen(descriptor, "rb") as handle:
+            before = os.fstat(handle.fileno())
+            if not stat.S_ISREG(before.st_mode):
+                raise MediaDownloadError("Saved media is not a regular file")
+            digest = hashlib.sha256()
+            while True:
+                if should_cancel():
+                    raise DownloadCancelledError("Task cancelled")
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            signature = cls._kuaishou_file_signature(before)
+            if (signature != cls._kuaishou_file_signature(os.fstat(handle.fileno()))
+                    or signature != cls._kuaishou_file_signature(path.lstat())):
+                raise MediaDownloadError("Saved media changed during verification")
+        return digest.hexdigest(), before
+
+    @classmethod
+    def _kuaishou_completion_record(
+        cls, path: Path, asset: RemoteAsset, media_id: str, media_kind: str, index: int,
+        *, should_cancel: CancelCallback, verified_record: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if should_cancel():
+            raise DownloadCancelledError("Task cancelled")
+        if verified_record is None:
+            digest, facts = cls._kuaishou_local_fingerprint(path, should_cancel=should_cancel)
+        else:
+            # The reuse gate already hashed and decoded this file in this attempt.
+            digest, facts = verified_record["local_sha256"], path.lstat()
+        return {
+            "media_id": media_id, "media_kind": media_kind, "index": index,
+            "path": str(path), "width": asset.width, "height": asset.height,
+            "size": facts.st_size, "format_id": asset.format_id,
+            "local_sha256": digest,
+            "source_sha256": cls._kuaishou_source_fingerprint(asset, media_kind),
+        }
+
+    @classmethod
+    def _kuaishou_receipt_matches(
+        cls, record: dict[str, Any], asset: RemoteAsset, media_kind: str,
+    ) -> bool:
+        if not re.fullmatch(r"[0-9a-f]{64}", str(record.get("local_sha256") or "")):
+            return False
+        return record.get("source_sha256") == cls._kuaishou_source_fingerprint(asset, media_kind)
+
+    @staticmethod
+    def _kuaishou_saved_asset_records(
+        item: DownloadItem, media_id: str, media_kind: str
+    ) -> dict[int, dict[str, Any]]:
+        """Index persisted completion records by position for this exact work.
+
+        Records are matched by work identity AND media kind, so a video record can
+        never be reused as an album image or the other way round.
+        """
+        raw = item.metadata.get(KUAISHOU_SAVED_ASSETS_KEY)
+        records: dict[int, dict[str, Any]] = {}
+        if not isinstance(raw, list):
+            return records
+        for entry in raw:
+            if not isinstance(entry, dict) or entry.get("media_id") != media_id:
+                continue
+            if entry.get("media_kind") != media_kind:
+                continue
+            index = entry.get("index")
+            if isinstance(index, int) and not isinstance(index, bool) and index > 0:
+                records[index] = entry
+        return records
+
+    def _existing_kuaishou_video_asset(
+        self,
+        record: dict[str, Any] | None,
+        output_dir: Path,
+        asset: RemoteAsset,
+        *,
+        should_cancel: CancelCallback,
+    ) -> tuple[Path, RemoteAsset] | None:
+        """Reuse a completed video only after FFprobe re-verifies it.
+
+        Matching uses the persisted record's work identity, never a file name. The
+        source and content digests must match the saved receipt. The file must
+        still exist inside the output directory, be a real file rather
+        than a symlink, and pass the same declared quality checks as a fresh
+        download. A truncated, user-modified, moved or missing file is
+        re-downloaded instead of being trusted or overwritten.
+        """
+        if not record:
+            return None
+        if should_cancel():
+            raise DownloadCancelledError("Task cancelled")
+        value = record.get("path")
+        if not isinstance(value, str) or not value:
+            return None
+        candidate = Path(value)
+        try:
+            if not self._kuaishou_receipt_matches(record, asset, "video"):
+                return None
+            if candidate.is_symlink() or not candidate.is_file():
+                return None
+            resolved = candidate.resolve(strict=True)
+            if resolved.parent != output_dir:
+                return None
+            digest, facts = self._kuaishou_local_fingerprint(resolved, should_cancel=should_cancel)
+            if digest != record["local_sha256"] or facts.st_size != record.get("size"):
+                return None
+            verified = self._verify_local_video_asset(
+                resolved,
+                asset,
+                should_cancel=should_cancel,
+                require_quality_fingerprint=False,
+            )
+            if self._kuaishou_file_signature(facts) != self._kuaishou_file_signature(resolved.lstat()):
+                return None
+        except DownloadCancelledError:
+            raise
+        except (OSError, MediaDownloadError, ValueError):
+            return None
+        return resolved, verified
+
+    def _existing_kuaishou_image_asset(
+        self,
+        record: dict[str, Any] | None,
+        output_dir: Path,
+        asset: RemoteAsset,
+        *,
+        should_cancel: CancelCallback,
+    ) -> tuple[Path, RemoteAsset] | None:
+        """Reuse a completed album image only after re-verifying it.
+
+        Matching uses the work, position, exact source and local content digests,
+        never a file name, because Kuaishou album files use date-and-title names
+        and collision avoidance may append a suffix. The file must still exist
+        inside the output directory, be a real file rather than a symlink, fully
+        decode, and still meet the declared dimensions. A user-modified, moved or
+        missing file is re-downloaded instead of being trusted or overwritten.
+        """
+        if not record:
+            return None
+        if should_cancel():
+            raise DownloadCancelledError("Task cancelled")
+        value = record.get("path")
+        if not isinstance(value, str) or not value:
+            return None
+        candidate = Path(value)
+        try:
+            if not self._kuaishou_receipt_matches(record, asset, "image"):
+                return None
+            if candidate.is_symlink() or not candidate.is_file():
+                return None
+            resolved = candidate.resolve(strict=True)
+            if resolved.parent != output_dir:
+                return None
+            digest, facts = self._kuaishou_local_fingerprint(resolved, should_cancel=should_cancel)
+            if digest != record["local_sha256"] or facts.st_size != record.get("size"):
+                return None
+            with resolved.open("rb") as handle:
+                dimensions = self._image_dimensions(handle.read(1024 * 1024))
+            size = resolved.stat().st_size
+            self._decode_local_image(resolved, should_cancel=should_cancel)
+            if self._kuaishou_file_signature(facts) != self._kuaishou_file_signature(resolved.lstat()):
+                return None
+        except DownloadCancelledError:
+            raise
+        except (OSError, MediaDownloadError, ValueError):
+            return None
+        if not dimensions:
+            return None
+        width, height = dimensions
+        if (
+            asset.width
+            and asset.height
+            and (
+                min(width, height) < min(asset.width, asset.height)
+                or max(width, height) < max(asset.width, asset.height)
+            )
+        ):
+            return None
+        return (
+            resolved,
+            RemoteAsset(
+                candidates=list(asset.candidates),
+                index=asset.index,
+                width=width,
+                height=height,
+                size=size,
+                format_id=asset.format_id,
+            ),
+        )
+
     def _download_xhs_item(
         self,
         item: DownloadItem,
@@ -5723,6 +6244,7 @@ class MediaDownloader:
         douyin_refresh_errors: list[DouyinMediaRefreshRequiredError] = []
         is_xiaohongshu_source = platform == Platform.XIAOHONGSHU
         is_douyin_source = platform == Platform.DOUYIN
+        is_kuaishou_source = platform == Platform.KUAISHOU
         transfer_budget = _douyin_transfer_budget
         for asset in assets:
             allow_verified_douyin_redirect = bool(
@@ -5809,6 +6331,11 @@ class MediaDownloader:
                         raise MediaDownloadError(
                             "Untrusted Xiaohongshu media URL was blocked"
                         )
+                    if is_kuaishou_source and not is_kuaishou_media_url(candidate):
+                        raise TemporaryAccessError(
+                            "Untrusted Kuaishou media URL was blocked",
+                            issue_code=SiteIssueCode.SECURITY_BLOCKED,
+                        )
                     candidate_redirect_reason = (
                         self._douyin_media_redirect_rejection_reason(
                             candidate,
@@ -5841,6 +6368,8 @@ class MediaDownloader:
                         referer = "https://www.xiaohongshu.com/"
                     elif is_douyin_source:
                         referer = DOUYIN_MEDIA_HEADERS["Referer"]
+                    elif is_kuaishou_source:
+                        referer = "https://www.kuaishou.com/"
                     request_headers = {
                         "Referer": referer,
                         "Accept": "*/*",
@@ -5884,14 +6413,21 @@ class MediaDownloader:
                                 f"Redirect port: {exc.redirect_port or 'unavailable'}; "
                                 f"reason: {exc.redirect_reason or 'unrecognized-host'}"
                             ) from exc
-                    elif is_xiaohongshu_source:
+                    elif is_xiaohongshu_source or is_kuaishou_source:
                         try:
                             response = _open_xiaohongshu_response(
                                 ydl,
                                 media_request,
-                                is_trusted_url=is_trusted_xiaohongshu_asset_url,
+                                is_trusted_url=(is_kuaishou_media_url if is_kuaishou_source
+                                                else is_trusted_xiaohongshu_asset_url),
                             )
                         except _XiaohongshuRedirectRejected as exc:
+                            if is_kuaishou_source:
+                                raise TemporaryAccessError(
+                                    "Kuaishou media redirect was blocked before "
+                                    "requesting an untrusted target",
+                                    issue_code=SiteIssueCode.SECURITY_BLOCKED,
+                                ) from exc
                             raise MediaDownloadError(
                                 "Xiaohongshu media redirect was blocked before "
                                 "requesting an untrusted target"
@@ -5899,6 +6435,11 @@ class MediaDownloader:
                     else:
                         response = ydl.urlopen(media_request)
                     final_url = str(getattr(response, "url", None) or candidate)
+                    if is_kuaishou_source and not is_kuaishou_media_url(final_url):
+                        raise TemporaryAccessError(
+                            "Kuaishou media request redirected to an untrusted URL",
+                            issue_code=SiteIssueCode.SECURITY_BLOCKED,
+                        )
                     if is_xiaohongshu_source and not (
                         is_trusted_xiaohongshu_asset_url(final_url)
                     ):
@@ -6026,6 +6567,7 @@ class MediaDownloader:
                         media_id,
                         extension,
                         asset_index,
+                        platform,
                     )
                     total_header = response.headers.get("Content-Length")
                     total = (
@@ -6141,7 +6683,22 @@ class MediaDownloader:
                                     require_quality_fingerprint
                                 ),
                             )
-                        os.replace(temporary, path)
+                        if is_kuaishou_source and media_type == MediaType.IMAGE:
+                            self._decode_local_image(temporary, should_cancel=should_cancel)
+                            chosen.size = downloaded
+                        if is_kuaishou_source:
+                            path = self._publish_kuaishou_asset(
+                                temporary,
+                                output_dir,
+                                upload_date,
+                                title,
+                                media_id,
+                                extension,
+                                asset_index,
+                                should_cancel=should_cancel,
+                            )
+                        else:
+                            os.replace(temporary, path)
                     except BaseException:
                         if temporary_fd >= 0:
                             with contextlib.suppress(OSError):
@@ -6603,6 +7160,53 @@ class MediaDownloader:
             else None
         )
 
+    def _publish_kuaishou_asset(
+        self,
+        temporary: Path,
+        output_dir: Path,
+        upload_date: str | None,
+        title: str,
+        media_id: str,
+        extension: str,
+        asset_index: int | None,
+        *,
+        should_cancel: CancelCallback,
+    ) -> Path:
+        """Publish verified media without replacing an existing destination."""
+        date_part = upload_date or "Unknown-Date"
+        title_part = safe_component(
+            title, fallback=media_id, limit=self.config.filename_limit
+        )
+        index_suffix = f"-{asset_index:03d}" if asset_index is not None else ""
+        base = f"{date_part}-{title_part}{index_suffix}"
+        safe_id = _safe_media_id(media_id)
+        for collision in range(10_001):
+            if should_cancel():
+                raise DownloadCancelledError("Task cancelled")
+            suffix = (
+                "" if collision == 0 else
+                f" [{safe_id}{'-' + str(collision) if collision > 1 else ''}]"
+            )
+            destination = output_dir / f"{base}{suffix}.{extension}"
+            try:
+                # Both names live in the same folder. The link is visible only
+                # after the complete, verified temporary file has been flushed.
+                # Unlike os.replace, link creation fails if another task or the
+                # user created this name since the earlier path selection.
+                os.link(temporary, destination)
+            except FileExistsError:
+                continue
+            except OSError as exc:
+                raise TemporaryAccessError(
+                    "Kuaishou output filesystem does not support safe atomic "
+                    "file publication; select a local folder on a filesystem "
+                    "with hard links",
+                    issue_code=SiteIssueCode.LOCAL_CONFIGURATION,
+                ) from exc
+            temporary.unlink()
+            return destination
+        raise MediaDownloadError("Kuaishou output has too many filename collisions")
+
     def _xhs_output_path(
         self,
         output_dir: Path,
@@ -6611,12 +7215,25 @@ class MediaDownloader:
         media_id: str,
         extension: str,
         asset_index: int | None,
+        platform: Platform | None = None,
     ) -> Path:
         date_part = upload_date or "Unknown-Date"
         title_part = safe_component(
             title, fallback=media_id, limit=self.config.filename_limit
         )
         suffix = f"-{asset_index:03d}" if asset_index is not None else ""
+        if platform == Platform.KUAISHOU:
+            base = f"{date_part}-{title_part}{suffix}"
+            path = output_dir / f"{base}.{extension}"
+            if path.exists():
+                # Never replace an existing user file; use the stable media ID
+                # only when the human-readable name collides.
+                path = output_dir / f"{base} [{_safe_media_id(media_id)}].{extension}"
+                counter = 2
+                while path.exists():
+                    path = output_dir / f"{base} [{_safe_media_id(media_id)}-{counter}].{extension}"
+                    counter += 1
+            return path
         return output_dir / f"{date_part}-{title_part} [{media_id}]{suffix}.{extension}"
 
     @staticmethod

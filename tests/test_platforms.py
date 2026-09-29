@@ -37,6 +37,28 @@ from app.platforms import UnsupportedUrlError, extract_url, identify_url
         ),
         ("https://v.douyin.com/example/", Platform.DOUYIN, SourceKind.SHORT_LINK),
         (
+            "https://www.kuaishou.com/short-video/3x12345678",
+            Platform.KUAISHOU,
+            SourceKind.ITEM,
+        ),
+        (
+            "https://www.kuaishou.com/profile/3x98765432",
+            Platform.KUAISHOU,
+            SourceKind.PROFILE,
+        ),
+        ("https://v.kuaishou.com/AbCdEF", Platform.KUAISHOU, SourceKind.SHORT_LINK),
+        ("https://www.kuaishou.com/f/AbCdEF", Platform.KUAISHOU, SourceKind.SHORT_LINK),
+        (
+            "https://m.gifshow.com/fw/photo/3x12345678",
+            Platform.KUAISHOU,
+            SourceKind.ITEM,
+        ),
+        (
+            "https://m.gifshow.com/fw/user/3x98765432",
+            Platform.KUAISHOU,
+            SourceKind.PROFILE,
+        ),
+        (
             "https://space.bilibili.com/946974/video",
             Platform.BILIBILI,
             SourceKind.PROFILE,
@@ -295,6 +317,17 @@ def test_douyin_rejects_invalid_or_ambiguous_profile_modal_id(query: str) -> Non
         "https://www.douyin.com/search/example",
         "https://www.douyin.com/video/7664225419386607205oops",
         "https://www.douyin.com/video/7664225419386607205/other",
+        "http://www.kuaishou.com/short-video/3x12345678",
+        "https://www.kuaishou.com:0/short-video/3x12345678",
+        "https://www.kuaishou.com:444/short-video/3x12345678",
+        "https://www.kuaishou.com:abc/short-video/3x12345678",
+        "https://www.kuaishou.com.evil.test/short-video/3x12345678",
+        "https://@www.kuaishou.com/short-video/3x12345678",
+        "https://www.kuaishou.com/short-video/../3x12345678",
+        "https://www.kuaishou.com/short-video/a%2Fb",
+        "https://www.kuaishou.com/profile/",
+        "https://v.kuaishou.com/id/extra",
+        "https://m.gifshow.com/other/3x12345678",
         (
             "https://www.douyin.com/video/7664225419386607205]"
             "(https://www.douyin.com/user/WRONG"

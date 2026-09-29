@@ -175,6 +175,12 @@ def _http_error(exc: Exception) -> HTTPException:
 
 
 def _redact_public_url(value: str) -> str:
+    try:
+        parsed = urlsplit(value)
+        if parsed.hostname in {"kuaishou.com", "www.kuaishou.com", "v.kuaishou.com", "m.gifshow.com"}:
+            return urlunsplit(parsed._replace(query="", fragment=""))
+    except (TypeError, ValueError):
+        pass
     if "xsec_token" not in value.lower():
         return value
     try:
@@ -299,14 +305,22 @@ def update_config(request: AppConfig) -> AppConfig:
     global config
     request = request.model_copy(deep=True)
     output_dir = Path(request.download_dir)
-    try:
-        output_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Cannot create download directory: {exc}",
-        ) from exc
     with _CONFIG_LOCK:
+        if request.chrome_profile != config.chrome_profile:
+            profile = (request.chrome_profile or "").strip()
+            if profile and not re.fullmatch(r"(?:Default|Profile [1-9][0-9]*)", profile):
+                raise HTTPException(
+                    status_code=422,
+                    detail="Chrome Profile must be Default or Profile N",
+                )
+            request.chrome_profile = profile or None
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Cannot create download directory: {exc}",
+            ) from exc
         try:
             _save_config(request)
         except OSError as exc:

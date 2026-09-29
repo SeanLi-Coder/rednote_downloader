@@ -443,6 +443,14 @@ svg {
 .platform-dot.pink { color: #ff78aa; }
 .platform-dot.blue { color: #6f9fff; }
 .platform-dot.cyan { color: #55e7ed; }
+.platform-dot.orange { color: #ffad5c; }
+
+.desktop-note {
+  margin: 7px 5px 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
 
 .form-error {
   margin: 0;

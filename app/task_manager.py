@@ -13,17 +13,19 @@ from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 from .browser import (
+    COOKIE_DIAGNOSTIC_CODES,
     chrome_profile_has_cookies,
     select_chrome_profile_with_cookies,
 )
 from .downloader import (
     DOUYIN_ITEM_EXPANSION_MESSAGE,
+    KUAISHOU_SAVED_ASSETS_KEY,
     DiscoveryResult,
     DownloaderConfig,
     EngineEvent,
     MediaDownloader,
     XIAOHONGSHU_COOKIE_BROWSER_ERROR,
-    safe_component,
+    platform_output_directory,
     safe_external_error_message,
 )
 from .douyin import (
@@ -42,6 +44,7 @@ from .errors import (
     TemporaryAccessError,
     classify_site_issue,
 )
+from .kuaishou import source_identity as kuaishou_source_identity
 from .models import (
     ACTIVE_JOB_STATUSES,
     RETRYABLE_ITEM_STATUSES,
@@ -95,6 +98,91 @@ QUEUE_PAUSE_SITE_ISSUES = frozenset(
         SiteIssueCode.LOCAL_CONFIGURATION,
     }
 )
+_KUAISHOU_SAVED_ASSET_FIELDS = {
+    "media_id": str,
+    "index": int,
+    "media_kind": str,
+    "path": str,
+    "width": int,
+    "height": int,
+    "size": int,
+    "format_id": str,
+    "local_sha256": str,
+    "source_sha256": str,
+}
+_KUAISHOU_SAVED_ASSET_KINDS = frozenset({"video", "image"})
+_KUAISHOU_SECURITY_TRANSFER_ERRORS = frozenset(
+    {
+        "Untrusted Kuaishou media URL was blocked",
+        "Kuaishou media redirect was blocked before requesting an untrusted target",
+        "Kuaishou media request redirected to an untrusted URL",
+    }
+)
+
+
+def _public_kuaishou_saved_asset(record: object) -> dict[str, object] | None:
+    """Persist only local file facts for a verified Kuaishou asset."""
+    if not isinstance(record, dict):
+        return None
+    cleaned: dict[str, object] = {}
+    for name, kind in _KUAISHOU_SAVED_ASSET_FIELDS.items():
+        value = record.get(name)
+        if value is None or (kind is int and isinstance(value, bool)):
+            continue
+        if not isinstance(value, kind):
+            continue
+        if name in {"local_sha256", "source_sha256"} and not re.fullmatch(
+            r"[0-9a-f]{64}", value
+        ):
+            continue
+        cleaned[name] = value
+    if not isinstance(cleaned.get("media_id"), str) or not cleaned["media_id"]:
+        return None
+    if not isinstance(cleaned.get("index"), int) or cleaned["index"] <= 0:
+        return None
+    if cleaned.get("media_kind") not in _KUAISHOU_SAVED_ASSET_KINDS:
+        return None
+    path = cleaned.get("path")
+    if not isinstance(path, str) or not Path(path).is_absolute() or "://" in path:
+        return None
+    return cleaned
+
+
+def _kuaishou_cookie_diagnostic(cause: BaseException | None) -> str | None:
+    """Read only fixed diagnostic categories from the exception chain."""
+    current = cause
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen and len(seen) < 8:
+        seen.add(id(current))
+        code = getattr(current, "diagnostic_code", None)
+        if isinstance(code, str) and code in COOKIE_DIAGNOSTIC_CODES:
+            return code
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def _recover_cookie_diagnostic_code(message: str | None) -> str | None:
+    match = re.search(r"\bDiagnostic:\s*([a-z0-9_]+)\b", message or "", re.I)
+    if not match:
+        return None
+    code = match.group(1).lower()
+    return code if code in COOKIE_DIAGNOSTIC_CODES else None
+
+
+def _is_kuaishou_security_transfer_error(
+    cause: BaseException | None, message: str
+) -> bool:
+    if not isinstance(cause, MediaDownloadError):
+        return False
+    if message in _KUAISHOU_SECURITY_TRANSFER_ERRORS:
+        return True
+    match = re.fullmatch(
+        r"All highest-available media URLs failed: Candidate [1-9][0-9]*: (.+)",
+        message,
+    )
+    return bool(match and match.group(1) in _KUAISHOU_SECURITY_TRANSFER_ERRORS)
+
+
 LEGACY_DOUYIN_RESULT_ERROR = (
     "This legacy Douyin profile result must be manually reviewed; "
     "create a new task before downloading again."
@@ -711,10 +799,12 @@ class DownloadManager:
                 targets = None
                 rediscover = True
             elif (
-                job.platform == Platform.DOUYIN
-                and job.source_kind == SourceKind.PROFILE
-                and self._should_rediscover_on_retry(job)
-            ):
+                (
+                    job.platform == Platform.DOUYIN
+                    and job.source_kind == SourceKind.PROFILE
+                )
+                or job.platform == Platform.KUAISHOU
+            ) and self._should_rediscover_on_retry(job):
                 targets = None
                 rediscover = True
             elif self._has_xiaohongshu_binding_rediscovery_pending(job):
@@ -957,6 +1047,8 @@ class DownloadManager:
         job.auth_message = None
         job.issue_code = None
         job.issue_message = None
+        if job.platform == Platform.KUAISHOU:
+            job.diagnostic_code = None
         job.verification_url = None
         job.finished_at = None
         job.updated_at = utc_now()
@@ -1024,12 +1116,20 @@ class DownloadManager:
                 with self._lock:
                     job = self._require_job(job_id)
                     job.author = result.author
-                    author_folder = safe_component(
-                        result.author, fallback=f"{job.platform.value}-author"
+                    job.output_dir = str(
+                        platform_output_directory(
+                            job.platform, job.output_root, result.author
+                        )
                     )
-                    job.output_dir = str(Path(job.output_root) / author_folder)
                     Path(job.output_dir).mkdir(parents=True, exist_ok=True)
                     previous_items = job.items
+                    if job.platform == Platform.KUAISHOU and result.items:
+                        source_kind = SourceKind(
+                            result.items[0].metadata["kuaishou_source_kind"]
+                        )
+                        source_id = result.items[0].metadata["kuaishou_source_id"]
+                        job.resolved_source_kind = source_kind
+                        job.resolved_source_id = source_id
                     if job.platform == Platform.XIAOHONGSHU:
                         for xhs_item in [*previous_items, *result.items]:
                             self._normalize_xiaohongshu_item_identity(xhs_item)
@@ -1078,6 +1178,14 @@ class DownloadManager:
                             job.platform == Platform.DOUYIN
                             and job.source_kind == SourceKind.PROFILE
                             and result.discovery_complete
+                        ),
+                        preserve_unmatched_items=(
+                            job.platform == Platform.KUAISHOU
+                            and (
+                                job.source_kind == SourceKind.PROFILE
+                                or job.resolved_source_kind == SourceKind.PROFILE
+                            )
+                            and not result.discovery_complete
                         ),
                     )
                     if (
@@ -1129,13 +1237,14 @@ class DownloadManager:
 
             job_snapshot = self.get_job(job_id)
             if not job_snapshot.output_dir:
-                author_folder = safe_component(
+                output_dir = platform_output_directory(
+                    job_snapshot.platform,
+                    job_snapshot.output_root,
                     job_snapshot.author,
-                    fallback=f"{job_snapshot.platform.value}-author",
                 )
                 with self._lock:
                     job = self._require_job(job_id)
-                    job.output_dir = str(Path(job.output_root) / author_folder)
+                    job.output_dir = str(output_dir)
                     Path(job.output_dir).mkdir(parents=True, exist_ok=True)
                     self._commit_locked(job)
 
@@ -1154,6 +1263,8 @@ class DownloadManager:
                     item.error = None
                     item.auth_message = None
                     item.issue_code = None
+                    if job.platform == Platform.KUAISHOU:
+                        item.diagnostic_code = None
                     item.updated_at = utc_now()
                     job.active_item_id = item.id
                     job.status = JobStatus.DOWNLOADING
@@ -1243,6 +1354,8 @@ class DownloadManager:
                         item.progress.percent = 100.0
                         item.error = None
                         item.issue_code = None
+                        if job.platform == Platform.KUAISHOU:
+                            item.diagnostic_code = None
                         item.updated_at = utc_now()
                         job.cookie_fallback_used |= outcome.cookie_fallback_used
                         job.active_item_id = None
@@ -1362,7 +1475,7 @@ class DownloadManager:
                             item.issue_code not in NON_RETRYABLE_SITE_ISSUES
                         )
                         pause_queue = item.issue_code in QUEUE_PAUSE_SITE_ISSUES or (
-                            job.platform == Platform.DOUYIN
+                            job.platform in {Platform.DOUYIN, Platform.KUAISHOU}
                             and item.issue_code == SiteIssueCode.SITE_RESPONSE_CHANGED
                         )
                         if (
@@ -1956,6 +2069,21 @@ class DownloadManager:
                     )
                 else:
                     item.output_paths = event.output_paths
+            if (
+                job.platform == Platform.KUAISHOU
+                and event.event == "asset_completed"
+                and event.asset_records
+            ):
+                previous = item.metadata.get(KUAISHOU_SAVED_ASSETS_KEY)
+                receipts: dict[tuple[str, int], dict[str, object]] = {}
+                for raw in [
+                    *(previous if isinstance(previous, list) else []),
+                    *event.asset_records,
+                ]:
+                    record = _public_kuaishou_saved_asset(raw)
+                    if record is not None and record["media_id"] == item.media_id:
+                        receipts[(record["media_kind"], record["index"])] = record
+                item.metadata[KUAISHOU_SAVED_ASSETS_KEY] = list(receipts.values())
             if event.event == "postprocessing":
                 item.status = ItemStatus.POSTPROCESSING
             elif event.event == "downloading":
@@ -2102,6 +2230,8 @@ class DownloadManager:
         job.auth_message = None
         job.issue_code = None
         job.issue_message = None
+        if job.platform == Platform.KUAISHOU:
+            job.diagnostic_code = None
         job.verification_url = None
         job.active_item_id = None
         job.cancel_requested = False
@@ -2117,6 +2247,8 @@ class DownloadManager:
                 item.error = "Cancelled by user"
                 item.auth_message = None
                 item.issue_code = None
+                if job.platform == Platform.KUAISHOU:
+                    item.diagnostic_code = None
                 item.updated_at = now
         job.refresh_counts()
 
@@ -2531,6 +2663,92 @@ class DownloadManager:
         job: DownloadJob,
         result: DiscoveryResult,
     ) -> None:
+        if job.platform == Platform.KUAISHOU:
+            original_kind, original_id = kuaishou_source_identity(job.source_url)
+            if original_kind != job.source_kind.value:
+                raise DiscoveryError("Kuaishou task source identity changed")
+            if len(result.items) > 10_000:
+                raise DiscoveryError("Kuaishou discovery exceeded the item safety limit")
+            if not result.items:
+                if original_kind != "profile" or job.items or not result.discovery_complete:
+                    raise TemporaryAccessError(
+                        "Kuaishou returned no verified media for this task. Retry "
+                        "the original link; saved entries were preserved."
+                    )
+                return
+            source_kind = result.items[0].metadata.get("kuaishou_source_kind")
+            source_id = result.items[0].metadata.get("kuaishou_source_id")
+            if any(
+                item.metadata.get("kuaishou_source_kind") != source_kind
+                or item.metadata.get("kuaishou_source_id") != source_id
+                for item in result.items
+            ):
+                raise DiscoveryError("Kuaishou discovery returned inconsistent source identities")
+            if (
+                not isinstance(source_kind, str)
+                or source_kind not in {"item", "profile"}
+                or not isinstance(source_id, str)
+                or re.fullmatch(r"[A-Za-z0-9_-]{1,80}", source_id) is None
+            ):
+                raise DiscoveryError("Kuaishou discovery returned an invalid source identity")
+            if original_kind != "short_link" and (
+                source_kind != original_kind or source_id != original_id
+            ):
+                raise DiscoveryError("Kuaishou discovery changed the requested source")
+            if job.resolved_source_kind or job.resolved_source_id:
+                if (
+                    job.resolved_source_kind is None
+                    or source_kind != job.resolved_source_kind.value
+                    or source_id != job.resolved_source_id
+                ):
+                    raise DiscoveryError(
+                        "Kuaishou share link target changed; create a new task"
+                    )
+            if source_kind == "item" and len(result.items) != 1:
+                raise DiscoveryError("Kuaishou item discovery returned multiple works")
+            seen_media_ids: set[str] = set()
+            for item in result.items:
+                media_id = str(item.media_id or "").strip()
+                try:
+                    item_kind, item_id = kuaishou_source_identity(item.source_url)
+                    refresh_url = item.metadata.get("kuaishou_refresh_url")
+                    refresh_kind, refresh_id = kuaishou_source_identity(refresh_url)
+                except (DiscoveryError, TypeError, ValueError) as exc:
+                    raise DiscoveryError(
+                        "Kuaishou discovery returned an untrusted work URL"
+                    ) from exc
+                refresh_is_original_share = (
+                    original_kind == "short_link"
+                    and refresh_url == job.source_url
+                    and refresh_kind == "short_link"
+                    and refresh_id == original_id
+                )
+                if (
+                    item_kind != "item"
+                    or item_id != media_id
+                    or media_id in seen_media_ids
+                    or item.extractor_key != "Kuaishou"
+                    or item.media_type not in {MediaType.VIDEO, MediaType.IMAGE}
+                    or not isinstance(item.metadata.get("kuaishou_author_id"), str)
+                    or not item.metadata["kuaishou_author_id"]
+                    or (
+                        source_kind == "profile"
+                        and item.metadata["kuaishou_author_id"] != source_id
+                    )
+                    or (
+                        source_kind == "item" and media_id != source_id
+                    )
+                    or not (
+                        (refresh_kind == "item" and refresh_id == media_id)
+                        or refresh_is_original_share
+                    )
+                ):
+                    raise DiscoveryError(
+                        "Kuaishou discovery returned duplicate or cross-wired media"
+                    )
+                seen_media_ids.add(media_id)
+            return
+
         if job.platform == Platform.XIAOHONGSHU:
             if not result.items:
                 raise TemporaryAccessError(
@@ -2949,14 +3167,24 @@ class DownloadManager:
             cause or message,
             authentication_required=authentication_required,
         )
+        if (
+            job.platform == Platform.KUAISHOU
+            and code == SiteIssueCode.UNKNOWN
+            and _is_kuaishou_security_transfer_error(cause, message)
+        ):
+            code = SiteIssueCode.SECURITY_BLOCKED
         if item is not None:
             item.issue_code = code
+            if job.platform == Platform.KUAISHOU:
+                item.diagnostic_code = _kuaishou_cookie_diagnostic(cause)
         if code != SiteIssueCode.UNKNOWN or job.issue_code in {
             None,
             SiteIssueCode.UNKNOWN,
         }:
             job.issue_code = code
             job.issue_message = message
+            if job.platform == Platform.KUAISHOU:
+                job.diagnostic_code = _kuaishou_cookie_diagnostic(cause)
 
     @classmethod
     def _backfill_job_issue_locked(cls, job: DownloadJob) -> bool:
@@ -2965,6 +3193,15 @@ class DownloadManager:
         changed = False
         for item in job.items:
             message = item.auth_message or item.error
+            if job.platform == Platform.KUAISHOU:
+                diagnostic = (
+                    item.diagnostic_code
+                    if item.diagnostic_code in COOKIE_DIAGNOSTIC_CODES
+                    else _recover_cookie_diagnostic_code(message)
+                )
+                if item.diagnostic_code != diagnostic:
+                    item.diagnostic_code = diagnostic
+                    changed = True
             if not message:
                 if item.issue_code is not None:
                     item.issue_code = None
@@ -2993,7 +3230,22 @@ class DownloadManager:
             if job.issue_message is not None:
                 job.issue_message = None
                 changed = True
+            if job.platform == Platform.KUAISHOU and job.diagnostic_code is not None:
+                job.diagnostic_code = None
+                changed = True
             return changed
+
+        if job.platform == Platform.KUAISHOU:
+            diagnostic = (
+                job.diagnostic_code
+                if job.diagnostic_code in COOKIE_DIAGNOSTIC_CODES
+                else _recover_cookie_diagnostic_code(
+                    job.auth_message or job.issue_message or job.error
+                )
+            )
+            if job.diagnostic_code != diagnostic:
+                job.diagnostic_code = diagnostic
+                changed = True
 
         if job.issue_code is not None and job.issue_message is not None:
             if (
@@ -3101,6 +3353,12 @@ class DownloadManager:
 
     @staticmethod
     def _should_rediscover_on_retry(job: DownloadJob) -> bool:
+        if job.platform == Platform.KUAISHOU:
+            return (
+                not job.items
+                or not job.discovery_complete
+                or job.status in {JobStatus.NEEDS_AUTH, JobStatus.INTERRUPTED}
+            )
         if DownloadManager._has_xiaohongshu_binding_rediscovery_pending(job):
             return True
         if DownloadManager._has_xiaohongshu_profile_media_revalidation_pending(job):
@@ -3172,6 +3430,7 @@ class DownloadManager:
         discovered: list[DownloadItem],
         *,
         retire_missing_douyin_profile_items: bool = False,
+        preserve_unmatched_items: bool = False,
     ) -> list[DownloadItem]:
         previous_by_media_id = {
             item.media_id: item for item in previous if item.media_id
@@ -3309,7 +3568,11 @@ class DownloadManager:
                 retained.updated_at = utc_now()
                 merged.append(retained)
                 continue
-            if retained.status != ItemStatus.COMPLETED and retained.retryable:
+            if (
+                not preserve_unmatched_items
+                and retained.status != ItemStatus.COMPLETED
+                and retained.retryable
+            ):
                 retained.status = ItemStatus.FAILED
                 retained.error = "Item was not found when the profile was refreshed"
                 retained.updated_at = utc_now()
@@ -3391,6 +3654,7 @@ class DownloadManager:
         item.error = None
         item.auth_message = None
         item.issue_code = None
+        item.diagnostic_code = None
         item.progress = item.progress.model_copy(
             update={
                 "downloaded_bytes": 0,

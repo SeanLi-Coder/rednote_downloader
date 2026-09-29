@@ -9,6 +9,7 @@
     authRetryButton: document.querySelector("#auth-retry-button"),
     cancelButton: document.querySelector("#cancel-button"),
     chromeCookies: document.querySelector("#chrome-cookies"),
+    chromeProfile: document.querySelector("#chrome-profile"),
     connectionStatus: document.querySelector("#connection-status"),
     downloadButton: document.querySelector("#download-button"),
     downloadDir: document.querySelector("#download-dir"),
@@ -64,6 +65,7 @@
     pollingTick: 0,
     refreshTimer: null,
     selectedJobId: null,
+    settingsSaving: false,
     versionBlocked: false
   };
 
@@ -154,6 +156,90 @@
   };
 
   const knownIssueCodes = new Set(Object.keys(issueTitles));
+  // Only these fixed Chrome Cookie reason codes may reach the interface. They
+  // come from the downloader's whitelist, never from raw exception text, so no
+  // local path, cookie value or token can be echoed here.
+  const cookieDiagnosticMessages = {
+    cookie_decryption_failed: {
+      description: "Chrome Cookie 未能解密：可能未取得钥匙串密钥，或部分 Cookie 已损坏。此提示本身不能证明钥匙串拒绝授权，也不代表账号已退出。",
+      solution: "如 macOS 弹出 Chrome Safe Storage 授权，请先核对是否由当前运行本工具的终端或应用触发，再决定是否允许。也请确认使用了已登录的 Chrome Profile，并在 Chrome 中重新访问目标网站后重试。不要删除钥匙串条目或发送 Cookie 内容。"
+    },
+    cookie_permission_denied: {
+      description: "系统拒绝了读取 Chrome Cookie 文件的权限。这是本机权限问题，不是登录失效，也不是网站验证码。",
+      solution: "在“系统设置 → 隐私与安全性 → 完全磁盘访问权限”中为启动本工具的 Terminal 或所用终端应用开启权限，然后完全退出并重新启动终端与本工具后重试。"
+    },
+    cookie_database_locked: {
+      description: "Chrome Cookie 数据库正被占用或锁定，程序无法安全读取。这不代表账号退出，也不是站点验证。",
+      solution: "完全退出 Chrome（包括所有窗口和后台进程）后立即重试；不要同时运行其他会读取 Chrome Cookie 的工具。"
+    },
+    chrome_data_directory_missing: {
+      description: "本机没有找到 Chrome 的用户数据目录，可能未安装 Chrome，或安装在了非默认位置。",
+      solution: "确认已安装 Google Chrome 并至少启动过一次；若安装在非默认位置，请改用默认位置。只下载公开内容时，也可以关闭“自动读取 Chrome Cookie”，再从原链接创建新任务。"
+    },
+    chrome_profile_invalid: {
+      description: "任务绑定的 Chrome Profile 名称不符合允许的格式。程序不会猜测或改用其他浏览器身份。",
+      solution: "在下载设置中重新选择 Profile（通常为 Default 或 Profile 1 这类名称），然后从原链接创建新任务。"
+    },
+    chrome_profile_missing: {
+      description: "任务绑定的 Chrome Profile 目录已不存在，该 Profile 可能已被删除或重命名。",
+      solution: "在下载设置中重新选择一个仍然存在的 Profile，然后从原链接创建新任务；程序不会自动改用其他 Profile。"
+    },
+    cookie_database_missing: {
+      description: "选定的 Chrome Profile 下没有找到 Cookie 数据库，该 Profile 可能从未用浏览器登录过网站。",
+      solution: "先在 Chrome 中用该 Profile 登录目标网站再重试，或在下载设置中改选已登录的 Profile，然后从原链接创建新任务。"
+    },
+    cookie_database_invalid: {
+      description: "Chrome Cookie 数据库的结构或内容无法读取，可能是数据库损坏或当前读取器不支持其结构；这不是网站验证码。",
+      solution: "先确认 Chrome 本身能正常打开目标网站，然后退出 Chrome 并重试。若仍失败，请反馈此诊断类别、工具版本和 build ID；不要手动删除 Cookie 数据库、重置浏览器或发送 Cookie 文件。"
+    },
+    cookie_storage_failed: {
+      description: "读取 Cookie 或创建私有临时快照时发生本地存储错误，可能涉及磁盘空间、I/O 或文件资源；不能据此认定账号已退出。",
+      solution: "检查系统磁盘可用空间及是否有磁盘错误，关闭不需要的程序后重试。若持续出现，请反馈诊断类别、版本和 build ID，不要删除浏览器资料。"
+    },
+    cookie_reader_failed: {
+      description: "Cookie 读取组件发生依赖、接口或数据类型处理错误；这不是登录失效的证据，也不代表必须重新授权。",
+      solution: "请反馈此诊断类别、工具版本和 build ID，供开发者修复读取组件。反复登录或退出 Chrome 不一定能解决；不要发送 Cookie 内容或完整本地路径。"
+    },
+    cookie_access_unknown: {
+      description: "读取 Chrome Cookie 失败，但现有信息不足以归类到具体原因。",
+      solution: "此提示不能证明 Chrome 未退出或钥匙串拒绝授权。若重试仍然失败，请反馈界面显示的诊断类别、版本号和 build ID；不要发送 Cookie 内容、Cookie 文件或完整本地路径。"
+    }
+  };
+
+  const cookieDiagnosticLabels = {
+    cookie_decryption_failed: "Chrome Cookie 解密失败",
+    cookie_permission_denied: "文件读取权限被拒绝",
+    cookie_database_locked: "Cookie 数据库被占用",
+    chrome_data_directory_missing: "未找到 Chrome 用户数据目录",
+    chrome_profile_invalid: "绑定的 Profile 名称无效",
+    chrome_profile_missing: "绑定的 Profile 已不存在",
+    cookie_database_missing: "该 Profile 没有 Cookie 数据库",
+    cookie_database_invalid: "Cookie 数据库内容或结构异常",
+    cookie_storage_failed: "Cookie 本地存储读取失败",
+    cookie_reader_failed: "Cookie 读取组件异常",
+    cookie_access_unknown: "未能归类的 Cookie 读取错误"
+  };
+
+  const knownCookieDiagnostics = new Set(Object.keys(cookieDiagnosticMessages));
+
+  function normalizeCookieDiagnostic(value) {
+    const code = String(firstDefined(value, "")).trim().toLowerCase();
+    return knownCookieDiagnostics.has(code) ? code : null;
+  }
+
+  function cookieDiagnosticCode(entity) {
+    return normalizeCookieDiagnostic(
+      firstDefined(entity?.diagnostic_code, entity?.diagnosticCode)
+    );
+  }
+
+  // Older persisted tasks stored only the text, so recover the fixed category
+  // from the sanitized marker instead of losing the specific reason.
+  function diagnosticFromText(text) {
+    const match = asText(text).match(/diagnostic(?: code)?:\s*([a-z0-9_]+)/i);
+    return match ? normalizeCookieDiagnostic(match[1]) : null;
+  }
+
 
   function firstDefined(...values) {
     return values.find((value) => value !== undefined && value !== null && value !== "");
@@ -294,11 +380,25 @@
     return runtimeIssueMessage(item) || direct;
   }
 
+  function primaryJobDiagnosticCode(job) {
+    const direct = cookieDiagnosticCode(job);
+    if (direct) return direct;
+    const fromMessage = diagnosticFromText(primaryJobIssueMessage(job));
+    if (fromMessage) return fromMessage;
+    const code = primaryJobIssueCode(job);
+    const item = getItems(job).find((candidate) => isFailed(candidate) && issueCode(candidate) === code);
+    return cookieDiagnosticCode(item) || diagnosticFromText(runtimeIssueMessage(item));
+  }
+
   function issueTitleForJob(job) {
+    const diagnostic = primaryJobDiagnosticCode(job);
+    if (primaryJobIssueCode(job) === "cookie_unavailable" && diagnostic) {
+      return `Chrome Cookie 读取失败：${cookieDiagnosticLabels[diagnostic]}`;
+    }
     return issueTitles[primaryJobIssueCode(job)] || issueTitles.unknown;
   }
 
-  function issuePresentation(code, raw = "") {
+  function issuePresentation(code, raw = "", diagnosticHint = null) {
     const normalized = knownIssueCodes.has(code) ? code : "unknown";
     let description = issueDescriptions[normalized] || issueDescriptions.unknown;
     let solution = issueSolutions[normalized] || issueSolutions.unknown;
@@ -309,17 +409,25 @@
     ) {
       description = "这个任务创建时关闭了 Chrome Cookie。程序遵守任务原有设置，没有读取浏览器 Cookie，因此无法安全刷新受限媒体地址。";
       solution = "在下载设置中开启“自动读取 Chrome Cookie”，然后从原链接创建一个新任务；继续旧任务仍会保持 Cookie 关闭。";
+      return { description, solution, diagnostic: null };
     }
-    return { description, solution };
+    const diagnostic = normalizeCookieDiagnostic(diagnosticHint) || diagnosticFromText(rawText);
+    if (normalized === "cookie_unavailable" && diagnostic) {
+      const detail = cookieDiagnosticMessages[diagnostic];
+      description = detail.description;
+      solution = detail.solution;
+    }
+    return { description, solution, diagnostic };
   }
 
-  function issueResolutionText(code, raw = "") {
-    const { description, solution } = issuePresentation(code, raw);
-    return `发生了什么：${description}\n解决办法：${solution}`;
+  function issueResolutionText(code, raw = "", diagnosticHint = null) {
+    const { description, solution, diagnostic } = issuePresentation(code, raw, diagnosticHint);
+    const label = diagnostic ? `\n具体原因：${cookieDiagnosticLabels[diagnostic]}（${diagnostic}）` : "";
+    return `发生了什么：${description}\n解决办法：${solution}${label}`;
   }
 
-  function composeIssueMessage(code, raw, job) {
-    const summary = issueResolutionText(code, raw);
+  function composeIssueMessage(code, raw, job, diagnosticHint = null) {
+    const summary = issueResolutionText(code, raw, diagnosticHint);
     if (!raw) return summary;
     const localized = localizeRuntimeMessage(raw, job);
     return localized === raw
@@ -330,13 +438,13 @@
   function localizedIssueMessage(entity, job = entity) {
     const raw = runtimeIssueMessage(entity);
     const code = issueCode(entity) || "unknown";
-    return composeIssueMessage(code, raw, job);
+    return composeIssueMessage(code, raw, job, cookieDiagnosticCode(entity));
   }
 
   function localizedPrimaryJobIssueMessage(job) {
     const raw = primaryJobIssueMessage(job);
     const code = primaryJobIssueCode(job) || "unknown";
-    return composeIssueMessage(code, raw, job);
+    return composeIssueMessage(code, raw, job, primaryJobDiagnosticCode(job));
   }
 
   function warningPresentation(job) {
@@ -367,9 +475,14 @@
       let code = issueCode(warningEntity) || "unknown";
       const explicitCode = String(firstDefined(job?.issue_code, job?.issueCode, "")).trim().toLowerCase();
       if (code === "unknown" && knownIssueCodes.has(explicitCode)) code = explicitCode;
+      const warningDiagnostic = cookieDiagnosticCode(job) || diagnosticFromText(job.warning);
       return {
-        title: issueTitles[code] || "任务提示",
-        message: composeIssueMessage(code, job.warning, job),
+        title: (
+          code === "cookie_unavailable" && warningDiagnostic
+            ? `Chrome Cookie 读取失败：${cookieDiagnosticLabels[warningDiagnostic]}`
+            : issueTitles[code] || "任务提示"
+        ),
+        message: composeIssueMessage(code, job.warning, job, warningDiagnostic),
         isAlert: false
       };
     }
@@ -377,7 +490,7 @@
       const raw = "Chrome cookies could not be read, so anonymous access was used; profile results or restricted highest-quality media may be incomplete.";
       return {
         title: "Chrome Cookie 读取失败，当前使用未登录模式",
-        message: composeIssueMessage("cookie_unavailable", raw, job),
+        message: composeIssueMessage("cookie_unavailable", raw, job, cookieDiagnosticCode(job)),
         isAlert: false
       };
     }
@@ -691,12 +804,14 @@
 
   function getPlatform(job) {
     const explicit = String(firstDefined(job?.platform, job?.site, job?.source, "")).toLowerCase();
+    if (["xiaohongshu", "bilibili", "youtube", "douyin", "kuaishou"].includes(explicit)) return explicit;
     const url = String(firstDefined(job?.url, job?.source_url, job?.profile_url, "")).toLowerCase();
     const combined = `${explicit} ${url}`;
     if (combined.includes("xiaohongshu") || combined.includes("xhs") || combined.includes("rednote")) return "xiaohongshu";
     if (combined.includes("bilibili") || combined.includes("b23.tv") || combined.includes("b站")) return "bilibili";
     if (combined.includes("youtube") || combined.includes("youtu.be")) return "youtube";
     if (combined.includes("douyin") || combined.includes("抖音")) return "douyin";
+    if (combined.includes("kuaishou") || combined.includes("gifshow.com") || combined.includes("快手")) return "kuaishou";
     return "unknown";
   }
 
@@ -705,6 +820,7 @@
     const metadata = {
       bilibili: { glyph: "B", label: "B站" },
       douyin: { glyph: "抖", label: "抖音" },
+      kuaishou: { glyph: "快", label: "快手" },
       unknown: { glyph: "链", label: "正在识别平台" },
       xiaohongshu: { glyph: "红", label: "小红书" },
       youtube: { glyph: "YT", label: "YouTube" }
@@ -713,11 +829,12 @@
   }
 
   function isProfileJob(job) {
-    const kind = String(firstDefined(job?.source_kind, job?.sourceKind, job?.kind, "")).toLowerCase();
+    const kind = String(firstDefined(job?.resolved_source_kind, job?.source_kind, job?.sourceKind, job?.kind, "")).toLowerCase();
     if (["profile", "channel", "user"].includes(kind)) return true;
     if (["item", "video", "note"].includes(kind)) return false;
     const url = String(firstDefined(job?.source_url, job?.url, job?.profile_url, ""));
-    return /\/user\/[^/?#]+(?:[/?#]|$)/i.test(url);
+    return /\/user\/[^/?#]+(?:[/?#]|$)/i.test(url)
+      || (getPlatform(job) === "kuaishou" && /\/profile\/[^/?#]+(?:[/?#]|$)/i.test(url));
   }
 
   function isXiaohongshuVerificationItem(job) {
@@ -1030,7 +1147,133 @@
     return `抖音解析已停止：${detail}。程序没有接受该响应或下载替代内容。${advice}不需要打开 Chrome 验证。诊断码：${code}。`;
   }
 
+  const kuaishouIssueLabels = {
+    rate_limited: "网站限制了请求频率",
+    request_rejected: "网站拒绝了请求",
+    site_unavailable: "网站服务暂时不可用",
+    network_error: "网络或连接异常",
+    content_unavailable: "作品已删除、私密或不可见",
+    unknown: "未能归类的原因"
+  };
+
+  const kuaishouProblemLabels = {
+    no_verifiable_media: "没有可验证的媒体",
+    unsupported_media_type: "媒体类型暂不支持（如图片缺少可核验尺寸）",
+    queue_limit_reached: "已达到作品数量保护上限",
+    page_item_limit_reached: "单页作品数超过保护上限"
+  };
+
+  function kuaishouReasonLabel(code, labels) {
+    const key = String(firstDefined(code, "")).trim();
+    if (!key) return "";
+    return labels[key] ? `${labels[key]}（${key}）` : key;
+  }
+
+  // The English warning carries structured suffixes; localize them instead of
+  // dropping them, so the user still sees which works failed and why.
+  function localizeKuaishouSuffixes(text) {
+    const parts = [];
+    const category = text.match(/Reason category:\s*([a-z0-9_-]+)\.?/i)?.[1];
+    if (category) {
+      parts.push(`中断原因：${kuaishouReasonLabel(category, kuaishouIssueLabels)}`);
+    }
+    const skipped = text.match(/(\d+)\s+work\(s\) could not be verified/i)?.[1];
+    if (skipped) {
+      // Only parse the fixed reason segment. A blanket scan would also match the
+      // affected-work list below and invent reasons that were never reported.
+      const reasonSegment = text.match(/were not queued:\s*([^.]*)\./i)?.[1] || "";
+      const reasons = [...reasonSegment.matchAll(/([a-z_]+)\s+x(\d+)/gi)]
+        .map((match) => `${kuaishouReasonLabel(match[1], kuaishouProblemLabels)} ${match[2]} 个`)
+        .join("，");
+      parts.push(`有 ${skipped} 个作品无法验证、未加入下载队列${reasons ? `：${reasons}` : ""}`);
+      const affected = text.match(/Affected:\s*((?:#\d+:[\w-]+(?:,\s*)?)+)/)?.[1];
+      if (affected) parts.push(`受影响作品：${affected.trim().replace(/,\s*$/, "")}`);
+      const more = text.match(/\(\+(\d+)\s+more listed in task details\)/)?.[1];
+      if (more) parts.push(`另有 ${more} 个仅在任务详情中列出`);
+      const capped = text.match(/A further (\d+) were only counted/i)?.[1];
+      if (capped) parts.push(`另有 ${capped} 个仅计数，明细已按上限截断`);
+    }
+    return parts.length ? ` ${parts.join("；")}。` : "";
+  }
+
+  function kuaishouMessage(text) {
+    if (!text.includes("Kuaishou")) return null;
+    const progress = text.match(/^Kuaishou: verified (\d+) videos across (\d+) pages$/);
+    if (progress) return `正在读取快手主页，已验证 ${progress[1]} 个视频（${progress[2]} 页）`;
+    const retry = text.match(
+      /^Kuaishou (rate limited the profile|rejected a profile page|profile service is unavailable|profile network request failed|profile request was interrupted); waiting before continuing \((\d+)\/(\d+)\)/
+    );
+    if (retry) {
+      const reasons = {
+        "rate limited the profile": "快手暂时限制了主页请求",
+        "rejected a profile page": "快手拒绝了当前主页分页请求",
+        "profile service is unavailable": "快手主页服务暂时不可用",
+        "profile network request failed": "快手主页网络请求失败，请检查本机网络或代理",
+        "profile request was interrupted": "快手主页请求暂时中断"
+      };
+      return `${reasons[retry[1]]}，程序正在等待后从当前位置继续读取（第 ${retry[2]}/${retry[3]} 次）。已验证的作品不会丢失，也不会从头重新读取；你可以随时取消。`;
+    }
+    if (text.startsWith("Kuaishou stopped serving further profile pages")) {
+      return `快手已停止继续提供主页内容，本次读取不完整。已验证的作品会继续下载，已保存的文件都会保留。请等待几分钟后点击“继续任务”：程序会重新读取主页以获取有效分页信息；未完成作品中已有的文件会在校验后复用，无法确认一致时会重新下载且不覆盖旧文件。${localizeKuaishouSuffixes(text)}`;
+    }
+    if (text.startsWith("Kuaishou stopped serving the author feed before any work")) {
+      return `快手在返回任何可验证作品前就停止了，因此没有加入任何下载项。这不是主页为空，程序也没有把限流当成“没有作品”。请等待几分钟后从原主页重试。${localizeKuaishouSuffixes(text)}`;
+    }
+    if (text.startsWith("Kuaishou profile discovery is incomplete")) {
+      return `快手主页尚未读取完整。已发现并验证的作品会继续下载；网站未确认列表结束，请稍后继续任务以重新读取主页。不能把当前数量视为全部作品。${localizeKuaishouSuffixes(text)}`;
+    }
+    if (text.startsWith("Kuaishou Chrome cookies could not be read")) {
+      // A specific local reason must not collapse into "quit Chrome", which is
+      // wrong for a keychain, permission or missing-profile failure and would
+      // send the user in circles.
+      const diagnostic = diagnosticFromText(text);
+      if (diagnostic && cookieDiagnosticMessages[diagnostic]) {
+        const detail = cookieDiagnosticMessages[diagnostic];
+        return `无法读取快手的 Chrome Cookie。${detail.description}${detail.solution}程序不会静默切换账号或改用匿名访问。诊断类别：${diagnostic}。`;
+      }
+      return "无法读取快手的 Chrome Cookie，但现有信息不足以确定原因。请核对已登录的 Chrome Profile 与本机读取权限后重试；仅在你明确关闭 Cookie 时才使用未登录模式，不会静默切换账号。";
+    }
+    const messages = [
+      ["Only Xiaohongshu, Douyin, Kuaishou, Bilibili, and YouTube URLs are supported", "目前支持小红书、抖音、快手、B站和 YouTube，请粘贴这些平台的视频或主页链接。"],
+      ["Opening Kuaishou in Chrome", "正在通过 Chrome 读取快手原页面并核对视频信息"],
+      ["Refreshing Kuaishou video links", "正在从快手原视频页刷新下载地址并再次核对身份"],
+      ["Kuaishou requires security verification", "快手要求安全验证。请打开 Chrome 完成验证，然后返回继续任务；程序不会绕过验证码。"],
+      ["Kuaishou requires login", "快手要求登录。请在 Chrome 登录快手，开启 Chrome Cookie 后重试。"],
+      ["Kuaishou rate limited", "快手暂时限制了请求频率，请稍后重试；已经完成的文件会保留。"],
+      ["Kuaishou video is deleted, private, or unavailable", "快手视频已删除、设为私密或当前不可见。请先在 Chrome 中确认你有权访问该视频。"],
+      ["Kuaishou rejected the page request", "快手拒绝了本次请求，请稍后重试；程序不会绕过网站的访问限制。"],
+      ["Kuaishou page could not be opened", "无法打开快手页面，请检查本机代理、VPN 与网络连接后重试。"],
+      ["Kuaishou was blocked by the local DNS or web filter", "本机的 DNS 或网页过滤器拦截了快手。请检查已配置的代理或网络访问策略；这不是快手验证码，不需要反复打开 Chrome 验证。"],
+      ["Kuaishou browser request timed out", "读取快手页面超时，请检查本机代理、VPN 与网络连接后重试。"],
+      ["Kuaishou browser TLS certificate verification failed", "快手连接的 HTTPS 证书校验失败，请检查代理证书或网络访问策略；程序不会关闭证书验证。"],
+      ["Kuaishou browser request failed", "快手页面请求失败，请检查本机代理与网络连接后重试。"],
+      ["Kuaishou output filesystem does not support safe atomic file publication", "当前下载目录不支持安全地原子保存快手文件。请在下载设置中改选支持硬链接的本机目录，再从原链接继续任务；已完成文件会保留。"],
+      ["Kuaishou browser redirect limit exceeded", "快手页面发生过多跳转，已停止访问；请复制新的官方视频或主页链接重试。"],
+      ["Kuaishou cross-origin browser submission redirect was blocked", "快手请求试图跨站转发提交内容，已安全拦截；请核对官方原始链接后重试。"],
+      ["Kuaishou returned no verified video data", "未取得可验证的快手视频信息。请在 Chrome 确认原链接可正常播放，复制新的分享链接后重试；不会下载推荐视频作为替代。"],
+      ["Kuaishou profile response changed", "快手主页返回格式发生变化，未加入无法验证的作品。请确认原主页可访问后重试；若仍失败，请反馈脱敏后的链接与工具版本。"],
+      ["Kuaishou response exceeded the safe size limit", "快手响应超过安全大小限制，已停止解析。已经下载的文件不受影响。"],
+      ["Kuaishou share link target changed", "这个快手分享链接指向的作品或作者已变化。为避免混入其他内容，已停止旧任务，请用新链接创建任务。"],
+      ["Kuaishou supports Chrome Cookie", "快手支持 Chrome Cookie 或明确选择的未登录模式，请检查下载设置。"],
+      ["Kuaishou video has no trusted media stream", "快手未提供可信的视频流，不会用封面图冒充视频；请确认原页面可播放后重试。"],
+      ["Unsupported Kuaishou", "快手链接格式不支持，请粘贴单个视频、分享短链接或作者主页链接。"],
+      ["Kuaishou URL is not a trusted HTTPS page", "快手链接必须是受支持的官方 HTTPS 地址，不能包含账号密码或自定义端口。"]
+    ];
+    for (const [prefix, localized] of messages) {
+      if (text.startsWith(prefix)) return localized;
+    }
+    if (/Kuaishou.*(?:identity|identities|different video|different author|missing video|inconsistent source)/.test(text)) {
+      return "快手返回的视频或作者身份未通过校验，已停止处理，不会下载其他作品作为替代。请核对原链接后重试。";
+    }
+    if (/Kuaishou.*(?:untrusted|trusted pages)|Untrusted Kuaishou/.test(text)) {
+      return "快手页面或媒体跳转到不可信地址，已在请求前拦截。请核对原始链接，不要手动放行未知地址。";
+    }
+    return "快手返回了暂未识别的错误，任务已停止。请从原链接重试一次；若仍失败，请反馈错误类别、工具版本和 build ID，不要发送 Cookie 或带签名的媒体链接。";
+  }
+
   function localizeRuntimeMessage(value, job = null) {
+    const kuaishou = kuaishouMessage(asText(value));
+    if (kuaishou) return kuaishou;
     let text = asText(value);
     const signingValidation = douyinSigningValidationMessage(text);
     if (signingValidation) return signingValidation;
@@ -1465,7 +1708,7 @@
     const raw = primaryJobIssueMessage(job);
     const author = getAuthor(job);
     const prefix = lead ? `${author}：${lead}\n` : `${author}\n`;
-    return `${prefix}${issueResolutionText(code, raw)}`;
+    return `${prefix}${issueResolutionText(code, raw, primaryJobDiagnosticCode(job))}`;
   }
 
   function showIssueToast(job, lead = "") {
@@ -1685,6 +1928,8 @@
 
   function localizeDiscoveryActivity(value, job) {
     const message = asText(value).trim();
+    const kuaishou = kuaishouMessage(message);
+    if (kuaishou) return kuaishou;
     const platform = platformMeta(job).label;
     const target = isProfileJob(job) ? `${platform}主页` : `${platform}作品`;
     if (!message || message === "Starting media discovery") {
@@ -2200,10 +2445,27 @@
     }
   }
 
+  function draftChromeProfile() {
+    if (!elements.chromeProfile) return state.chromeProfile;
+    const raw = elements.chromeProfile.value;
+    // Preserve a legacy value when an unrelated setting changes. Validate only
+    // a newly selected profile name; existing jobs keep their saved identity.
+    return raw === (state.chromeProfile || "") ? state.chromeProfile : (raw.trim() || null);
+  }
+
   async function createJob(event) {
     event.preventDefault();
     if (state.versionBlocked) return;
     elements.formError.textContent = "";
+    if (state.settingsSaving) {
+      elements.formError.textContent = "下载设置正在保存，请稍后再创建任务。";
+      return;
+    }
+    if (draftChromeProfile() !== state.chromeProfile) {
+      elements.formError.textContent = "Chrome Profile 已修改，请先保存下载设置，再创建新任务。";
+      elements.chromeProfile.focus();
+      return;
+    }
     const url = elements.urlInput.value.trim();
     if (!url || !/https?:\/\//i.test(url)) {
       elements.formError.textContent = "请输入链接，或粘贴包含链接的分享文案";
@@ -2247,6 +2509,7 @@
       const cookieValue = cookieKey ? config[cookieKey] : true;
       elements.chromeCookies.checked = Boolean(cookieValue);
       state.chromeProfile = firstDefined(config.chrome_profile, config.browser_profile) ?? null;
+      if (elements.chromeProfile) elements.chromeProfile.value = state.chromeProfile || "";
       elements.downloadDir.value = firstDefined(config.download_dir, config.output_dir, config.download_path, "downloads");
       return true;
     } catch (error) {
@@ -2257,13 +2520,21 @@
 
   async function saveConfig(event) {
     event.preventDefault();
-    if (state.versionBlocked) return;
+    if (state.versionBlocked || state.settingsSaving) return;
     const directory = elements.downloadDir.value.trim();
+    const profile = draftChromeProfile();
+    if (profile !== state.chromeProfile && profile !== null && !/^(?:Default|Profile [1-9][0-9]*)$/.test(profile)) {
+      showToast("请填写 Default、Profile 1 等 Chrome Profile 文件夹名称，或留空使用自动选择。", "error");
+      elements.chromeProfile?.focus();
+      return;
+    }
     if (!directory) {
       showToast("请填写下载目录", "error");
       elements.downloadDir.focus();
       return;
     }
+    state.settingsSaving = true;
+    if (elements.chromeProfile) elements.chromeProfile.disabled = true;
     elements.saveSettingsButton.disabled = true;
     elements.saveSettingsButton.textContent = "保存中…";
     elements.settingsSaved.textContent = "";
@@ -2273,17 +2544,22 @@
         body: JSON.stringify({
           download_dir: directory,
           use_chrome_cookies: elements.chromeCookies.checked,
-          chrome_profile: state.chromeProfile
+          chrome_profile: profile
         })
       });
+      const profileChanged = profile !== state.chromeProfile;
+      state.chromeProfile = profile;
+      if (elements.chromeProfile) elements.chromeProfile.value = profile || "";
       elements.settingsSaved.textContent = "已保存";
-      showToast("下载设置已保存");
+      showToast(profileChanged ? "Chrome Profile 已保存；请从原链接创建新任务，旧任务保留原来的设置。" : "下载设置已保存");
       window.setTimeout(() => {
         elements.settingsSaved.textContent = "";
       }, 3000);
     } catch (error) {
       showToast(`保存设置失败：${localizeRuntimeMessage(error.message)}`, "error");
     } finally {
+      state.settingsSaving = false;
+      if (elements.chromeProfile) elements.chromeProfile.disabled = false;
       elements.saveSettingsButton.disabled = false;
       elements.saveSettingsButton.textContent = "保存设置";
     }

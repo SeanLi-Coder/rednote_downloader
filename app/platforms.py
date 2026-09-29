@@ -35,12 +35,16 @@ def extract_url(value: str) -> str:
     parsed = urlsplit(value)
     if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
         raise UnsupportedUrlError("Please enter a complete http:// or https:// URL")
-    if parsed.username or parsed.password:
+    if parsed.username is not None or parsed.password is not None:
         raise UnsupportedUrlError("URLs containing credentials are not accepted")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise UnsupportedUrlError("Invalid URL port") from exc
     normalized = parsed._replace(
         scheme=parsed.scheme.lower(),
         netloc=(parsed.hostname or "").lower().rstrip(".")
-        + (f":{parsed.port}" if parsed.port else ""),
+        + (f":{port}" if port is not None else ""),
         fragment="",
     )
     return urlunsplit(normalized)
@@ -53,6 +57,16 @@ def identify_url(value: str) -> UrlInfo:
     path = parsed.path.rstrip("/") or "/"
     query = parse_qs(parsed.query)
     query_with_blanks = parse_qs(parsed.query, keep_blank_values=True)
+
+    if host in {"kuaishou.com", "www.kuaishou.com", "v.kuaishou.com", "m.gifshow.com"}:
+        from .errors import DiscoveryError
+        from .kuaishou import source_identity
+
+        try:
+            kind, _ = source_identity(url)
+        except DiscoveryError as exc:
+            raise UnsupportedUrlError(str(exc)) from exc
+        return UrlInfo(url=url, platform=Platform.KUAISHOU, kind=SourceKind(kind))
 
     if _is_domain(host, "xhslink.com"):
         return UrlInfo(
@@ -129,5 +143,5 @@ def identify_url(value: str) -> UrlInfo:
         return UrlInfo(url=url, platform=Platform.YOUTUBE, kind=kind)
 
     raise UnsupportedUrlError(
-        "Only Xiaohongshu, Douyin, Bilibili, and YouTube URLs are supported"
+        "Only Xiaohongshu, Douyin, Kuaishou, Bilibili, and YouTube URLs are supported"
     )

@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#090c14">
-    <meta name="description" content="从小红书、B站、YouTube 和抖音下载平台当前可用的最高质量图片与视频。">
+    <meta name="description" content="从小红书、B站、YouTube、抖音和快手下载平台当前可用的最高质量媒体。">
     <meta name="app-id" content="__APP_ID__">
     <meta name="app-version" content="__APP_VERSION__">
     <meta name="app-build" content="__BUILD_ID__">
@@ -55,7 +55,7 @@
         </div>
 
         <form class="download-form" id="download-form" novalidate>
-          <label for="url-input">主页或视频链接</label>
+          <label for="url-input">主页或作品链接</label>
           <div class="url-control">
             <span class="url-icon" aria-hidden="true">
               <svg viewBox="0 0 24 24">
@@ -69,7 +69,7 @@
               inputmode="url"
               autocomplete="url"
               spellcheck="false"
-              placeholder="粘贴小红书、B站、YouTube 或抖音链接"
+              placeholder="粘贴小红书、B站、YouTube、抖音或快手链接"
               aria-describedby="url-help form-error"
               required
             >
@@ -86,9 +86,11 @@
               <span><i class="platform-dot pink"></i>B站</span>
               <span><i class="platform-dot blue"></i>YouTube</span>
               <span><i class="platform-dot cyan"></i>抖音</span>
+              <span><i class="platform-dot orange"></i>快手</span>
             </div>
             <p class="form-error" id="form-error" role="alert"></p>
           </div>
+          <p class="desktop-note">快手支持单个视频、图片作品、分享短链接和作者主页；如网站要求登录或验证，请按提示在 Chrome 中完成。仅下载你有权保存的内容。</p>
         </form>
       </section>
 
@@ -245,6 +247,19 @@
                   <span class="switch-track" aria-hidden="true"><i></i></span>
                 </span>
               </label>
+
+              <label class="field-label" for="chrome-profile">
+                Chrome Profile（可选）
+                <span class="path-input">
+                  <input id="chrome-profile" type="text" autocomplete="off" spellcheck="false" list="chrome-profile-examples" placeholder="留空自动选择" aria-describedby="chrome-profile-help">
+                </span>
+                <datalist id="chrome-profile-examples">
+                  <option value="Default"></option>
+                  <option value="Profile 1"></option>
+                  <option value="Profile 2"></option>
+                </datalist>
+              </label>
+              <p class="settings-note" id="chrome-profile-help">在已登录的 Chrome 打开 chrome://version，查看“个人资料路径”最后一级名称（如 Default 或 Profile 1），只填写名称。保存后只影响新任务；旧任务仍使用原配置。</p>
 
               <label class="field-label" for="download-dir">
                 下载目录

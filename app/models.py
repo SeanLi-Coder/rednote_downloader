@@ -17,6 +17,7 @@ def utc_now() -> datetime:
 class Platform(str, Enum):
     XIAOHONGSHU = "xiaohongshu"
     DOUYIN = "douyin"
+    KUAISHOU = "kuaishou"
     BILIBILI = "bilibili"
     YOUTUBE = "youtube"
 
@@ -104,6 +105,8 @@ class DownloadItem(BaseModel):
     error: str | None = None
     auth_message: str | None = None
     issue_code: SiteIssueCode | None = None
+    # Store only fixed diagnostic categories, never raw exception details.
+    diagnostic_code: str | None = None
     retryable: bool = True
     metadata: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=utc_now)
@@ -135,6 +138,7 @@ class DownloadJob(BaseModel):
     auth_message: str | None = None
     issue_code: SiteIssueCode | None = None
     issue_message: str | None = None
+    diagnostic_code: str | None = None
     verification_url: str | None = None
     cookie_browser: str | None = "chrome"
     cookie_profile: str | None = None
